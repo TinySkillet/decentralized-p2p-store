@@ -42,14 +42,36 @@ func (s *Store) Write(key string, r io.Reader) (int64, error) {
 	return s.writeStream(key, r)
 }
 
-func (s *Store) WriteDecrypt(encryptionKey []byte, key string, r io.Reader) (int64, error) {
-
+func (s *Store) WriteEncrypt(encryptionKey []byte, key string, r io.Reader) (int64, error) {
 	f, err := s.openFileForWriting(key)
 	if err != nil {
 		return 0, err
 	}
-	n, err := copyDecrypt(encryptionKey, r, f)
+	n, err := copyEncrypt(encryptionKey, r, f)
 	return int64(n), err
+}
+
+func (s *Store) ReadDecrypt(encryptionKey []byte, key string) (int64, io.Reader, error) {
+	f, err := s.openFileForReading(key)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	pr, pw := io.Pipe()
+
+	go func() {
+		_, err := copyDecrypt(encryptionKey, f, pw)
+		pw.CloseWithError(err)
+		f.Close()
+	}()
+
+	return 0, pr, nil
+}
+
+func (s *Store) openFileForReading(key string) (*os.File, error) {
+	pathKey := s.PathTransformFunc(key)
+	fullPath := fmt.Sprintf("%s/%s", s.Root, pathKey.FullPath())
+	return os.Open(fullPath)
 }
 
 func (s *Store) writeStream(key string, r io.Reader) (int64, error) {
@@ -63,16 +85,15 @@ func (s *Store) writeStream(key string, r io.Reader) (int64, error) {
 func (s *Store) Delete(key string) error {
 	pathKey := s.PathTransformFunc(key)
 
-	defer func() {
-		log.Printf("Deleted [%s] from disk\n", pathKey.Filename)
-	}()
-
 	parentDir := strings.Split(pathKey.FullPath(), "/")[0]
 
 	parentDirWRoot := fmt.Sprintf("%s/%s", s.Root, parentDir)
 	if err := os.RemoveAll(parentDirWRoot); err != nil {
+		log.Printf("Failed to delete [%s] from disk: %v\n", pathKey.Filename, err)
 		return err
 	}
+
+	log.Printf("Deleted [%s] from disk\n", pathKey.Filename)
 	return nil
 }
 
@@ -146,7 +167,6 @@ type Store struct {
 }
 
 type StoreOpts struct {
-	// Root is the root folder containing all files and folders of the p2p system
 	Root              string
 	PathTransformFunc PathTransformFunc
 }
@@ -164,9 +184,7 @@ func NewStore(opts StoreOpts) *Store {
 	}
 }
 
-// FullPathForKey returns the absolute path on disk where the file for the given
-// logical key is stored. This is useful for metadata recording. It does not
-// perform any filesystem access.
+// FullPathForKey returns absolute path for key storage without filesystem access
 func (s *Store) FullPathForKey(key string) string {
 	pathKey := s.PathTransformFunc(key)
 	return fmt.Sprintf("%s/%s", s.Root, pathKey.FullPath())

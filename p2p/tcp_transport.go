@@ -8,23 +8,18 @@ import (
 	"sync"
 )
 
-// Implements the Transport interface
 func (t TCPTransport) Close() error {
 	return t.listener.Close()
 }
 
-// Implements the Transport interface
 func (t *TCPTransport) Address() string {
 	return t.ListenAddr
 }
 
-// Consume implements the Transport interface, which returns a read only channel for
-// reading incoming messages from another peer
 func (t *TCPTransport) Consume() <-chan RPC {
 	return t.rpcChan
 }
 
-// Implements the Transport interface
 func (t *TCPTransport) Dial(addr string) error {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -82,7 +77,6 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 		}
 	}
 
-	// Read Loop
 	for {
 		rpc := RPC{}
 		err = t.Decoder.Decode(conn, &rpc)
@@ -90,11 +84,13 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 			return
 		}
 
-		rpc.From = conn.RemoteAddr().String()
+		rpc.From = peer.RemoteAddr().String()
 
 		if rpc.Stream {
 			peer.wg.Add(1)
 			fmt.Printf("[%s] Incoming stream from [%s], waiting till stream is done...\n", t.ListenAddr, conn.RemoteAddr().String())
+
+			t.rpcChan <- rpc
 
 			peer.wg.Wait()
 			fmt.Printf("[%s] Stream from [%s] closed. Resuming normal read loop.\n", t.ListenAddr, conn.RemoteAddr().String())
@@ -106,26 +102,32 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 	}
 }
 
-// TCPPeer represents the remote node over a TCP connection.
 type TCPPeer struct {
-	// underlying connection of the peer
-	// in this case is a tcp connection
 	net.Conn
 
-	// If we dial and retrieve a conn: outbound = true.
-	// If we accept and retrieve a conn:  outbound = false.
 	outbound bool
 
 	wg *sync.WaitGroup
+
+	// FullAddr is the verified listening address of the peer
+	FullAddr string
 }
 
-// implements the Peer interface
+func (p *TCPPeer) RemoteAddr() net.Addr {
+	if p.FullAddr != "" {
+		addr, err := net.ResolveTCPAddr("tcp", p.FullAddr)
+		if err == nil {
+			return addr
+		}
+	}
+	return p.Conn.RemoteAddr()
+}
+
 func (p *TCPPeer) Send(b []byte) error {
 	_, err := p.Conn.Write(b)
 	return err
 }
 
-// implements the Peer interface
 func (p *TCPPeer) CloseStream() {
 	p.wg.Done()
 }

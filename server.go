@@ -39,6 +39,13 @@ func (s *FileServer) loop() {
 	for {
 		select {
 		case rpc := <-s.Transport.Consume():
+			if rpc.Stream {
+				if err := s.handleStream(rpc.From); err != nil {
+					log.Printf("[%s] Error handling stream: %v", s.Transport.Address(), err)
+				}
+				continue
+			}
+
 			var msg Message
 			err := gob.NewDecoder(bytes.NewReader(rpc.Payload)).Decode(&msg)
 			if err != nil {
@@ -63,43 +70,92 @@ func (s *FileServer) handleMessage(from string, msg *Message) error {
 		return s.handleMessageGetFile(from, v)
 	case MessageDeleteFile:
 		return s.handleMessageDeleteFile(from, v)
+	case MessagePeerExchange:
+		return s.handleMessagePeerExchange(from, v)
 	}
 	return nil
 }
 
 func (s *FileServer) handleMessageStoreFile(from string, msg MessageStoreFile) error {
-	peer, found := s.peers[from]
-	if !found {
-		return fmt.Errorf("peer (%s) could not be found in the peers list", from)
-	}
-
-	n, err := s.store.Write(msg.Key, io.LimitReader(peer, msg.Size))
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("[%s] Written %d bytes to disk\n", s.Transport.Address(), n)
-
-	peer.CloseStream()
+	fmt.Printf("[%s] Received StoreFile message from %s for key %s. Expecting stream...\n", s.Transport.Address(), from, msg.Key)
+	s.pendingFileTransfers[from] = msg
 	return nil
+}
+
+func (s *FileServer) handleStream(from string) error {
+	// Check for pending upload (StoreFile)
+	if msg, ok := s.pendingFileTransfers[from]; ok {
+		delete(s.pendingFileTransfers, from)
+
+		peer, found := s.peers[from]
+		if !found {
+			return fmt.Errorf("peer (%s) could not be found in the peers list", from)
+		}
+
+		// Receive plaintext, write encrypted
+		n, err := s.store.WriteEncrypt(s.EncryptionKey, msg.Key, io.LimitReader(peer, msg.Size))
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("[%s] Written %d bytes to disk (encrypted) from %s\n", s.Transport.Address(), n, from)
+
+		// Record share in database if configured
+		if s.DB != nil {
+			shareID := hashKey(msg.Key + from + "incoming")
+			_ = s.DB.InsertShare(context.Background(), dbpkg.Share{
+				ID:        shareID,
+				FileID:    msg.Key,
+				PeerID:    from,
+				Direction: "incoming",
+			})
+		}
+
+		peer.CloseStream()
+
+		// Signal download completion if anyone is waiting
+		if ch, ok := s.downloadChannels[msg.Key]; ok {
+			close(ch)
+			delete(s.downloadChannels, msg.Key)
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("peer %s sent a stream but no pending transfer was found", from)
 }
 
 func (s *FileServer) handleMessageGetFile(from string, msg MessageGetFile) error {
 	fmt.Printf("[%s] Received request to serve file '%s'\n", s.Transport.Address(), msg.Key)
 
-	if !s.store.Has(msg.Key) {
-		return fmt.Errorf("[%s] Received request to serve file %s but it does not exist on disk", s.Transport.Address(), msg.Key)
+	keyToRead := msg.Key
+
+	if s.DB != nil {
+		files, err := s.DB.ListFiles(context.Background())
+		if err == nil {
+			for _, f := range files {
+				if f.Hash == msg.Key {
+					fmt.Printf("[%s] Found original key '%s' for hash '%s'\n", s.Transport.Address(), f.Name, msg.Key)
+					keyToRead = f.Name
+					break
+				}
+			}
+		}
 	}
 
-	fmt.Printf("[%s] Serving file '%s' over the network\n", s.Transport.Address(), msg.Key)
+	encSize, r, err := s.store.Read(keyToRead)
+	if err != nil {
+		return fmt.Errorf("[%s] Failed to read file %s: %v", s.Transport.Address(), keyToRead, err)
+	}
+	if rc, ok := r.(io.ReadCloser); ok {
+		rc.Close()
+	}
 
-	size, r, err := s.store.Read(msg.Key)
+	plaintextSize := encSize - 16
+
+	_, fileReader, err := s.store.ReadDecrypt(s.EncryptionKey, keyToRead)
 	if err != nil {
 		return err
-	}
-
-	if rc, ok := r.(io.ReadCloser); ok {
-		defer rc.Close()
 	}
 
 	peer, ok := s.peers[from]
@@ -107,32 +163,42 @@ func (s *FileServer) handleMessageGetFile(from string, msg MessageGetFile) error
 		return fmt.Errorf("peer %s not found in peer list", from)
 	}
 
-	// send the 'IncomingStream' byte to the peer first
+	storeMsg := Message{
+		Payload: MessageStoreFile{
+			Key:  msg.Key,
+			Size: plaintextSize,
+		},
+	}
+
+	buf := new(bytes.Buffer)
+	if err := gob.NewEncoder(buf).Encode(&storeMsg); err != nil {
+		return err
+	}
+
+	peer.Send([]byte{p2p.IncomingMessage})
+	binary.Write(peer, binary.LittleEndian, int64(buf.Len()))
+	if err := peer.Send(buf.Bytes()); err != nil {
+		return err
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
 	peer.Send([]byte{p2p.IncomingStream})
 
-	// then we can send the file size
-	binary.Write(peer, binary.LittleEndian, size)
-
-	n, err := io.Copy(peer, r)
+	n, err := io.Copy(peer, fileReader)
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("[%s] Written %d bytes over the network to %s\n", s.Transport.Address(), n, from)
+	fmt.Printf("[%s] Written %d bytes (plaintext) over the network to %s\n", s.Transport.Address(), n, from)
 	return nil
 }
 
 func (s *FileServer) handleMessageDeleteFile(from string, msg MessageDeleteFile) error {
 	fmt.Printf("[%s] Received delete request for file with hash '%s' from %s\n", s.Transport.Address(), msg.Key, from)
 
-	// The msg.Key is the hashed key. Files can be stored in two ways:
-	// 1. Locally stored with original key (metadata in DB, file stored with hashed path)
-	// 2. Received from peer with hashed key (no metadata, file stored with double-hashed path)
-	// We need to try both approaches.
-
 	var originalKey string
 	if s.DB != nil {
-		// Try to find the file by hash in the database to get the original key
 		files, err := s.DB.ListFiles(context.Background())
 		if err == nil {
 			for _, f := range files {
@@ -144,35 +210,47 @@ func (s *FileServer) handleMessageDeleteFile(from string, msg MessageDeleteFile)
 		}
 	}
 
-	// First, try to delete using original key (if file was stored locally)
+	dbDeleteFailed := false
+	if s.DB != nil {
+		if err := s.DB.DeleteFile(context.Background(), msg.Key); err != nil {
+			fmt.Printf("[%s] WARNING: Failed to delete file with hash '%s' from database: %v. Continuing with file deletion - DATABASE INCONSISTENCY DETECTED\n", s.Transport.Address(), msg.Key, err)
+			dbDeleteFailed = true
+		} else {
+			fmt.Printf("[%s] Deleted file with hash '%s' from database\n", s.Transport.Address(), msg.Key)
+		}
+	}
+
+	fileDeleted := false
+
 	if originalKey != "" {
 		if s.store.Has(originalKey) {
 			if err := s.store.Delete(originalKey); err != nil {
 				return fmt.Errorf("[%s] Error deleting file '%s': %v", s.Transport.Address(), originalKey, err)
 			}
 			fmt.Printf("[%s] Deleted file '%s' from local storage\n", s.Transport.Address(), originalKey)
-			return nil
+			fileDeleted = true
 		}
 	}
 
-	// If original key approach didn't work, try deleting using the hashed key directly
-	// (for files received from peers, which were stored with the hashed key)
-	if s.store.Has(msg.Key) {
+	if !fileDeleted && s.store.Has(msg.Key) {
 		if err := s.store.Delete(msg.Key); err != nil {
 			return fmt.Errorf("[%s] Error deleting file with hash '%s': %v", s.Transport.Address(), msg.Key, err)
 		}
 		fmt.Printf("[%s] Deleted file with hash '%s' from local storage\n", s.Transport.Address(), msg.Key)
-		return nil
+		fileDeleted = true
 	}
 
-	fmt.Printf("[%s] File with hash '%s' does not exist locally, skipping deletion\n", s.Transport.Address(), msg.Key)
+	if !fileDeleted {
+		fmt.Printf("[%s] File with hash '%s' does not exist locally, skipping deletion\n", s.Transport.Address(), msg.Key)
+	}
+
+	if dbDeleteFailed {
+		fmt.Printf("[%s] WARNING: Database inconsistency - file deleted from disk but database cleanup failed for hash '%s'\n", s.Transport.Address(), msg.Key)
+	}
 	return nil
 }
 
 func (s *FileServer) stream(msg *Message) error {
-
-	// Peer implements net.Conn which implements Writer interface
-	// therefore we can use Peer as a writer
 	peers := []io.Writer{}
 	for _, peer := range s.peers {
 		peers = append(peers, peer)
@@ -194,6 +272,7 @@ func (s *FileServer) broadcast(msg *Message) error {
 	for addr, peer := range s.peers {
 		fmt.Printf("[%s] Sending message to peer %s\n", s.Transport.Address(), addr)
 		peer.Send([]byte{p2p.IncomingMessage})
+		binary.Write(peer, binary.LittleEndian, int64(buf.Len()))
 		if err := peer.Send(buf.Bytes()); err != nil {
 			fmt.Printf("[%s] Error sending message to peer %s: %v\n", s.Transport.Address(), addr, err)
 			return err
@@ -206,100 +285,148 @@ func (s *FileServer) broadcast(msg *Message) error {
 func (s *FileServer) Get(key string) (int64, io.Reader, error) {
 	if s.store.Has(key) {
 		fmt.Printf("[%s] File '%s' found locally! Serving file from disk...\n", s.Transport.Address(), key)
-		return s.store.Read(key)
+		return s.store.ReadDecrypt(s.EncryptionKey, key)
 	}
 
 	fmt.Printf("[%s] Did not find file '%s' locally, searching on network...\n", s.Transport.Address(), key)
 
+	// Create channel to wait for download
+	hash := hashKey(key)
+	ch := make(chan struct{})
+	s.downloadChannels[hash] = ch
+
 	msg := Message{
 		Payload: MessageGetFile{
-			Key: hashKey(key),
+			Key: hash,
 		},
 	}
 
 	if err := s.broadcast(&msg); err != nil {
+		delete(s.downloadChannels, hash)
 		return 0, nil, err
 	}
 
-	time.Sleep(time.Millisecond * 500)
-
-	for _, peer := range s.peers {
-		// first read the file size so we can limit the amt of bytes
-		// that we read from the connection, so it will not keep hanging
-
-		var fileSize int64
-		binary.Read(peer, binary.LittleEndian, &fileSize)
-
-		n, err := s.store.WriteDecrypt(s.EncryptionKey, key, io.LimitReader(peer, fileSize))
-		if err != nil {
-			return 0, nil, err
-		}
-
-		fmt.Printf("[%s] Received %d bytes over the network from [%s]\n", s.Transport.Address(), n, peer.RemoteAddr())
-		peer.CloseStream()
+	// Wait for download to complete or timeout
+	select {
+	case <-ch:
+		fmt.Printf("[%s] File downloaded successfully!\n", s.Transport.Address())
+		// The file was downloaded and stored using the hash
+		return s.store.ReadDecrypt(s.EncryptionKey, hash)
+	case <-time.After(10 * time.Second):
+		delete(s.downloadChannels, hash)
+		return 0, nil, fmt.Errorf("timeout waiting for file download")
 	}
-
-	return s.store.Read(key)
-
 }
 
 func (s *FileServer) Store(key string, r io.Reader) error {
 
-	fileBuf := new(bytes.Buffer)
-	tee := io.TeeReader(r, fileBuf)
-
-	size, err := s.store.Write(key, tee)
+	// 1. Write Encrypted to disk.
+	n, err := s.store.WriteEncrypt(s.EncryptionKey, key, r)
 	if err != nil {
 		return err
 	}
 
-	// Record file metadata if DB is configured
+	plaintextSize := n - 16
+
 	if s.DB != nil {
 		_ = s.DB.InsertFileWithKey(context.Background(), dbpkg.File{
 			ID:        hashKey(key),
 			Name:      key,
 			Hash:      hashKey(key),
-			Size:      size,
+			Size:      plaintextSize,
 			LocalPath: s.store.FullPathForKey(key),
 		}, "default")
 	}
 
+	s.peersLock.Lock()
+	peers := []io.Writer{}
+	peerAddrs := []string{}
+	for addr, peer := range s.peers {
+		peers = append(peers, peer)
+		peerAddrs = append(peerAddrs, addr)
+	}
+	s.peersLock.Unlock()
+
 	msg := Message{
 		Payload: MessageStoreFile{
 			Key:  hashKey(key),
-			Size: size + 16, // IV which is 16 bytes is prepended
+			Size: plaintextSize,
 		},
 	}
 
-	if err := s.broadcast(&msg); err != nil {
+	buf := new(bytes.Buffer)
+	if err := gob.NewEncoder(buf).Encode(&msg); err != nil {
 		return err
 	}
 
-	time.Sleep(500 * time.Millisecond)
-
-	peers := []io.Writer{}
-
-	for _, peer := range s.peers {
-		peers = append(peers, peer)
+	for i, peer := range peers {
+		addr := peerAddrs[i]
+		fmt.Printf("[%s] Sending message to peer %s\n", s.Transport.Address(), addr)
+		if p, ok := peer.(p2p.Peer); ok {
+			p.Send([]byte{p2p.IncomingMessage})
+			binary.Write(p, binary.LittleEndian, int64(buf.Len()))
+			if err := p.Send(buf.Bytes()); err != nil {
+				fmt.Printf("[%s] Error sending message to peer %s: %v\n", s.Transport.Address(), addr, err)
+			}
+		}
 	}
 
-	mw := io.MultiWriter(peers...)
-	mw.Write([]byte{p2p.IncomingStream})
-	n, err := copyEncrypt(s.EncryptionKey, fileBuf, mw)
+	_, fileReader, err := s.store.ReadDecrypt(s.EncryptionKey, key)
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("[%s] Received and written %d bytes to disk\n", s.Transport.Address(), n)
+	mw := io.MultiWriter(peers...)
+	mw.Write([]byte{p2p.IncomingStream})
+
+	written, err := io.Copy(mw, fileReader)
+	if err != nil {
+		return err
+	}
+
+	if s.DB != nil {
+		fileID := hashKey(key)
+		for _, addr := range peerAddrs {
+			shareID := hashKey(fileID + addr + "outgoing")
+			_ = s.DB.InsertShare(context.Background(), dbpkg.Share{
+				ID:        shareID,
+				FileID:    fileID,
+				PeerID:    addr,
+				Direction: "outgoing",
+			})
+		}
+	}
+
+	fmt.Printf("[%s] Received and written %d bytes to disk (encrypted), sent %d bytes (plaintext) to peers\n", s.Transport.Address(), n, written)
 
 	return nil
 }
 
 func (s *FileServer) Delete(key string) error {
-	// Delete locally first
+	fileID := hashKey(key)
+
+	// Query peers that have this file BEFORE deleting from DB
+	var sharePeers []string
+	if s.DB != nil {
+		peers, err := s.DB.GetOutgoingSharePeers(context.Background(), fileID)
+		if err != nil {
+			fmt.Printf("[%s] Warning: could not query share peers: %v\n", s.Transport.Address(), err)
+		} else {
+			sharePeers = peers
+		}
+	}
+
+	// Delete from local database
+	if s.DB != nil {
+		if err := s.DB.DeleteFile(context.Background(), fileID); err != nil {
+			return fmt.Errorf("[%s] Failed to delete file '%s' from database: %v. File not deleted from disk to maintain consistency", s.Transport.Address(), key, err)
+		}
+		fmt.Printf("[%s] Deleted file '%s' from database\n", s.Transport.Address(), key)
+	}
+
+	// Delete from local storage
 	if !s.store.Has(key) {
 		fmt.Printf("[%s] File '%s' does not exist locally\n", s.Transport.Address(), key)
-		// Still broadcast the delete in case other peers have it
 	} else {
 		if err := s.store.Delete(key); err != nil {
 			return err
@@ -307,7 +434,21 @@ func (s *FileServer) Delete(key string) error {
 		fmt.Printf("[%s] Deleted file '%s' from local storage\n", s.Transport.Address(), key)
 	}
 
-	// Check if we have any peers connected
+	// Connect to peers that have the file (from shares table)
+	if len(sharePeers) > 0 {
+		fmt.Printf("[%s] Connecting to %d peer(s) from shares: %v\n", s.Transport.Address(), len(sharePeers), sharePeers)
+		for _, addr := range sharePeers {
+			go func(addr string) {
+				if err := s.Transport.Dial(addr); err != nil {
+					fmt.Printf("[%s] Could not connect to share peer %s: %v\n", s.Transport.Address(), addr, err)
+				}
+			}(addr)
+		}
+		// Wait for connections to establish
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// Now broadcast to all connected peers
 	s.peersLock.Lock()
 	peerCount := len(s.peers)
 	peerAddrs := make([]string, 0, len(s.peers))
@@ -323,10 +464,9 @@ func (s *FileServer) Delete(key string) error {
 		return nil
 	}
 
-	// Broadcast delete message to all peers
 	msg := Message{
 		Payload: MessageDeleteFile{
-			Key: hashKey(key),
+			Key: fileID,
 		},
 	}
 
@@ -342,23 +482,77 @@ func (s *FileServer) Stop() {
 	close(s.quitch)
 }
 
-// in OnPeer
 func (s *FileServer) OnPeer(p p2p.Peer) error {
+	peerAddr := p.RemoteAddr().String()
+
 	s.peersLock.Lock()
 	defer s.peersLock.Unlock()
-	s.peers[p.RemoteAddr().String()] = p
-	fmt.Printf("[%s] Connected with remote %s\n", s.Transport.Address(), p.RemoteAddr().String())
+	s.peers[peerAddr] = p
+
+	fmt.Printf("[%s] Connected with remote %s\n", s.Transport.Address(), peerAddr)
 
 	if s.DB != nil {
 		now := time.Now()
 		_ = s.DB.UpsertPeer(context.Background(), dbpkg.Peer{
-			ID:       p.RemoteAddr().String(),
-			Address:  p.RemoteAddr().String(),
+			ID:       peerAddr,
+			Address:  peerAddr,
 			Status:   "connected",
 			LastSeen: &now,
 		})
 	}
+
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+
+		for i := 0; i < 5; i++ {
+			if err := s.sendPeerExchange(peerAddr); err != nil {
+				fmt.Printf("[%s] Error sending peer exchange to %s: %v (attempt %d/5)\n", s.Transport.Address(), peerAddr, err, i+1)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			break
+		}
+	}()
+
 	return nil
+}
+
+type Handshake struct {
+	ListenAddr string
+}
+
+func GetHandshakeFunc(listenAddr string) p2p.HandshakeFunc {
+	return func(p any) error {
+		peer, ok := p.(*p2p.TCPPeer)
+		if !ok {
+			return fmt.Errorf("invalid peer type for TCP handshake")
+		}
+
+		hs := Handshake{
+			ListenAddr: listenAddr,
+		}
+
+		// 1. Send our handshake
+		buf := new(bytes.Buffer)
+		if err := gob.NewEncoder(buf).Encode(hs); err != nil {
+			return err
+		}
+
+		if err := peer.Send(buf.Bytes()); err != nil {
+			return err
+		}
+
+		// 2. Receive their handshake
+		var remoteHS Handshake
+		if err := gob.NewDecoder(peer).Decode(&remoteHS); err != nil {
+			return err
+		}
+
+		fmt.Printf("[%s] Handshake successful with %s\n", listenAddr, remoteHS.ListenAddr)
+		peer.FullAddr = remoteHS.ListenAddr
+
+		return nil
+	}
 }
 
 func (s *FileServer) bootstrapNetwork() error {
@@ -394,11 +588,13 @@ func (s *FileServer) waitForPeers(timeout time.Duration) error {
 	return fmt.Errorf("timeout waiting for peer connections")
 }
 
-// register MessageStoreFile on gob, since we use any for payload
 func init() {
 	gob.Register(MessageStoreFile{})
 	gob.Register(MessageGetFile{})
 	gob.Register(MessageDeleteFile{})
+	gob.Register(MessagePeerExchange{})
+	gob.Register(PeerInfo{})
+	gob.Register(Handshake{})
 }
 
 type FileServerOpts struct {
@@ -418,6 +614,9 @@ type FileServer struct {
 
 	store  *Store
 	quitch chan struct{}
+
+	pendingFileTransfers map[string]MessageStoreFile
+	downloadChannels     map[string]chan struct{}
 }
 
 func NewFileServer(opts FileServerOpts) *FileServer {
@@ -426,10 +625,12 @@ func NewFileServer(opts FileServerOpts) *FileServer {
 		PathTransformFunc: opts.PathTransformFunc,
 	}
 	return &FileServer{
-		FileServerOpts: opts,
-		store:          NewStore(storeOpts),
-		quitch:         make(chan struct{}),
-		peers:          make(map[string]p2p.Peer),
+		FileServerOpts:       opts,
+		store:                NewStore(storeOpts),
+		quitch:               make(chan struct{}),
+		peers:                make(map[string]p2p.Peer),
+		pendingFileTransfers: make(map[string]MessageStoreFile),
+		downloadChannels:     make(map[string]chan struct{}),
 	}
 }
 
@@ -448,4 +649,13 @@ type MessageGetFile struct {
 
 type MessageDeleteFile struct {
 	Key string
+}
+
+type MessagePeerExchange struct {
+	Peers []PeerInfo
+}
+
+type PeerInfo struct {
+	Address  string
+	LastSeen time.Time
 }

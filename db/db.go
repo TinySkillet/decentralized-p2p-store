@@ -8,24 +8,22 @@ import (
 )
 
 type DB struct {
-	sql *sql.DB
+	sql  *sql.DB
+	path string
 }
 
 func Open(path string) (*DB, error) {
-	// e.g., path = "p2p.db"
-	d, err := sql.Open("sqlite", path)
+	dsn := path + "?_pragma=busy_timeout=5000&_pragma=journal_mode=WAL"
+	d, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	// busy timeout reasonable for single-process writes
-	if _, err := d.Exec(`PRAGMA busy_timeout=3000;`); err != nil {
-		_ = d.Close()
-		return nil, err
-	}
-	return &DB{sql: d}, nil
+	return &DB{sql: d, path: path}, nil
 }
 
 func (d *DB) Close() error { return d.sql.Close() }
+
+func (d *DB) Path() string { return d.path }
 
 func (d *DB) Migrate(ctx context.Context) error {
 	stmts := []string{

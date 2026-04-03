@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"encoding/binary"
 	"io"
 )
 
@@ -17,21 +18,23 @@ func (decoder DefaultDecoder) Decode(r io.Reader, msg *RPC) error {
 		return err
 	}
 
-	// in case of a stream, we do not decode
 	stream := peekBuf[0] == IncomingStream
 	if stream {
 		msg.Stream = true
 		return nil
 	}
 
-	buf := make([]byte, 2028)
-
-	n, err := r.Read(buf)
-	if err != nil {
+	var length int64
+	if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
 		return err
 	}
 
-	msg.Payload = buf[:n]
+	buf := make([]byte, length)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return err
+	}
+
+	msg.Payload = buf
 
 	return nil
 }

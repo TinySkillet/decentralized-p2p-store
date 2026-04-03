@@ -1,0 +1,39 @@
+# P2P Storage Node Configuration
+
+# Listen address - the port this node will bind to
+# Format: :PORT or IP:PORT
+# Default: :3000
+listen=:3000
+
+# Database path - where to store peer and file metadata
+# Supports ~ for home directory
+# Default: ~/.p2p/p2p.db
+db=~/.p2p/p2p.db
+
+# Bootstrap nodes - comma-separated list of initial peers to connect to
+# Leave empty for standalone/bootstrap nodes
+# Examples:
+#   Single node:    bootstrap=localhost:4000
+#   Multiple nodes: bootstrap=192.168.1.100:3000,192.168.1.101:3000,bootstrap.example.com:3000
+#
+# For production networks, specify 2-3 stable bootstrap nodes:
+bootstrap=
+
+# ========================================
+# Example Configurations
+# ========================================
+
+# Configuration 1: Bootstrap Node (First node in network)
+# listen=:3000
+# db=~/.p2p/p2p.db
+# bootstrap=
+
+# Configuration 2: Regular Node (Connects to existing network)
+# listen=:3000
+# db=~/.p2p/p2p.db
+# bootstrap=localhost:3000,localhost:4000
+
+# Configuration 3: Production Node
+# listen=:3000
+# db=~/.p2p/p2p.db
+# bootstrap=bootstrap1.example.com:3000,bootstrap2.example.com:3000

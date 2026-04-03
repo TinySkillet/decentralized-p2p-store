@@ -1,9 +1,0 @@
-:3000_network/
-:4000_network/
-daily_progress/
-vendor/
-.gitignore/
-go.mod
-go.sum
-storage_test.go
-bin/

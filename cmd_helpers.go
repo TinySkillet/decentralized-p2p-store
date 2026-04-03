@@ -2,15 +2,26 @@ package main
 
 import (
 	"context"
+	"path/filepath"
+	"strings"
 
 	dbpkg "github.com/TinySkillet/DecentralizedP2PStorage/db"
 	"github.com/TinySkillet/DecentralizedP2PStorage/p2p"
 )
 
+func getStorageRoot(listenAddr string) string {
+	port := strings.TrimPrefix(listenAddr, ":")
+	if strings.Contains(port, ":") {
+		parts := strings.Split(port, ":")
+		port = parts[len(parts)-1]
+	}
+	return "node_" + port + "_data"
+}
+
 func makeServer(listenAddr string, nodes ...string) *FileServer {
 	tcpTransportOpts := p2p.TCPTransportOpts{
 		ListenAddr:    listenAddr,
-		HandshakeFunc: p2p.NOPHandshakeFunc,
+		HandshakeFunc: GetHandshakeFunc(listenAddr),
 		Decoder:       p2p.DefaultDecoder{},
 	}
 	tcpTransport := p2p.NewTCPTransport(tcpTransportOpts)
@@ -18,7 +29,7 @@ func makeServer(listenAddr string, nodes ...string) *FileServer {
 	fileServerOpts := FileServerOpts{
 		EncryptionKey:     newEcryptionKey(),
 		PathTransformFunc: CASPathTransformFunc,
-		StorageRoot:       listenAddr + "_network",
+		StorageRoot:       getStorageRoot(listenAddr),
 		Transport:         tcpTransport,
 		BootstrapNodes:    nodes,
 	}
@@ -31,15 +42,23 @@ func makeServer(listenAddr string, nodes ...string) *FileServer {
 func makeServerWithDB(listenAddr string, db *dbpkg.DB, nodes ...string) *FileServer {
 	tcpTransportOpts := p2p.TCPTransportOpts{
 		ListenAddr:    listenAddr,
-		HandshakeFunc: p2p.NOPHandshakeFunc,
+		HandshakeFunc: GetHandshakeFunc(listenAddr),
 		Decoder:       p2p.DefaultDecoder{},
 	}
 	tcpTransport := p2p.NewTCPTransport(tcpTransportOpts)
 
+	var storageRoot string
+	if db != nil {
+		dbDir := filepath.Dir(db.Path())
+		storageRoot = filepath.Join(dbDir, "files")
+	} else {
+		storageRoot = getStorageRoot(listenAddr)
+	}
+
 	fileServerOpts := FileServerOpts{
 		EncryptionKey:     newEcryptionKey(),
 		PathTransformFunc: CASPathTransformFunc,
-		StorageRoot:       listenAddr + "_network",
+		StorageRoot:       storageRoot,
 		Transport:         tcpTransport,
 		BootstrapNodes:    nodes,
 		DB:                db,
