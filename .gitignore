@@ -2,7 +2,7 @@ bin/
 .env
 .codex
 .cursorignore
-daily_progress*
+daily_progress/
 vendor/**/.gitignore
 
 node_*/
