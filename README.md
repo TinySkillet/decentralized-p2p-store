@@ -16,6 +16,41 @@ Peer-to-peer file storage with automatic peer discovery, file replication, SQLit
 go build -o bin/p2p
 ```
 
+## CLI
+
+The binary is invoked as:
+
+```bash
+./bin/p2p <command> [arguments] [flags]
+```
+
+Common flags:
+
+- `--db <path>`: SQLite database path. Defaults to `p2p.db`.
+- `--listen <addr>`: Local listen address for commands that start a temporary node, for example `:3000`.
+- `--bootstrap <host:port>`: One or more peer addresses to join an existing network.
+
+Command formats:
+
+- `serve --listen <addr> [--db <path>] [--bootstrap <host:port>] [--config <path>]`
+  Starts a node and keeps it running. Use this for long-lived peers.
+- `store <key> <file> --listen <addr> [--db <path>] [--bootstrap <host:port>]`
+  Stores a local file under a key and broadcasts it to peers.
+- `get <key> --listen <addr> [--db <path>] [--bootstrap <host:port>] [--out <file>]`
+  Fetches a file by key from the local node or the network. If `--out` is omitted, the file is written to stdout.
+- `delete <key> --listen <addr> [--db <path>] [--bootstrap <host:port>]`
+  Deletes a file by key locally and propagates the deletion to peers.
+- `files list [--db <path>]`
+  Lists files known to the local database.
+- `shares [--db <path>]`
+  Lists file share records for files stored on other peers.
+- `peers [--db <path>]`
+  Lists known peers and their last seen status.
+- `cleanup [--db <path>]`
+  Removes stale peer records from the database.
+- `demo`
+  Starts the built-in local three-node demo flow.
+
 ## Local Testing
 
 Use the helper script to prepare three local nodes:
