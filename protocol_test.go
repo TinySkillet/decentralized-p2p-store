@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
+	"fmt"
 	"io"
 	"io/fs"
 	"net"
@@ -495,3 +496,86 @@ type stubPortSource struct {
 
 func (s stubPortSource) Address() string   { return s.address }
 func (s stubPortSource) BoundAddr() string { return s.bound }
+
+// TestAdmitLimitsIdentitiesPerHost covers the admission side of the Sybil
+// filtering: one machine may not present an unbounded number of identities.
+func TestAdmitLimitsIdentitiesPerHost(t *testing.T) {
+	node := newTestNode(t)
+	node.MaxPeersPerHost = 2
+
+	ctx := context.Background()
+	now := time.Now()
+
+	// Two identities already accepted from one host.
+	for i := range 2 {
+		addr := fmt.Sprintf("10.0.0.5:%d", 3000+i)
+		if err := node.db.UpsertPeer(ctx, dbpkg.Peer{
+			ID:       addr,
+			Address:  addr,
+			NodeID:   fmt.Sprintf("sybil-%d", i),
+			Status:   "connected",
+			LastSeen: &now,
+		}); err != nil {
+			t.Fatalf("UpsertPeer: %v", err)
+		}
+	}
+
+	if err := node.admit("10.0.0.5:3002", "sybil-2"); err == nil {
+		t.Fatal("a third identity from the same host was admitted, want a refusal")
+	}
+
+	// A different host is unaffected.
+	if err := node.admit("10.0.0.6:3000", "genuine-peer"); err != nil {
+		t.Errorf("a peer on a different host was refused: %v", err)
+	}
+}
+
+// TestAdmitExemptsLoopback keeps the documented local setup working.
+func TestAdmitExemptsLoopback(t *testing.T) {
+	node := newTestNode(t)
+	node.MaxPeersPerHost = 1
+
+	ctx := context.Background()
+	now := time.Now()
+	for i := range 5 {
+		addr := fmt.Sprintf("127.0.0.1:%d", 3000+i)
+		if err := node.db.UpsertPeer(ctx, dbpkg.Peer{
+			ID:       addr,
+			Address:  addr,
+			NodeID:   fmt.Sprintf("local-%d", i),
+			Status:   "connected",
+			LastSeen: &now,
+		}); err != nil {
+			t.Fatalf("UpsertPeer: %v", err)
+		}
+	}
+
+	if err := node.admit("127.0.0.1:3005", "local-5"); err != nil {
+		t.Errorf("a loopback peer was refused: %v", err)
+	}
+}
+
+// TestAdmitAllowsReconnectionOfKnownIdentity checks a peer that drops and
+// comes back is not counted twice against its host's budget.
+func TestAdmitAllowsReconnectionOfKnownIdentity(t *testing.T) {
+	node := newTestNode(t)
+	node.MaxPeersPerHost = 1
+
+	ctx := context.Background()
+	now := time.Now()
+	if err := node.db.UpsertPeer(ctx, dbpkg.Peer{
+		ID: "10.0.0.5:3000", Address: "10.0.0.5:3000", NodeID: "returning",
+		Status: "disconnected", LastSeen: &now,
+	}); err != nil {
+		t.Fatalf("UpsertPeer: %v", err)
+	}
+
+	peer := &countingPeer{}
+	node.peersLock.Lock()
+	node.peers["10.0.0.5:3000"] = peer
+	node.peersLock.Unlock()
+
+	if err := node.admit("10.0.0.5:3000", peer.ID()); err != nil {
+		t.Errorf("a already-connected identity was refused on reconnect: %v", err)
+	}
+}

@@ -101,6 +101,7 @@ func (d *DB) Migrate(ctx context.Context) error {
 	// statement skipped rather than treated as a failure.
 	altered := []struct{ table, column, ddl string }{
 		{"peers", "node_id", `ALTER TABLE peers ADD COLUMN node_id TEXT NOT NULL DEFAULT ''`},
+		{"peers", "host", `ALTER TABLE peers ADD COLUMN host TEXT NOT NULL DEFAULT ''`},
 		{"files", "digest", `ALTER TABLE files ADD COLUMN digest TEXT NOT NULL DEFAULT ''`},
 	}
 	for _, a := range altered {
@@ -116,7 +117,16 @@ func (d *DB) Migrate(ctx context.Context) error {
 		}
 	}
 
-	if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_peers_node_id ON peers(node_id)`); err != nil {
+	for _, stmt := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_peers_node_id ON peers(node_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_peers_host ON peers(host)`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+
+	if err := backfillPeerHosts(ctx, tx); err != nil {
 		return err
 	}
 
@@ -125,6 +135,38 @@ func (d *DB) Migrate(ctx context.Context) error {
 	}
 
 	return tx.Commit()
+}
+
+// backfillPeerHosts fills in the host column for rows written before it
+// existed, so the per-host limits apply to them too.
+func backfillPeerHosts(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `SELECT id, address FROM peers WHERE host = ''`)
+	if err != nil {
+		return err
+	}
+
+	type peerRow struct{ id, address string }
+	var pending []peerRow
+	for rows.Next() {
+		var p peerRow
+		if err := rows.Scan(&p.id, &p.address); err != nil {
+			rows.Close()
+			return err
+		}
+		pending = append(pending, p)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	for _, p := range pending {
+		if _, err := tx.ExecContext(ctx, `UPDATE peers SET host = ? WHERE id = ?`, HostOf(p.address), p.id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // addShareForeignKey gives shares a foreign key onto files, so a replication

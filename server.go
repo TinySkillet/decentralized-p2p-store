@@ -24,6 +24,10 @@ const downloadTimeout = 10 * time.Second
 // a key. It is short because an offer is a single small message.
 const offerTimeout = 5 * time.Second
 
+// peerRecency is how far back a peer counts as active when the per-host
+// identity limit is applied.
+const peerRecency = 30 * time.Minute
+
 // Listen binds the transport and starts connecting to bootstrap nodes. It
 // returns as soon as the socket is bound, so callers can report a bind
 // failure directly instead of discovering it later on a background goroutine.
@@ -833,6 +837,10 @@ func (s *FileServer) Stop() {
 func (s *FileServer) OnPeer(p p2p.Peer) error {
 	peerAddr := p.RemoteAddr().String()
 
+	if err := s.admit(peerAddr, p.ID()); err != nil {
+		return err
+	}
+
 	s.peersLock.Lock()
 	s.peers[peerAddr] = p
 	s.peersLock.Unlock()
@@ -855,6 +863,41 @@ func (s *FileServer) OnPeer(p p2p.Peer) error {
 	go s.announceTo(peerAddr)
 
 	return nil
+}
+
+// admit decides whether a peer may join this node's peer set.
+//
+// One machine presenting many identities is the shape a Sybil attack takes,
+// so the number of identities accepted from a single address is capped. The
+// network is scoped to trusted groups reached through a known bootstrap node,
+// and this limits the damage a single compromised host can do to the peer
+// tables that get gossiped onward.
+//
+// Loopback is exempt: several nodes on one machine is the normal local
+// testing arrangement, not an attack.
+func (s *FileServer) admit(peerAddr, nodeID string) error {
+	if s.DB == nil || nodeID == "" {
+		return nil
+	}
+
+	host := dbpkg.HostOf(peerAddr)
+	if dbpkg.IsLoopbackHost(host) {
+		return nil
+	}
+
+	// An identity already known at this address is a reconnection, not a new
+	// claim on the budget.
+	known, err := s.DB.CountActivePeersForHost(context.Background(), host, peerRecency)
+	if err != nil {
+		log.Printf("[%s] Could not check peer count for %s: %v", s.Transport.Address(), host, err)
+		return nil
+	}
+	if s.hasPeerWithNodeID(nodeID) || known < s.MaxPeersPerHost {
+		return nil
+	}
+
+	return fmt.Errorf("refusing peer %s: host %s already has %d identities, limit is %d",
+		nodeID, host, known, s.MaxPeersPerHost)
 }
 
 // OnPeerDisconnect drops a peer whose connection has ended. Without it the
@@ -1081,7 +1124,12 @@ func init() {
 }
 
 type FileServerOpts struct {
-	NodeID            string
+	NodeID string
+
+	// MaxPeersPerHost caps how many identities may be accepted from one
+	// address. Zero means the package default.
+	MaxPeersPerHost int
+
 	EncryptionKey     []byte
 	StorageRoot       string
 	PathTransformFunc PathTransformFunc
@@ -1114,6 +1162,9 @@ type FileServer struct {
 }
 
 func NewFileServer(opts FileServerOpts) *FileServer {
+	if opts.MaxPeersPerHost <= 0 {
+		opts.MaxPeersPerHost = dbpkg.DefaultMaxPeersPerHost
+	}
 	storeOpts := StoreOpts{
 		Root:              opts.StorageRoot,
 		PathTransformFunc: opts.PathTransformFunc,

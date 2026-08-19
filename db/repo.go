@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"strings"
 	"time"
 )
@@ -101,6 +102,30 @@ func parseTime(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unrecognised timestamp %q", s)
 }
 
+// HostOf returns the host half of a "host:port" address. An address without a
+// port is treated as a bare host.
+func HostOf(address string) string {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return strings.TrimSpace(address)
+	}
+	return host
+}
+
+// loopbackHosts are exempt from the per-host peer limit. Running several
+// nodes on one machine is a normal development and testing setup, and is the
+// arrangement the local testing instructions describe.
+var loopbackHosts = map[string]bool{
+	"127.0.0.1": true,
+	"::1":       true,
+	"localhost": true,
+}
+
+// IsLoopbackHost reports whether the per-host peer limit should be skipped.
+func IsLoopbackHost(host string) bool {
+	return loopbackHosts[host]
+}
+
 func (d *DB) UpsertPeer(ctx context.Context, p Peer) error {
 	var lastSeen any
 	if p.LastSeen != nil {
@@ -109,18 +134,20 @@ func (d *DB) UpsertPeer(ctx context.Context, p Peer) error {
 
 	// Conflicts can arrive on either unique column, so both are handled.
 	_, err := d.sql.ExecContext(ctx, `
-		INSERT INTO peers(id,address,node_id,status,last_seen)
-		VALUES(?,?,?,?,?)
+		INSERT INTO peers(id,address,node_id,host,status,last_seen)
+		VALUES(?,?,?,?,?,?)
 		ON CONFLICT(address) DO UPDATE SET
 			node_id=excluded.node_id,
+			host=excluded.host,
 			status=excluded.status,
 			last_seen=excluded.last_seen
 		ON CONFLICT(id) DO UPDATE SET
 			address=excluded.address,
 			node_id=excluded.node_id,
+			host=excluded.host,
 			status=excluded.status,
 			last_seen=excluded.last_seen
-	`, p.ID, p.Address, p.NodeID, p.Status, lastSeen)
+	`, p.ID, p.Address, p.NodeID, HostOf(p.Address), p.Status, lastSeen)
 	return err
 }
 
@@ -261,19 +288,51 @@ func (d *DB) DeleteFileByName(ctx context.Context, name string) (hash string, or
 	return hash, remaining == 0, nil
 }
 
+// CountActivePeersForHost reports how many recently seen peers share an IP.
+//
+// One machine presenting many identities is the shape a Sybil attack takes,
+// so the count is what the per-host admission limit is checked against.
+func (d *DB) CountActivePeersForHost(ctx context.Context, host string, maxAge time.Duration) (int, error) {
+	cutoff := formatTime(time.Now().Add(-maxAge))
+
+	var n int
+	err := d.sql.QueryRowContext(ctx, `
+		SELECT COUNT(DISTINCT node_id) FROM peers
+		WHERE host = ? AND node_id != '' AND last_seen IS NOT NULL AND last_seen > ?
+	`, host, cutoff).Scan(&n)
+	return n, err
+}
+
 // GetActivePeers returns recently active peers for discovery.
+//
+// At most maxPerHost peers are returned for any one IP address, so a single
+// machine cannot crowd out the rest of the network in the peer lists this
+// node gossips onward. Loopback is exempt, because several nodes on one
+// machine is a normal local setup rather than an attack.
 //
 // A row with an unreadable timestamp is skipped rather than failing the whole
 // query: one malformed record should not blind the node to every other peer.
 func (d *DB) GetActivePeers(ctx context.Context, maxAge time.Duration, limit int) ([]Peer, error) {
+	return d.getActivePeers(ctx, maxAge, limit, DefaultMaxPeersPerHost)
+}
+
+// DefaultMaxPeersPerHost bounds how many identities one IP may contribute to
+// the peer list.
+const DefaultMaxPeersPerHost = 3
+
+func (d *DB) getActivePeers(ctx context.Context, maxAge time.Duration, limit, maxPerHost int) ([]Peer, error) {
 	cutoff := formatTime(time.Now().Add(-maxAge))
 	rows, err := d.sql.QueryContext(ctx, `
-		SELECT id, address, node_id, status, last_seen
-		FROM peers
-		WHERE last_seen IS NOT NULL AND last_seen > ?
+		SELECT id, address, node_id, status, last_seen FROM (
+			SELECT id, address, node_id, host, status, last_seen,
+			       ROW_NUMBER() OVER (PARTITION BY host ORDER BY last_seen DESC) AS rank_in_host
+			FROM peers
+			WHERE last_seen IS NOT NULL AND last_seen > ?
+		)
+		WHERE rank_in_host <= ? OR host IN ('127.0.0.1', '::1', 'localhost')
 		ORDER BY last_seen DESC
 		LIMIT ?
-	`, cutoff, limit)
+	`, cutoff, maxPerHost, limit)
 	if err != nil {
 		return nil, err
 	}
