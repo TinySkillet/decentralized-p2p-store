@@ -41,10 +41,18 @@ type File struct {
 	CreatedAt time.Time
 }
 
+// Peer is a node this one has seen.
+//
+// It is keyed by NodeID: a node keeps its identity as it moves between
+// networks, so the address is a hint about where it was last reached rather
+// than what it is.
 type Peer struct {
-	ID       string
-	Address  string
-	NodeID   string
+	NodeID  string
+	Address string
+
+	// Addrs are additional places this peer may be reachable.
+	Addrs []string
+
 	Status   string
 	LastSeen *time.Time
 }
@@ -107,6 +115,19 @@ func parseTime(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unrecognised timestamp %q", s)
 }
 
+// joinAddrs and splitAddrs store the extra location hints in one column.
+// Newline separated because an address never contains one.
+func joinAddrs(addrs []string) string {
+	return strings.Join(addrs, "\n")
+}
+
+func splitAddrs(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, "\n")
+}
+
 // HostOf returns the host half of a "host:port" address. An address without a
 // port is treated as a bare host.
 func HostOf(address string) string {
@@ -137,22 +158,18 @@ func (d *DB) UpsertPeer(ctx context.Context, p Peer) error {
 		lastSeen = formatTime(*p.LastSeen)
 	}
 
-	// Conflicts can arrive on either unique column, so both are handled.
+	// Identity is the only key, so there is one conflict to handle: the same
+	// node seen again, wherever it was reached this time.
 	_, err := d.sql.ExecContext(ctx, `
-		INSERT INTO peers(id,address,node_id,host,status,last_seen)
+		INSERT INTO peers(id,address,addrs,host,status,last_seen)
 		VALUES(?,?,?,?,?,?)
-		ON CONFLICT(address) DO UPDATE SET
-			node_id=excluded.node_id,
-			host=excluded.host,
-			status=excluded.status,
-			last_seen=excluded.last_seen
 		ON CONFLICT(id) DO UPDATE SET
 			address=excluded.address,
-			node_id=excluded.node_id,
+			addrs=excluded.addrs,
 			host=excluded.host,
 			status=excluded.status,
 			last_seen=excluded.last_seen
-	`, p.ID, p.Address, p.NodeID, HostOf(p.Address), p.Status, lastSeen)
+	`, p.NodeID, p.Address, joinAddrs(p.Addrs), HostOf(p.Address), p.Status, lastSeen)
 	return err
 }
 
@@ -444,8 +461,8 @@ func (d *DB) CountActivePeersForHost(ctx context.Context, host string, maxAge ti
 
 	var n int
 	err := d.sql.QueryRowContext(ctx, `
-		SELECT COUNT(DISTINCT node_id) FROM peers
-		WHERE host = ? AND node_id != '' AND last_seen IS NOT NULL AND last_seen > ?
+		SELECT COUNT(*) FROM peers
+		WHERE host = ? AND last_seen IS NOT NULL AND last_seen > ?
 	`, host, cutoff).Scan(&n)
 	return n, err
 }
@@ -470,8 +487,8 @@ const DefaultMaxPeersPerHost = 3
 func (d *DB) getActivePeers(ctx context.Context, maxAge time.Duration, limit, maxPerHost int) ([]Peer, error) {
 	cutoff := formatTime(time.Now().Add(-maxAge))
 	rows, err := d.sql.QueryContext(ctx, `
-		SELECT id, address, node_id, status, last_seen FROM (
-			SELECT id, address, node_id, host, status, last_seen,
+		SELECT id, address, addrs, status, last_seen FROM (
+			SELECT id, address, addrs, host, status, last_seen,
 			       ROW_NUMBER() OVER (PARTITION BY host ORDER BY last_seen DESC) AS rank_in_host
 			FROM peers
 			WHERE last_seen IS NOT NULL AND last_seen > ?
@@ -489,10 +506,12 @@ func (d *DB) getActivePeers(ctx context.Context, maxAge time.Duration, limit, ma
 	for rows.Next() {
 		var p Peer
 		var lastSeen sql.NullString
+		var addrs string
 
-		if err := rows.Scan(&p.ID, &p.Address, &p.NodeID, &p.Status, &lastSeen); err != nil {
+		if err := rows.Scan(&p.NodeID, &p.Address, &addrs, &p.Status, &lastSeen); err != nil {
 			return nil, err
 		}
+		p.Addrs = splitAddrs(addrs)
 
 		if lastSeen.Valid {
 			parsed, err := parseTime(lastSeen.String)
@@ -678,7 +697,40 @@ func (d *DB) ListShares(ctx context.Context) ([]ShareInfo, error) {
 	return out, rows.Err()
 }
 
-// GetOutgoingSharePeers returns peer addresses that have received the file (outgoing shares).
+// AddressesForNodes maps node ids to an address each was last seen at.
+//
+// Peers are identified by their key, but dialling still needs somewhere to go,
+// so the recorded location is looked up when a connection has to be made.
+// Identities with no recorded address are simply absent from the result.
+func (d *DB) AddressesForNodes(ctx context.Context, nodeIDs []string) (map[string]string, error) {
+	out := make(map[string]string, len(nodeIDs))
+	if len(nodeIDs) == 0 {
+		return out, nil
+	}
+
+	// One statement per identity rather than a built-up IN clause: the lists
+	// here are short, and it keeps the query free of assembled SQL.
+	for _, nodeID := range nodeIDs {
+		if nodeID == "" {
+			continue
+		}
+		var address string
+		err := d.sql.QueryRowContext(ctx, `
+			SELECT address FROM peers WHERE id = ? AND address != ''
+		`, nodeID).Scan(&address)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		out[nodeID] = address
+	}
+	return out, nil
+}
+
+// GetOutgoingSharePeers returns the identities that have received the file
+// (outgoing shares).
 func (d *DB) GetOutgoingSharePeers(ctx context.Context, fileID string) ([]string, error) {
 	rows, err := d.sql.QueryContext(ctx, `
 		SELECT DISTINCT peer_id FROM shares WHERE file_id = ? AND direction = 'outgoing'
@@ -720,8 +772,18 @@ func (d *DB) PutSetting(ctx context.Context, key, value string) error {
 	return err
 }
 
+// PeerKeySchemaSetting records that the peer table is keyed by node identity
+// rather than by address. That is a data migration, so unlike an added column
+// it cannot be detected by inspecting the schema.
+const PeerKeySchemaSetting = "peer_key_schema"
+
 // NodeIDSetting is the settings key holding this node's identity.
 const NodeIDSetting = "node_id"
+
+// RepairCursorSetting remembers how far the last repair cycle got, so cycles
+// round-robin through the files instead of restarting from the same end every
+// time and never reaching the rest.
+const RepairCursorSetting = "repair_cursor"
 
 // nodeIDSetting is retained for internal use.
 const nodeIDSetting = NodeIDSetting

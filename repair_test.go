@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"testing"
@@ -404,5 +405,53 @@ func TestSweepLoopReclaimsAutomatically(t *testing.T) {
 	// The current version must be untouched.
 	if !node.store.Has(contentKey(v2)) {
 		t.Error("the sweep removed the contents the name refers to")
+	}
+}
+
+// TestRepairEventuallyChecksEveryFile is a regression test. A cycle stops
+// after maxRepairsPerCycle files, but it always started from the beginning of
+// the same list, so on a node holding more blobs than that the tail was never
+// checked and never repaired — not on this cycle, and not on any cycle after
+// it. Those files simply never got their missing copies.
+func TestRepairEventuallyChecksEveryFile(t *testing.T) {
+	const blobs = maxRepairsPerCycle + 5
+
+	origin := newQuietNodeWith(t, 2)
+
+	digests := make([]string, blobs)
+	for i := range blobs {
+		payload := randomBytes(t, 256)
+		digests[i] = contentKey(payload)
+		if err := origin.Store(fmt.Sprintf("file-%02d", i), bytes.NewReader(payload)); err != nil {
+			t.Fatalf("Store %d: %v", i, err)
+		}
+	}
+
+	helper := newQuietNodeWith(t, 2, origin.addr)
+	waitForPeerCount(t, origin, 1)
+	waitForPeerCount(t, helper, 1)
+
+	// One cycle is bounded, so it cannot place them all. Several cycles must,
+	// and each settles before the next so the count is not raced.
+	for cycle := range 4 {
+		before := countStoredFiles(t, helper.store.Root)
+		if _, err := origin.RepairOnce(); err != nil {
+			t.Fatalf("RepairOnce %d: %v", cycle+1, err)
+		}
+		waitFor(t, "the cycle's offers to settle", 15*time.Second, func() bool {
+			return countStoredFiles(t, helper.store.Root) >= before || cycle > 0
+		})
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	missing := make([]string, 0, blobs)
+	for i, d := range digests {
+		if !helper.store.Has(d) {
+			missing = append(missing, fmt.Sprintf("file-%02d", i))
+		}
+	}
+	if len(missing) > 0 {
+		t.Errorf("%d of %d files were never repaired across several cycles: %v",
+			len(missing), blobs, missing)
 	}
 }

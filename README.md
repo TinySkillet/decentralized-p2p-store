@@ -15,6 +15,7 @@ mark the states worth distinguishing:
 | `v1.2-consistency` | Fixes the data-integrity bugs found by auditing the two releases above. |
 | `v1.3-identity` | Peers prove who they are, and deleting a file requires its owner's authorisation. |
 | `v1.4-control` | Commands ask the running node to act instead of starting one of their own. |
+| _unreleased_ | Peers keyed by identity rather than address; repair works through every file; re-storing a deleted file sticks. Existing databases are migrated in place on first start. |
 
 **Run the newest tag.** The earlier tags are kept as reference
 points, not as versions to deploy.
@@ -113,6 +114,12 @@ larger than the network can satisfy is reported rather than retried forever.
 Repair is deduplication-aware: several names sharing one blob cost one check
 and one transfer, not one per name.
 
+A cycle checks a bounded number of files so that a large store does not flood
+its peers with availability queries in one burst, and resumes where the previous
+cycle stopped. That position is persisted, so a node holding more files than one
+cycle covers still works through all of them rather than re-checking the same
+few for ever.
+
 ## Deletion
 
 Deleting a file removes the name that refers to it. Because several names can
@@ -126,6 +133,11 @@ were offline when it was broadcast still hold the file, and their repair cycle
 would otherwise offer it back and undo the deletion everywhere. Instead the
 offer is refused and the straggler is told, so the deletion reaches it late
 rather than never.
+
+Storing a file again after deleting it clears the tombstone here, and a peer
+that still holds one cannot undo that: an authorisation stays valid for ever, so
+a node that owns a file and holds no deletion record for it treats an incoming
+authorisation as a stale replay and keeps the file.
 
 Deletions carry the content digest as well as the name. Two nodes may
 legitimately use the same name for different files, and a peer only acts when
