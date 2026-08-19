@@ -164,14 +164,10 @@ func (s *FileServer) storageOwnerID() string {
 	return id
 }
 
-// isStorageOwner reports whether the peer at addr is the node whose storage
-// this one is borrowing.
-func (s *FileServer) isStorageOwner(addr, ownerID string) bool {
-	if ownerID == "" {
-		return false
-	}
-	p, ok := s.peer(addr)
-	return ok && p.ID() == ownerID
+// isStorageOwner reports whether a peer is the node whose storage this one is
+// borrowing. Peers are identified by node id, so this is a direct comparison.
+func (s *FileServer) isStorageOwner(nodeID, ownerID string) bool {
+	return ownerID != "" && nodeID == ownerID
 }
 
 // short abbreviates a digest for log output.
@@ -229,6 +225,26 @@ func (s *FileServer) authorizeDelete(msg MessageDeleteFile) error {
 	}
 	if !verifyByNode(msg.Owner, deleteTranscript(msg.Name, f.Hash), msg.Signature) {
 		return fmt.Errorf("the authorisation does not verify against %s", short(msg.Owner))
+	}
+
+	// The authorisation is genuine, and still may not apply.
+	//
+	// As the file's owner we would hold a tombstone if we wanted it gone, so
+	// holding the file without one means it was deliberately stored again. An
+	// authorisation stays valid for ever, and a peer that kept the old
+	// tombstone replays it when it refuses the new copy — which would destroy
+	// the copy we had just chosen to make.
+	//
+	// A genuine deletion here never reaches this path: Delete records the
+	// tombstone locally before it broadcasts.
+	if f.Owner == s.OwnerID() {
+		deleted, err := s.DB.IsDeleted(context.Background(), msg.Name, f.Hash)
+		if err != nil {
+			return fmt.Errorf("checking our own deletion record: %w", err)
+		}
+		if !deleted {
+			return fmt.Errorf("we own %q and hold no deletion record for it, so it was stored again deliberately", msg.Name)
+		}
 	}
 
 	return nil
@@ -331,14 +347,30 @@ func (s *FileServer) Delete(name string) error {
 
 	// Reconnect to peers that were sent a copy but are not currently
 	// connected, so the deletion reaches them too.
+	//
+	// The share records name identities, which have to be turned back into
+	// somewhere to dial. A peer whose address is unknown is skipped: the
+	// deletion reaches it when it next connects, which is already how the
+	// system treats a peer that is simply offline.
 	if len(sharePeers) > 0 {
-		fmt.Printf("[%s] Connecting to %d peer(s) from shares: %v\n", s.Transport.Address(), len(sharePeers), sharePeers)
+		fmt.Printf("[%s] Reconnecting to %d peer(s) from shares\n", s.Transport.Address(), len(sharePeers))
+
+		addresses, err := s.DB.AddressesForNodes(context.Background(), sharePeers)
+		if err != nil {
+			fmt.Printf("[%s] Warning: could not resolve share peer addresses: %v\n", s.Transport.Address(), err)
+			addresses = nil
+		}
 
 		var wg sync.WaitGroup
-		for _, addr := range sharePeers {
-			if _, already := s.peer(addr); already {
+		for _, nodeID := range sharePeers {
+			if _, already := s.peer(nodeID); already {
 				continue
 			}
+			addr := addresses[nodeID]
+			if addr == "" {
+				continue
+			}
+
 			wg.Add(1)
 			go func(addr string) {
 				defer wg.Done()
