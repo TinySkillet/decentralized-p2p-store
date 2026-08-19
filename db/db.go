@@ -64,6 +64,10 @@ func (d *DB) Migrate(ctx context.Context) error {
 			status TEXT NOT NULL,
 			last_seen TIMESTAMP
 		);`,
+		`CREATE TABLE IF NOT EXISTS settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);`,
 		`CREATE TABLE IF NOT EXISTS shares (
 			id TEXT PRIMARY KEY,
 			file_id TEXT NOT NULL,
@@ -76,6 +80,7 @@ func (d *DB) Migrate(ctx context.Context) error {
 		// name on each incoming request, listing peers by recency, and
 		// finding the peers that hold a file when it is deleted.
 		`CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash);`,
+		`CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);`,
 		`CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen);`,
 		`CREATE INDEX IF NOT EXISTS idx_shares_file_id ON shares(file_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_shares_file_direction ON shares(file_id, direction);`,
@@ -90,7 +95,115 @@ func (d *DB) Migrate(ctx context.Context) error {
 			return err
 		}
 	}
+
+	// Columns added after the original schema shipped. SQLite has no
+	// ADD COLUMN IF NOT EXISTS, so an existing column is detected and the
+	// statement skipped rather than treated as a failure.
+	altered := []struct{ table, column, ddl string }{
+		{"peers", "node_id", `ALTER TABLE peers ADD COLUMN node_id TEXT NOT NULL DEFAULT ''`},
+		{"files", "digest", `ALTER TABLE files ADD COLUMN digest TEXT NOT NULL DEFAULT ''`},
+	}
+	for _, a := range altered {
+		has, err := columnExists(ctx, tx, a.table, a.column)
+		if err != nil {
+			return err
+		}
+		if has {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, a.ddl); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_peers_node_id ON peers(node_id)`); err != nil {
+		return err
+	}
+
+	if err := addShareForeignKey(ctx, tx); err != nil {
+		return err
+	}
+
 	return tx.Commit()
+}
+
+// addShareForeignKey gives shares a foreign key onto files, so a replication
+// record cannot outlive the file it describes.
+//
+// SQLite cannot add a constraint to an existing table, so the table is
+// rebuilt when the constraint is missing. Rows whose file is already gone are
+// dropped rather than carried across: they are exactly the orphans the
+// constraint exists to prevent.
+func addShareForeignKey(ctx context.Context, tx *sql.Tx) error {
+	has, err := hasForeignKey(ctx, tx, "shares")
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+
+	stmts := []string{
+		`CREATE TABLE shares_new (
+			id TEXT PRIMARY KEY,
+			file_id TEXT NOT NULL,
+			peer_id TEXT NOT NULL,
+			direction TEXT NOT NULL,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+		);`,
+		`INSERT INTO shares_new(id,file_id,peer_id,direction,created_at)
+			SELECT id,file_id,peer_id,direction,created_at FROM shares
+			WHERE file_id IN (SELECT id FROM files);`,
+		`DROP TABLE shares;`,
+		`ALTER TABLE shares_new RENAME TO shares;`,
+		`CREATE INDEX IF NOT EXISTS idx_shares_file_id ON shares(file_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_shares_file_direction ON shares(file_id, direction);`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// hasForeignKey reports whether table declares any foreign key.
+func hasForeignKey(ctx context.Context, tx *sql.Tx, table string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_list(?)`, table)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		return false, rows.Err()
+	}
+	var n int
+	if err := rows.Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, rows.Err()
+}
+
+// columnExists reports whether table already has the named column.
+func columnExists(ctx context.Context, tx *sql.Tx, table, column string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (d *DB) SQL() *sql.DB { return d.sql }

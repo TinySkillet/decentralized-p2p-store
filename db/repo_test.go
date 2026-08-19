@@ -350,6 +350,10 @@ func TestInsertShareIsIdempotent(t *testing.T) {
 	d := newTestDB(t)
 	ctx := context.Background()
 
+	if err := d.InsertFileWithKey(ctx, File{ID: "f1", Name: "hello", Hash: "h", Size: 5, LocalPath: "/a"}, "default"); err != nil {
+		t.Fatalf("InsertFileWithKey: %v", err)
+	}
+
 	// Share IDs are derived from file, peer and direction, so re-sharing the
 	// same file to the same peer must not accumulate duplicate rows.
 	s := Share{ID: "s1", FileID: "f1", PeerID: ":4000", Direction: "outgoing"}
@@ -480,5 +484,138 @@ func TestGetOrCreateDefaultKeyDoesNotRekeyOnDatabaseError(t *testing.T) {
 	}
 	if generated {
 		t.Error("a database fault caused a new key to be generated, orphaning stored files")
+	}
+}
+
+// TestSharesCannotOutliveTheirFile covers the foreign key: a replication
+// record must not exist for a file that is not there.
+func TestSharesCannotOutliveTheirFile(t *testing.T) {
+	d := newTestDB(t)
+	ctx := context.Background()
+
+	err := d.InsertShare(ctx, Share{ID: "orphan", FileID: "no-such-file", PeerID: ":4000", Direction: "outgoing"})
+	if err == nil {
+		t.Fatal("a share was inserted for a file that does not exist")
+	}
+
+	// And a share must disappear with the file it describes.
+	if err := d.InsertFileWithKey(ctx, File{ID: "f1", Name: "hello", Hash: "h", Size: 5, LocalPath: "/a"}, "default"); err != nil {
+		t.Fatalf("InsertFileWithKey: %v", err)
+	}
+	if err := d.InsertShare(ctx, Share{ID: "s1", FileID: "f1", PeerID: ":4000", Direction: "outgoing"}); err != nil {
+		t.Fatalf("InsertShare: %v", err)
+	}
+
+	if _, _, err := d.DeleteFileByName(ctx, "hello"); err != nil {
+		t.Fatalf("DeleteFileByName: %v", err)
+	}
+
+	shares, err := d.ListShares(ctx)
+	if err != nil {
+		t.Fatalf("ListShares: %v", err)
+	}
+	if len(shares) != 0 {
+		t.Errorf("%d share(s) survived the file they describe, want 0", len(shares))
+	}
+}
+
+func TestFindFileByName(t *testing.T) {
+	d := newTestDB(t)
+	ctx := context.Background()
+
+	if err := d.InsertFileWithKey(ctx, File{ID: "id1", Name: "report.pdf", Hash: "digest1", Size: 42, LocalPath: "/a"}, "default"); err != nil {
+		t.Fatalf("InsertFileWithKey: %v", err)
+	}
+
+	found, err := d.FindFileByName(ctx, "report.pdf")
+	if err != nil {
+		t.Fatalf("FindFileByName: %v", err)
+	}
+	if found == nil {
+		t.Fatal("FindFileByName returned nil for a stored name")
+	}
+	if found.Hash != "digest1" {
+		t.Errorf("Hash = %q, want the content digest it maps to", found.Hash)
+	}
+
+	missing, err := d.FindFileByName(ctx, "absent.pdf")
+	if err != nil {
+		t.Fatalf("FindFileByName: %v", err)
+	}
+	if missing != nil {
+		t.Errorf("FindFileByName for an unknown name = %+v, want nil", missing)
+	}
+}
+
+// TestSeveralNamesShareOneHash is the metadata half of deduplication: the
+// same contents stored under different names are separate rows pointing at
+// one hash.
+func TestSeveralNamesShareOneHash(t *testing.T) {
+	d := newTestDB(t)
+	ctx := context.Background()
+
+	for _, name := range []string{"first", "second", "third"} {
+		if err := d.InsertFileWithKey(ctx, File{
+			ID: name, Name: name, Hash: "shared-digest", Size: 10, LocalPath: "/blob",
+		}, "default"); err != nil {
+			t.Fatalf("InsertFileWithKey %s: %v", name, err)
+		}
+	}
+
+	n, err := d.CountNamesForHash(ctx, "shared-digest")
+	if err != nil {
+		t.Fatalf("CountNamesForHash: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("CountNamesForHash = %d, want 3", n)
+	}
+}
+
+// TestDeleteFileByNameReportsWhenContentsAreOrphaned drives the decision of
+// whether the bytes on disk may be removed.
+func TestDeleteFileByNameReportsWhenContentsAreOrphaned(t *testing.T) {
+	d := newTestDB(t)
+	ctx := context.Background()
+
+	for _, name := range []string{"keeper", "goner"} {
+		if err := d.InsertFileWithKey(ctx, File{
+			ID: name, Name: name, Hash: "shared-digest", Size: 10, LocalPath: "/blob",
+		}, "default"); err != nil {
+			t.Fatalf("InsertFileWithKey %s: %v", name, err)
+		}
+	}
+
+	hash, orphaned, err := d.DeleteFileByName(ctx, "goner")
+	if err != nil {
+		t.Fatalf("DeleteFileByName: %v", err)
+	}
+	if hash != "shared-digest" {
+		t.Errorf("hash = %q, want shared-digest", hash)
+	}
+	if orphaned {
+		t.Error("contents reported orphaned while another name still refers to them")
+	}
+
+	hash, orphaned, err = d.DeleteFileByName(ctx, "keeper")
+	if err != nil {
+		t.Fatalf("DeleteFileByName: %v", err)
+	}
+	if !orphaned {
+		t.Error("contents not reported orphaned after the last name was removed")
+	}
+	if hash != "shared-digest" {
+		t.Errorf("hash = %q, want shared-digest", hash)
+	}
+}
+
+func TestDeleteFileByNameForUnknownName(t *testing.T) {
+	d := newTestDB(t)
+
+	hash, orphaned, err := d.DeleteFileByName(context.Background(), "never-stored")
+	if err != nil {
+		t.Fatalf("DeleteFileByName: %v", err)
+	}
+	if hash != "" || orphaned {
+		t.Errorf("got hash %q orphaned %v, want empty and false", hash, orphaned)
 	}
 }
