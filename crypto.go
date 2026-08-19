@@ -3,11 +3,12 @@ package main
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 )
 
@@ -27,9 +28,13 @@ func newEncryptionKey() ([]byte, error) {
 	return keyBuf, nil
 }
 
-func hashKey(key string) string {
-	hash := md5.Sum([]byte(key))
-	return hex.EncodeToString(hash[:])
+// nameKey derives a stable row identifier for a file name.
+//
+// This is an internal identifier, not a content address: the contents are
+// identified by their own SHA-256 digest. SHA-256 is used here too so the
+// codebase has a single hash function rather than a weaker second one.
+func nameKey(name string) string {
+	return contentKey([]byte(name))
 }
 
 // copyDecrypt reads an IV-prefixed ciphertext from src and writes the
@@ -96,4 +101,52 @@ func copyStream(stream cipher.Stream, written int, src io.Reader, dest io.Writer
 		}
 	}
 	return nw, nil
+}
+
+// digestSize is the hex-encoded length of a SHA-256 digest.
+const digestSize = sha256.Size * 2
+
+// newNodeID returns a fresh random node identifier.
+func newNodeID() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
+		return "", fmt.Errorf("generating node id: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+// newRequestID returns an identifier that correlates a reply with the request
+// that caused it.
+func newRequestID() (string, error) {
+	buf := make([]byte, 12)
+	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
+		return "", fmt.Errorf("generating request id: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+// contentKey returns the hex SHA-256 of b, the identifier a file is stored
+// and requested under.
+func contentKey(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// digester accumulates a SHA-256 digest of everything read through it.
+type digester struct {
+	hash hash.Hash
+}
+
+func newDigester() *digester {
+	return &digester{hash: sha256.New()}
+}
+
+// tee wraps r so that everything read from it also feeds the digest.
+func (d *digester) tee(r io.Reader) io.Reader {
+	return io.TeeReader(r, d.hash)
+}
+
+// sum returns the hex-encoded digest of everything seen so far.
+func (d *digester) sum() string {
+	return hex.EncodeToString(d.hash.Sum(nil))
 }

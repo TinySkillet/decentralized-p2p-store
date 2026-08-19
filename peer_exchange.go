@@ -27,11 +27,20 @@ func (s *FileServer) discoverPeers(peers []PeerInfo) {
 			break
 		}
 
-		if peerInfo.Address == myAddr || peerInfo.Address == "" {
+		if peerInfo.Address == "" {
+			continue
+		}
+		// Gossip eventually hands this node its own address back. Identity
+		// catches that reliably; the handshake rejects it as a backstop for
+		// entries that predate node ids.
+		if peerInfo.NodeID != "" && peerInfo.NodeID == s.NodeID {
 			continue
 		}
 
 		if _, alreadyConnected := s.peer(peerInfo.Address); alreadyConnected {
+			continue
+		}
+		if s.hasPeerWithNodeID(peerInfo.NodeID) {
 			continue
 		}
 
@@ -74,6 +83,7 @@ func (s *FileServer) sendPeerExchange(peerAddr string) error {
 		if p.LastSeen != nil {
 			peerInfos = append(peerInfos, PeerInfo{
 				Address:  p.Address,
+				NodeID:   p.NodeID,
 				LastSeen: *p.LastSeen,
 			})
 		}

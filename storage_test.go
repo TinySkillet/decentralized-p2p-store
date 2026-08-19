@@ -21,22 +21,26 @@ func newTestStore(t *testing.T) *Store {
 }
 
 func TestCASPathTransformFunc(t *testing.T) {
-	pathKey := CASPathTransformFunc("momsbestpicture")
+	// The key is already a content digest, so the path shards it rather than
+	// hashing it again: a digest of a1b2c... becomes a1b2c/....
+	digest := contentKey([]byte("some file contents"))
 
-	// sha1 of the key, hex encoded, split into five character directories.
-	const wantFilename = "6804429f74181a63c50c3d81d733a12f14a353ff"
-	if pathKey.Filename != wantFilename {
-		t.Errorf("Filename = %q, want %q", pathKey.Filename, wantFilename)
+	pathKey := CASPathTransformFunc(digest)
+	if pathKey.Filename != digest {
+		t.Errorf("Filename = %q, want the digest %q", pathKey.Filename, digest)
 	}
 
 	dirs := strings.Split(pathKey.Pathname, string(filepath.Separator))
-	if len(dirs) != 8 {
-		t.Errorf("got %d path segments, want 8", len(dirs))
+	if want := digestSize / 5; len(dirs) != want {
+		t.Errorf("got %d path segments, want %d", len(dirs), want)
 	}
 	for _, d := range dirs {
 		if len(d) != 5 {
 			t.Errorf("path segment %q has length %d, want 5", d, len(d))
 		}
+	}
+	if !strings.HasPrefix(pathKey.FullPath(), digest[:5]) {
+		t.Errorf("path %q does not begin with the digest prefix %q", pathKey.FullPath(), digest[:5])
 	}
 
 	if CASPathTransformFunc("a") == CASPathTransformFunc("b") {
@@ -44,6 +48,29 @@ func TestCASPathTransformFunc(t *testing.T) {
 	}
 	if CASPathTransformFunc("a") != CASPathTransformFunc("a") {
 		t.Error("transform is not deterministic")
+	}
+}
+
+func TestCASPathTransformFuncHashesNonDigestKeys(t *testing.T) {
+	// A key that is not a digest still has to produce a valid sharded path.
+	pathKey := CASPathTransformFunc("just-a-name")
+
+	if len(pathKey.Filename) != digestSize {
+		t.Errorf("Filename = %q, want a %d character digest", pathKey.Filename, digestSize)
+	}
+	if !isDigest(pathKey.Filename) {
+		t.Errorf("Filename %q is not a hex digest", pathKey.Filename)
+	}
+}
+
+func TestIsDigest(t *testing.T) {
+	if !isDigest(contentKey([]byte("x"))) {
+		t.Error("a real digest was not recognised")
+	}
+	for _, bad := range []string{"", "short", strings.Repeat("z", digestSize), strings.Repeat("a", digestSize-1), strings.ToUpper(contentKey([]byte("x")))} {
+		if isDigest(bad) {
+			t.Errorf("isDigest(%q) = true, want false", bad)
+		}
 	}
 }
 

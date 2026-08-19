@@ -15,9 +15,17 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// peerWaitTimeout bounds how long a one-shot command waits for the network
-// before giving up and acting on whatever it is connected to.
-const peerWaitTimeout = 10 * time.Second
+const (
+	// peerWaitTimeout bounds how long a one-shot command waits for its first
+	// peer before giving up and acting on whatever it is connected to.
+	peerWaitTimeout = 10 * time.Second
+
+	// discoveryQuietPeriod is how long the peer set must hold steady before
+	// discovery is treated as settled, and discoverySettleTimeout caps the
+	// wait on a network that keeps producing new peers.
+	discoveryQuietPeriod   = 300 * time.Millisecond
+	discoverySettleTimeout = 5 * time.Second
+)
 
 // openDB opens and migrates the node database.
 func openDB(path string) (*dbpkg.DB, error) {
@@ -43,7 +51,7 @@ func startClientNode(listen string, d *dbpkg.DB, bootstrap []string) (*FileServe
 		return nil, nil, err
 	}
 
-	s, err := makeServerWithDB(listen, d, bootstrap...)
+	s, err := makeClientNode(listen, d, bootstrap...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -58,9 +66,10 @@ func startClientNode(listen string, d *dbpkg.DB, bootstrap []string) (*FileServe
 		if err := s.waitForPeers(peerWaitTimeout); err != nil {
 			fmt.Printf("Warning: %v. Proceeding anyway.\n", err)
 		}
-		// Peer exchange runs after the first connection settles; give
-		// discovery a moment to reach the rest of the network.
-		time.Sleep(2 * time.Second)
+		// Gossip keeps introducing peers after the first connection lands.
+		// Wait for the set to settle rather than for a fixed period.
+		n := s.waitForPeerDiscovery(discoveryQuietPeriod, discoverySettleTimeout)
+		fmt.Printf("Connected to %d peer(s).\n", n)
 	}
 
 	return s, s.Stop, nil
@@ -74,7 +83,14 @@ func setupCommands() *cobra.Command {
 		configPath string
 	)
 
-	root := &cobra.Command{Use: "p2p", Short: "Decentralized P2P storage node"}
+	root := &cobra.Command{
+		Use:   "p2p",
+		Short: "Decentralized P2P storage node",
+
+		// A command that fails at run time has already parsed its flags
+		// correctly, so printing the usage text buries the actual error.
+		SilenceUsage: true,
+	}
 	root.PersistentFlags().StringVar(&dbPath, "db", "p2p.db", "sqlite database path")
 
 	serveCmd := &cobra.Command{
@@ -389,14 +405,13 @@ func setupCommands() *cobra.Command {
 				defer s.Stop()
 
 				servers = append(servers, s)
-				time.Sleep(500 * time.Millisecond)
 			}
 
 			s3 := servers[2]
 			if err := s3.waitForPeers(peerWaitTimeout); err != nil {
 				return err
 			}
-			time.Sleep(1 * time.Second)
+			s3.waitForPeerDiscovery(discoveryQuietPeriod, discoverySettleTimeout)
 
 			key := "coolpicture.jpg"
 			data := bytes.NewReader([]byte("my big data file here!"))

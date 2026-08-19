@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"sync"
 	"time"
 
@@ -19,11 +20,9 @@ import (
 // downloadTimeout bounds how long Get waits for a peer to answer.
 const downloadTimeout = 10 * time.Second
 
-// duplicateResponseGrace is how long a delivered key stays marked as
-// satisfied. Every peer holding a file answers the same Get, and the losing
-// responses can arrive after Get has already returned its reader, so the
-// marker has to outlive the request that created it.
-const duplicateResponseGrace = time.Minute
+// offerTimeout bounds how long Get waits for peers to say whether they hold
+// a key. It is short because an offer is a single small message.
+const offerTimeout = 5 * time.Second
 
 // Listen binds the transport and starts connecting to bootstrap nodes. It
 // returns as soon as the socket is bound, so callers can report a bind
@@ -96,6 +95,10 @@ func (s *FileServer) handleMessage(from string, msg *Message) error {
 		return s.handleMessageStoreFile(from, v)
 	case MessageGetFile:
 		return s.handleMessageGetFile(from, v)
+	case MessageFileOffer:
+		return s.handleMessageFileOffer(from, v)
+	case MessageFetchFile:
+		return s.handleMessageFetchFile(from, v)
 	case MessageDeleteFile:
 		return s.handleMessageDeleteFile(from, v)
 	case MessagePeerExchange:
@@ -105,7 +108,7 @@ func (s *FileServer) handleMessage(from string, msg *Message) error {
 }
 
 func (s *FileServer) handleMessageStoreFile(from string, msg MessageStoreFile) error {
-	fmt.Printf("[%s] Received StoreFile message from %s for key %s. Expecting stream...\n", s.Transport.Address(), from, msg.Key)
+	fmt.Printf("[%s] Received StoreFile message from %s for %s. Expecting stream...\n", s.Transport.Address(), from, short(msg.Digest))
 
 	s.transferLock.Lock()
 	s.pendingFileTransfers[from] = msg
@@ -116,7 +119,7 @@ func (s *FileServer) handleMessageStoreFile(from string, msg MessageStoreFile) e
 
 func (s *FileServer) handleStream(from string) (err error) {
 	s.transferLock.Lock()
-	msg, pending := s.pendingFileTransfers[from]
+	msg, announced := s.pendingFileTransfers[from]
 	delete(s.pendingFileTransfers, from)
 	s.transferLock.Unlock()
 
@@ -129,8 +132,8 @@ func (s *FileServer) handleStream(from string) (err error) {
 		defer peer.CloseStream()
 	}
 
-	if !pending {
-		return fmt.Errorf("peer %s sent a stream but no pending transfer was found", from)
+	if !announced {
+		return fmt.Errorf("peer %s sent a stream but announced no transfer", from)
 	}
 	if !found {
 		return fmt.Errorf("peer (%s) could not be found in the peers list", from)
@@ -138,147 +141,227 @@ func (s *FileServer) handleStream(from string) (err error) {
 
 	body := io.LimitReader(peer, msg.Size)
 
-	// Several peers may answer the same Get. The first response satisfies it;
-	// the rest are drained off the connection and discarded, so a slower peer
-	// cannot overwrite the copy already accepted.
-	if s.claimDownload(msg.Key) == downloadAlreadySatisfied {
-		if _, derr := io.Copy(io.Discard, body); derr != nil {
-			return derr
-		}
-		fmt.Printf("[%s] Discarded duplicate copy of %s from %s\n", s.Transport.Address(), msg.Key, from)
-		return nil
-	}
-
-	// Receive plaintext, write encrypted
-	n, err := s.store.WriteEncrypt(s.EncryptionKey, msg.Key, body)
+	// The contents are hashed as they are written and the file is only moved
+	// into place if it matches what the sender announced, so data that fails
+	// verification never becomes readable at all.
+	size, err := s.store.WriteContentExpecting(s.EncryptionKey, msg.Digest, body)
 	if err != nil {
+		s.failRequest(msg.RequestID, err)
+		return fmt.Errorf("receiving %s from %s: %w", msg.Digest, from, err)
+	}
+	if size != msg.Size {
+		// A peer that dies mid-transfer ends the body early. The digest would
+		// normally catch that; this reports the more specific cause.
+		err := fmt.Errorf("truncated transfer of %s from %s: got %d bytes, announced %d", msg.Digest, from, size, msg.Size)
+		s.failRequest(msg.RequestID, err)
 		return err
 	}
 
-	// A peer that dies mid-transfer ends the body early, which reads as a
-	// clean EOF. Without this check the short file would be stored and served
-	// on as though it were the whole thing.
-	if got := n - ivSize; got != msg.Size {
-		if derr := s.store.Delete(msg.Key); derr != nil {
-			log.Printf("[%s] Failed to remove truncated file %s: %v", s.Transport.Address(), msg.Key, derr)
-		}
-		return fmt.Errorf("truncated transfer of %s from %s: got %d bytes, announced %d", msg.Key, from, got, msg.Size)
-	}
+	fmt.Printf("[%s] Received %d bytes of %s from %s\n", s.Transport.Address(), size, short(msg.Digest), from)
 
-	fmt.Printf("[%s] Written %d bytes to disk (encrypted) from %s\n", s.Transport.Address(), n, from)
-
-	// Record share in database if configured
 	if s.DB != nil {
-		shareID := hashKey(msg.Key + from + "incoming")
+		if derr := s.recordFile(msg.Name, msg.Digest, size); derr != nil {
+			log.Printf("[%s] Failed to record %s: %v", s.Transport.Address(), short(msg.Digest), derr)
+		}
+
+		shareID := contentKey([]byte(msg.Digest + from + "incoming"))
 		if derr := s.DB.InsertShare(context.Background(), dbpkg.Share{
 			ID:        shareID,
-			FileID:    msg.Key,
+			FileID:    nameKey(msg.Name),
 			PeerID:    from,
 			Direction: "incoming",
 		}); derr != nil {
-			log.Printf("[%s] Failed to record incoming share for %s: %v", s.Transport.Address(), msg.Key, derr)
+			log.Printf("[%s] Failed to record incoming share for %s: %v", s.Transport.Address(), short(msg.Digest), derr)
 		}
 	}
 
-	s.completeDownload(msg.Key)
+	s.completeRequest(msg.RequestID)
 
 	return nil
 }
 
-type downloadClaim int
-
-const (
-	downloadNotRequested downloadClaim = iota
-	downloadClaimed
-	downloadAlreadySatisfied
-)
-
-// claimDownload reports whether this node should accept an incoming copy of
-// key. A key nobody asked for is an unsolicited push and is always accepted.
-func (s *FileServer) claimDownload(key string) downloadClaim {
-	s.transferLock.Lock()
-	defer s.transferLock.Unlock()
-
-	s.pruneSatisfiedLocked()
-
-	if _, waiting := s.downloadChannels[key]; waiting {
-		return downloadClaimed
+// recordFile maps a name to the contents now stored under it.
+func (s *FileServer) recordFile(name, digest string, size int64) error {
+	if name == "" {
+		name = digest
 	}
-	if _, satisfied := s.satisfiedDownloads[key]; satisfied {
-		return downloadAlreadySatisfied
-	}
-	return downloadNotRequested
+	return s.DB.InsertFileWithKey(context.Background(), dbpkg.File{
+		ID:        nameKey(name),
+		Name:      name,
+		Hash:      digest,
+		Size:      size,
+		LocalPath: s.store.FullPathForKey(digest),
+	}, "default")
 }
 
-// completeDownload wakes the Get waiting on key, if any. Deleting the channel
-// under the same lock that closes it makes a second responder a no-op rather
-// than a close of a closed channel.
-func (s *FileServer) completeDownload(key string) {
-	s.transferLock.Lock()
-	defer s.transferLock.Unlock()
-
-	if ch, ok := s.downloadChannels[key]; ok {
-		delete(s.downloadChannels, key)
-		s.satisfiedDownloads[key] = time.Now()
-		close(ch)
+// short abbreviates a digest for log output.
+func short(digest string) string {
+	if len(digest) > 12 {
+		return digest[:12]
 	}
+	return digest
 }
 
-// awaitDownload registers interest in key and returns a channel closed when a
-// peer delivers it, plus a function to release the registration.
-func (s *FileServer) awaitDownload(key string) (<-chan struct{}, func()) {
-	ch := make(chan struct{})
+// fileRequest tracks one outstanding Get.
+type fileRequest struct {
+	key string
+
+	// offers carries one entry per peer that answered. It is buffered to the
+	// number of peers asked so a reply never blocks the server loop.
+	offers chan peerOffer
+
+	// done is closed when the file has been received, or closed with err set
+	// when the chosen peer failed to deliver it.
+	done chan struct{}
+	once sync.Once
+	err  error
+}
+
+// peerOffer is one peer's answer to a MessageGetFile.
+type peerOffer struct {
+	from  string
+	offer MessageFileOffer
+}
+
+// newRequest registers an outstanding request and returns it with a function
+// that deregisters it.
+func (s *FileServer) newRequest(id, key string, expectedReplies int) (*fileRequest, func()) {
+	req := &fileRequest{
+		key:    key,
+		offers: make(chan peerOffer, expectedReplies),
+		done:   make(chan struct{}),
+	}
 
 	s.transferLock.Lock()
-	s.downloadChannels[key] = ch
+	s.requests[id] = req
 	s.transferLock.Unlock()
 
-	return ch, func() {
+	return req, func() {
 		s.transferLock.Lock()
-		defer s.transferLock.Unlock()
-		delete(s.downloadChannels, key)
-		// satisfiedDownloads is deliberately left in place: responses still
-		// in flight must be discarded, not written over the copy the caller
-		// is at this moment reading.
-		s.pruneSatisfiedLocked()
+		delete(s.requests, id)
+		s.transferLock.Unlock()
 	}
 }
 
-// pruneSatisfiedLocked drops expired duplicate-response markers. Callers must
-// hold transferLock.
-func (s *FileServer) pruneSatisfiedLocked() {
-	for key, at := range s.satisfiedDownloads {
-		if time.Since(at) > duplicateResponseGrace {
-			delete(s.satisfiedDownloads, key)
-		}
+func (s *FileServer) request(id string) (*fileRequest, bool) {
+	s.transferLock.Lock()
+	defer s.transferLock.Unlock()
+	req, ok := s.requests[id]
+	return req, ok
+}
+
+// completeRequest wakes the Get waiting on id, if any. sync.Once makes a
+// repeated completion a no-op rather than a close of a closed channel.
+func (s *FileServer) completeRequest(id string) {
+	if id == "" {
+		return
+	}
+	if req, ok := s.request(id); ok {
+		req.once.Do(func() { close(req.done) })
 	}
 }
 
+// failRequest wakes the Get waiting on id with an error, so a rejected
+// transfer fails immediately instead of waiting out the timeout.
+func (s *FileServer) failRequest(id string, err error) {
+	if id == "" {
+		return
+	}
+	if req, ok := s.request(id); ok {
+		req.once.Do(func() {
+			req.err = err
+			close(req.done)
+		})
+	}
+}
+
+// handleMessageGetFile answers a peer asking whether this node holds a name,
+// resolving it to the contents stored under it. Peers that hold nothing
+// answer too, so the requester learns the answer is no without waiting for a
+// timeout.
 func (s *FileServer) handleMessageGetFile(from string, msg MessageGetFile) error {
-	fmt.Printf("[%s] Received request to serve file '%s'\n", s.Transport.Address(), msg.Key)
+	fmt.Printf("[%s] Received availability query for '%s' from %s\n", s.Transport.Address(), msg.Name, from)
 
-	keyToRead := msg.Key
+	peer, ok := s.peer(from)
+	if !ok {
+		return fmt.Errorf("peer %s not found in peer list", from)
+	}
 
-	// Files stored locally are keyed by their original name, while the
-	// request carries the hash, so the name is looked up by index rather than
-	// by scanning every file on every request.
+	offer := MessageFileOffer{RequestID: msg.RequestID, Name: msg.Name}
+
+	local, err := s.resolve(msg.Name)
+	if err != nil {
+		log.Printf("[%s] Failed to look up '%s': %v", s.Transport.Address(), msg.Name, err)
+	} else if local != nil {
+		offer.Have = true
+		offer.Digest = local.digest
+		offer.Size = local.size
+	}
+
+	return sendMessage(peer, &Message{Payload: offer})
+}
+
+// handleMessageFileOffer records a peer's answer for the Get that is waiting.
+func (s *FileServer) handleMessageFileOffer(from string, msg MessageFileOffer) error {
+	req, ok := s.request(msg.RequestID)
+	if !ok {
+		// The request timed out or was already satisfied.
+		return nil
+	}
+
+	select {
+	case req.offers <- peerOffer{from: from, offer: msg}:
+	default:
+		// More replies than peers asked; drop rather than block the loop.
+	}
+	return nil
+}
+
+// localContent describes contents this node can serve.
+type localContent struct {
+	digest string
+	size   int64
+}
+
+// resolve maps a name to the contents this node holds for it, or nil.
+//
+// The name is looked up in the database, which is what maps a name to the
+// content-addressed hash. A name that is itself a digest is also accepted, so
+// contents can be asked for directly.
+func (s *FileServer) resolve(name string) (*localContent, error) {
 	if s.DB != nil {
-		f, err := s.DB.FindFileByHash(context.Background(), msg.Key)
+		f, err := s.DB.FindFileByName(context.Background(), name)
 		if err != nil {
-			log.Printf("[%s] Failed to look up hash '%s': %v", s.Transport.Address(), msg.Key, err)
-		} else if f != nil {
-			fmt.Printf("[%s] Found original key '%s' for hash '%s'\n", s.Transport.Address(), f.Name, msg.Key)
-			keyToRead = f.Name
+			return nil, err
+		}
+		if f != nil && s.store.Has(f.Hash) {
+			return &localContent{digest: f.Hash, size: f.Size}, nil
 		}
 	}
 
-	if !s.store.Has(keyToRead) {
-		return fmt.Errorf("[%s] Do not have file %s", s.Transport.Address(), keyToRead)
+	if isDigest(name) && s.store.Has(name) {
+		size, r, err := s.store.Read(name)
+		if err != nil {
+			return nil, err
+		}
+		r.Close()
+		return &localContent{digest: name, size: size - ivSize}, nil
 	}
 
-	plaintextSize, fileReader, err := s.store.ReadDecrypt(s.EncryptionKey, keyToRead)
+	return nil, nil
+}
+
+// handleMessageFetchFile streams contents to the one peer that asked for them.
+func (s *FileServer) handleMessageFetchFile(from string, msg MessageFetchFile) error {
+	fmt.Printf("[%s] Received request to serve %s\n", s.Transport.Address(), short(msg.Digest))
+
+	if !s.store.Has(msg.Digest) {
+		return fmt.Errorf("[%s] Do not have %s", s.Transport.Address(), short(msg.Digest))
+	}
+
+	plaintextSize, fileReader, err := s.store.ReadDecrypt(s.EncryptionKey, msg.Digest)
 	if err != nil {
-		return fmt.Errorf("[%s] Failed to read file %s: %w", s.Transport.Address(), keyToRead, err)
+		return fmt.Errorf("[%s] Failed to read %s: %w", s.Transport.Address(), short(msg.Digest), err)
 	}
 	if rc, ok := fileReader.(io.Closer); ok {
 		defer rc.Close()
@@ -291,22 +374,16 @@ func (s *FileServer) handleMessageGetFile(from string, msg MessageGetFile) error
 
 	storeMsg := Message{
 		Payload: MessageStoreFile{
-			Key:  msg.Key,
-			Size: plaintextSize,
+			RequestID: msg.RequestID,
+			Name:      msg.Name,
+			Digest:    msg.Digest,
+			Size:      plaintextSize,
 		},
 	}
 
-	if err := sendMessage(peer, &storeMsg); err != nil {
-		return err
-	}
-
-	// No sleep is needed between the header and the body: both travel over
-	// the same connection and the receiver decodes frames in order.
-	if err := peer.Send([]byte{p2p.IncomingStream}); err != nil {
-		return err
-	}
-
-	n, err := io.Copy(peer, fileReader)
+	// The announcement and the body go out under one lock, so a concurrent
+	// transfer on this connection cannot be spliced between them.
+	n, err := sendFile(peer, &storeMsg, fileReader)
 	if err != nil {
 		return err
 	}
@@ -316,66 +393,95 @@ func (s *FileServer) handleMessageGetFile(from string, msg MessageGetFile) error
 }
 
 func (s *FileServer) handleMessageDeleteFile(from string, msg MessageDeleteFile) error {
-	fmt.Printf("[%s] Received delete request for file with hash '%s' from %s\n", s.Transport.Address(), msg.Key, from)
+	fmt.Printf("[%s] Received delete request for '%s' from %s\n", s.Transport.Address(), msg.Name, from)
 
-	var originalKey string
-	if s.DB != nil {
-		f, err := s.DB.FindFileByHash(context.Background(), msg.Key)
-		if err != nil {
-			log.Printf("[%s] Failed to look up hash '%s': %v", s.Transport.Address(), msg.Key, err)
-		} else if f != nil {
-			originalKey = f.Name
-		}
+	if err := s.forget(msg.Name); err != nil {
+		return fmt.Errorf("[%s] %w", s.Transport.Address(), err)
 	}
-
-	if s.DB != nil {
-		if err := s.DB.DeleteFile(context.Background(), msg.Key); err != nil {
-			// Stop before touching the disk. Removing the bytes while the
-			// metadata still points at them is the inconsistency worth
-			// avoiding; leaving both in place is recoverable.
-			return fmt.Errorf("[%s] Failed to delete hash '%s' from database, leaving the file on disk: %w", s.Transport.Address(), msg.Key, err)
-		}
-		fmt.Printf("[%s] Deleted file with hash '%s' from database\n", s.Transport.Address(), msg.Key)
-	}
-
-	// A replica is stored under the hash, an original under its name, so both
-	// are attempted. Delete is idempotent, so a miss is not an error.
-	for _, key := range []string{originalKey, msg.Key} {
-		if key == "" || !s.store.Has(key) {
-			continue
-		}
-		if err := s.store.Delete(key); err != nil {
-			return fmt.Errorf("[%s] Error deleting file '%s': %w", s.Transport.Address(), key, err)
-		}
-		fmt.Printf("[%s] Deleted file '%s' from local storage\n", s.Transport.Address(), key)
-		return nil
-	}
-
-	fmt.Printf("[%s] File with hash '%s' does not exist locally, skipping deletion\n", s.Transport.Address(), msg.Key)
 	return nil
 }
 
-// sendMessage writes msg to peer as a single frame.
+// forget removes a name and, if nothing else refers to them, the contents
+// behind it.
 //
-// Tag, length and payload go out in one write so that a concurrent send on
+// Deduplication means one blob can back several names, so the bytes outlive
+// any single name that pointed at them.
+func (s *FileServer) forget(name string) error {
+	if s.DB == nil {
+		// Without a database there is no name mapping, so the name can only
+		// be the contents themselves.
+		if err := s.store.Delete(name); err != nil {
+			return fmt.Errorf("deleting %q: %w", name, err)
+		}
+		return nil
+	}
+
+	hash, orphaned, err := s.DB.DeleteFileByName(context.Background(), name)
+	if err != nil {
+		// Stop before touching the disk. Removing the bytes while the
+		// metadata still points at them is the inconsistency worth avoiding;
+		// leaving both in place is recoverable.
+		return fmt.Errorf("deleting %q from the database, leaving the file on disk: %w", name, err)
+	}
+
+	if hash == "" {
+		fmt.Printf("[%s] Nothing stored under '%s', skipping deletion\n", s.Transport.Address(), name)
+		return nil
+	}
+
+	fmt.Printf("[%s] Removed name '%s' from the database\n", s.Transport.Address(), name)
+
+	if !orphaned {
+		fmt.Printf("[%s] Contents %s are still referenced by another name, keeping them\n", s.Transport.Address(), short(hash))
+		return nil
+	}
+
+	if err := s.store.Delete(hash); err != nil {
+		return fmt.Errorf("deleting contents %s: %w", short(hash), err)
+	}
+	fmt.Printf("[%s] Deleted contents %s from local storage\n", s.Transport.Address(), short(hash))
+	return nil
+}
+
+// encodeMessage renders msg as a single wire frame.
+//
+// Tag, length and payload are emitted together so that a concurrent send on
 // the same connection cannot land between them and corrupt the frame.
-func sendMessage(peer p2p.Peer, msg *Message) error {
+func encodeMessage(msg *Message) ([]byte, error) {
 	payload := new(bytes.Buffer)
 	if err := gob.NewEncoder(payload).Encode(msg); err != nil {
-		return err
+		return nil, err
 	}
 	if payload.Len() > p2p.MaxMessageSize {
-		return fmt.Errorf("message of %d bytes exceeds the %d byte limit", payload.Len(), p2p.MaxMessageSize)
+		return nil, fmt.Errorf("message of %d bytes exceeds the %d byte limit", payload.Len(), p2p.MaxMessageSize)
 	}
 
 	frame := new(bytes.Buffer)
 	frame.WriteByte(p2p.IncomingMessage)
 	if err := binary.Write(frame, binary.LittleEndian, int64(payload.Len())); err != nil {
-		return err
+		return nil, err
 	}
 	frame.Write(payload.Bytes())
 
-	return peer.Send(frame.Bytes())
+	return frame.Bytes(), nil
+}
+
+// sendMessage writes msg to peer as a single frame.
+func sendMessage(peer p2p.Peer, msg *Message) error {
+	frame, err := encodeMessage(msg)
+	if err != nil {
+		return err
+	}
+	return peer.Send(frame)
+}
+
+// sendFile announces a file and streams its body as one indivisible transfer.
+func sendFile(peer p2p.Peer, msg *Message, body io.Reader) (int64, error) {
+	frame, err := encodeMessage(msg)
+	if err != nil {
+		return 0, err
+	}
+	return peer.SendStream(frame, body)
 }
 
 // connectedPeers returns a snapshot of the current peers.
@@ -402,6 +508,23 @@ func (s *FileServer) peer(addr string) (p2p.Peer, bool) {
 	return p, ok
 }
 
+// hasPeerWithNodeID reports whether a peer with this identity is already
+// connected, possibly on a different address.
+func (s *FileServer) hasPeerWithNodeID(nodeID string) bool {
+	if nodeID == "" {
+		return false
+	}
+
+	s.peersLock.Lock()
+	defer s.peersLock.Unlock()
+	for _, p := range s.peers {
+		if p.ID() == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *FileServer) peerCount() int {
 	s.peersLock.Lock()
 	defer s.peersLock.Unlock()
@@ -425,119 +548,144 @@ func (s *FileServer) broadcast(msg *Message) error {
 	return lastErr
 }
 
-func (s *FileServer) Get(key string) (int64, io.Reader, error) {
-	if s.store.Has(key) {
-		fmt.Printf("[%s] File '%s' found locally! Serving file from disk...\n", s.Transport.Address(), key)
-		return s.store.ReadDecrypt(s.EncryptionKey, key)
+// Get returns a file, fetching it from a peer when it is not held locally.
+//
+// The exchange runs in two rounds. First every peer is asked whether it holds
+// the name and answers either way, resolving the name to a content digest, so
+// a name nobody has fails as soon as the last peer has spoken. Then exactly
+// one peer that answered yes is asked for those contents, which is what stops
+// several peers streaming the same file at once.
+//
+// Because the second round asks for a digest rather than a name, the reply is
+// self-verifying: the bytes either hash to what was asked for or they are
+// discarded. A peer cannot substitute different contents.
+func (s *FileServer) Get(name string) (int64, io.Reader, error) {
+	if local, err := s.resolve(name); err != nil {
+		return 0, nil, err
+	} else if local != nil {
+		fmt.Printf("[%s] File '%s' found locally! Serving file from disk...\n", s.Transport.Address(), name)
+		return s.store.ReadDecrypt(s.EncryptionKey, local.digest)
 	}
 
-	fmt.Printf("[%s] Did not find file '%s' locally, searching on network...\n", s.Transport.Address(), key)
+	fmt.Printf("[%s] Did not find file '%s' locally, searching on network...\n", s.Transport.Address(), name)
 
-	hash := hashKey(key)
+	requestID, err := newRequestID()
+	if err != nil {
+		return 0, nil, err
+	}
+
+	peers, addrs := s.connectedPeers()
+	if len(addrs) == 0 {
+		return 0, nil, fmt.Errorf("no peers connected to ask for %q", name)
+	}
 
 	// Register before broadcasting, so a fast peer cannot answer before this
 	// node is ready to notice.
-	ch, release := s.awaitDownload(hash)
+	req, release := s.newRequest(requestID, name, len(addrs))
 	defer release()
 
-	msg := Message{
-		Payload: MessageGetFile{
-			Key: hash,
-		},
+	query := Message{Payload: MessageGetFile{RequestID: requestID, Name: name}}
+	asked := 0
+	for _, addr := range addrs {
+		if err := sendMessage(peers[addr], &query); err != nil {
+			fmt.Printf("[%s] Error asking peer %s: %v\n", s.Transport.Address(), addr, err)
+			continue
+		}
+		asked++
+	}
+	if asked == 0 {
+		return 0, nil, fmt.Errorf("could not reach any peer to ask for %q", name)
 	}
 
-	if err := s.broadcast(&msg); err != nil {
+	holder, ok := s.awaitOffer(req, asked)
+	if !ok {
+		return 0, nil, fmt.Errorf("no peer has %q", name)
+	}
+
+	peer, ok := s.peer(holder.from)
+	if !ok {
+		return 0, nil, fmt.Errorf("peer %s went away before it could send %q", holder.from, name)
+	}
+
+	digest := holder.offer.Digest
+	fmt.Printf("[%s] Fetching '%s' (%s) from %s\n", s.Transport.Address(), name, short(digest), holder.from)
+
+	fetch := Message{Payload: MessageFetchFile{RequestID: requestID, Name: name, Digest: digest}}
+	if err := sendMessage(peer, &fetch); err != nil {
 		return 0, nil, err
 	}
 
 	select {
-	case <-ch:
+	case <-req.done:
+		if req.err != nil {
+			return 0, nil, fmt.Errorf("fetching %q from %s: %w", name, holder.from, req.err)
+		}
 		fmt.Printf("[%s] File downloaded successfully!\n", s.Transport.Address())
-		// The file was downloaded and stored using the hash
-		return s.store.ReadDecrypt(s.EncryptionKey, hash)
+		return s.store.ReadDecrypt(s.EncryptionKey, digest)
 	case <-time.After(downloadTimeout):
-		return 0, nil, fmt.Errorf("timeout waiting for file download of %q", key)
+		return 0, nil, fmt.Errorf("timeout waiting for %q from %s", name, holder.from)
 	case <-s.quitch:
-		return 0, nil, fmt.Errorf("server stopped while waiting for %q", key)
+		return 0, nil, fmt.Errorf("server stopped while waiting for %q", name)
 	}
 }
 
-func (s *FileServer) Store(key string, r io.Reader) error {
+// awaitOffer collects replies until a peer says it holds the file, every peer
+// asked has answered, or the offer window closes.
+func (s *FileServer) awaitOffer(req *fileRequest, asked int) (peerOffer, bool) {
+	deadline := time.After(offerTimeout)
 
-	// 1. Write Encrypted to disk.
-	n, err := s.store.WriteEncrypt(s.EncryptionKey, key, r)
+	for replies := 0; replies < asked; replies++ {
+		select {
+		case reply := <-req.offers:
+			if reply.offer.Have && reply.offer.Digest != "" {
+				return reply, true
+			}
+		case <-deadline:
+			return peerOffer{}, false
+		case <-s.quitch:
+			return peerOffer{}, false
+		}
+	}
+
+	// Every peer answered and none of them holds it.
+	return peerOffer{}, false
+}
+
+// Store writes a file and pushes it to every connected peer.
+//
+// The file is stored under the digest of its own contents, so storing the
+// same bytes twice under different names keeps one copy on disk with two
+// names pointing at it.
+func (s *FileServer) Store(name string, r io.Reader) error {
+	digest, size, err := s.store.WriteContent(s.EncryptionKey, r)
 	if err != nil {
 		return err
 	}
 
-	plaintextSize := n - ivSize
-
 	if s.DB != nil {
-		if err := s.DB.InsertFileWithKey(context.Background(), dbpkg.File{
-			ID:        hashKey(key),
-			Name:      key,
-			Hash:      hashKey(key),
-			Size:      plaintextSize,
-			LocalPath: s.store.FullPathForKey(key),
-		}, "default"); err != nil {
+		if err := s.recordFile(name, digest, size); err != nil {
 			// The bytes are on disk but unrecorded, so surface it rather than
 			// reporting a store that later commands cannot see.
-			return fmt.Errorf("recording file %q: %w", key, err)
+			return fmt.Errorf("recording file %q: %w", name, err)
 		}
 	}
-
-	peers, addrs := s.connectedPeers()
 
 	msg := Message{
 		Payload: MessageStoreFile{
-			Key:  hashKey(key),
-			Size: plaintextSize,
+			Name:   name,
+			Digest: digest,
+			Size:   size,
 		},
 	}
 
-	// 2. Announce the file, then stream it to the peers that accepted the
-	// announcement. A peer that fails the announcement is skipped, so its
-	// connection never receives a body it is not expecting.
-	replicated := make([]string, 0, len(addrs))
-	writers := make([]io.Writer, 0, len(addrs))
-	for _, addr := range addrs {
-		fmt.Printf("[%s] Sending message to peer %s\n", s.Transport.Address(), addr)
-		if err := sendMessage(peers[addr], &msg); err != nil {
-			fmt.Printf("[%s] Error sending message to peer %s: %v\n", s.Transport.Address(), addr, err)
-			continue
-		}
-		replicated = append(replicated, addr)
-		writers = append(writers, peers[addr])
-	}
-
-	_, fileReader, err := s.store.ReadDecrypt(s.EncryptionKey, key)
-	if err != nil {
-		return err
-	}
-	if rc, ok := fileReader.(io.Closer); ok {
-		defer rc.Close()
-	}
-
-	var written int64
-	if len(writers) > 0 {
-		mw := io.MultiWriter(writers...)
-		if _, err := mw.Write([]byte{p2p.IncomingStream}); err != nil {
-			return err
-		}
-
-		written, err = io.Copy(mw, fileReader)
-		if err != nil {
-			return err
-		}
-	}
+	replicated, written := s.replicate(digest, &msg)
 
 	if s.DB != nil {
-		fileID := hashKey(key)
 		for _, addr := range replicated {
-			shareID := hashKey(fileID + addr + "outgoing")
+			shareID := contentKey([]byte(digest + addr + "outgoing"))
 			if err := s.DB.InsertShare(context.Background(), dbpkg.Share{
 				ID:        shareID,
-				FileID:    fileID,
+				FileID:    nameKey(name),
 				PeerID:    addr,
 				Direction: "outgoing",
 			}); err != nil {
@@ -546,19 +694,73 @@ func (s *FileServer) Store(key string, r io.Reader) error {
 		}
 	}
 
-	fmt.Printf("[%s] Received and written %d bytes to disk (encrypted), sent %d bytes (plaintext) to %d peer(s)\n",
-		s.Transport.Address(), n, written, len(replicated))
+	fmt.Printf("[%s] Stored '%s' as %s (%d bytes), sent %d bytes to %d peer(s)\n",
+		s.Transport.Address(), name, short(digest), size, written, len(replicated))
 
 	return nil
 }
 
-func (s *FileServer) Delete(key string) error {
-	fileID := hashKey(key)
+// replicate pushes a stored file to every connected peer and reports which
+// peers accepted it, along with the total bytes sent.
+//
+// Each peer is served by its own goroutine reading its own copy of the file.
+// A single shared reader would have to hold every peer's connection lock at
+// once to keep the transfer indivisible, and one slow peer would stall
+// delivery to all the others.
+func (s *FileServer) replicate(digest string, msg *Message) ([]string, int64) {
+	peers, addrs := s.connectedPeers()
 
-	// Query peers that have this file BEFORE deleting from DB
+	type result struct {
+		addr    string
+		written int64
+	}
+	results := make(chan result, len(addrs))
+
+	var wg sync.WaitGroup
+	for _, addr := range addrs {
+		wg.Add(1)
+		go func(addr string, peer p2p.Peer) {
+			defer wg.Done()
+
+			_, body, err := s.store.ReadDecrypt(s.EncryptionKey, digest)
+			if err != nil {
+				fmt.Printf("[%s] Could not read %s to send to %s: %v\n", s.Transport.Address(), short(digest), addr, err)
+				return
+			}
+			if rc, ok := body.(io.Closer); ok {
+				defer rc.Close()
+			}
+
+			fmt.Printf("[%s] Sending message to peer %s\n", s.Transport.Address(), addr)
+
+			n, err := sendFile(peer, msg, body)
+			if err != nil {
+				fmt.Printf("[%s] Error sending %s to peer %s: %v\n", s.Transport.Address(), short(digest), addr, err)
+				return
+			}
+			results <- result{addr: addr, written: n}
+		}(addr, peers[addr])
+	}
+
+	wg.Wait()
+	close(results)
+
+	replicated := make([]string, 0, len(addrs))
+	var written int64
+	for r := range results {
+		replicated = append(replicated, r.addr)
+		written += r.written
+	}
+	return replicated, written
+}
+
+// Delete removes a name locally and asks every peer to do the same.
+func (s *FileServer) Delete(name string) error {
+	// Query the peers holding this file before the metadata that names them
+	// is removed.
 	var sharePeers []string
 	if s.DB != nil {
-		peers, err := s.DB.GetOutgoingSharePeers(context.Background(), fileID)
+		peers, err := s.DB.GetOutgoingSharePeers(context.Background(), nameKey(name))
 		if err != nil {
 			fmt.Printf("[%s] Warning: could not query share peers: %v\n", s.Transport.Address(), err)
 		} else {
@@ -566,22 +768,12 @@ func (s *FileServer) Delete(key string) error {
 		}
 	}
 
-	// Delete from local database
-	if s.DB != nil {
-		if err := s.DB.DeleteFile(context.Background(), fileID); err != nil {
-			return fmt.Errorf("[%s] Failed to delete file '%s' from database: %w. File not deleted from disk to maintain consistency", s.Transport.Address(), key, err)
-		}
-		fmt.Printf("[%s] Deleted file '%s' from database\n", s.Transport.Address(), key)
+	if err := s.forget(name); err != nil {
+		return fmt.Errorf("[%s] %w", s.Transport.Address(), err)
 	}
 
-	// Delete from local storage. Delete is idempotent, so an absent file is
-	// not an error.
-	if err := s.store.Delete(key); err != nil {
-		return err
-	}
-	fmt.Printf("[%s] Deleted file '%s' from local storage\n", s.Transport.Address(), key)
-
-	// Connect to peers that have the file (from shares table)
+	// Reconnect to peers that were sent a copy but are not currently
+	// connected, so the deletion reaches them too.
 	if len(sharePeers) > 0 {
 		fmt.Printf("[%s] Connecting to %d peer(s) from shares: %v\n", s.Transport.Address(), len(sharePeers), sharePeers)
 
@@ -606,24 +798,17 @@ func (s *FileServer) Delete(key string) error {
 	}
 
 	peerCount := s.peerCount()
-	fmt.Printf("[%s] Connected to %d peer(s)\n", s.Transport.Address(), peerCount)
-
 	if peerCount == 0 {
 		fmt.Printf("[%s] No peers connected, cannot broadcast delete message\n", s.Transport.Address())
 		return nil
 	}
 
-	msg := Message{
-		Payload: MessageDeleteFile{
-			Key: fileID,
-		},
-	}
-
+	msg := Message{Payload: MessageDeleteFile{Name: name}}
 	if err := s.broadcast(&msg); err != nil {
 		return err
 	}
 
-	fmt.Printf("[%s] Broadcasted delete request for '%s' to %d peer(s)\n", s.Transport.Address(), key, peerCount)
+	fmt.Printf("[%s] Broadcasted delete request for '%s' to %d peer(s)\n", s.Transport.Address(), name, peerCount)
 	return nil
 }
 
@@ -659,6 +844,7 @@ func (s *FileServer) OnPeer(p p2p.Peer) error {
 		if err := s.DB.UpsertPeer(context.Background(), dbpkg.Peer{
 			ID:       peerAddr,
 			Address:  peerAddr,
+			NodeID:   p.ID(),
 			Status:   "connected",
 			LastSeen: &now,
 		}); err != nil {
@@ -687,6 +873,7 @@ func (s *FileServer) OnPeerDisconnect(p p2p.Peer) {
 		if err := s.DB.UpsertPeer(context.Background(), dbpkg.Peer{
 			ID:       peerAddr,
 			Address:  peerAddr,
+			NodeID:   p.ID(),
 			Status:   "disconnected",
 			LastSeen: &now,
 		}); err != nil {
@@ -700,12 +887,6 @@ func (s *FileServer) OnPeerDisconnect(p p2p.Peer) {
 func (s *FileServer) announceTo(peerAddr string) {
 	const attempts = 5
 
-	select {
-	case <-time.After(500 * time.Millisecond):
-	case <-s.quitch:
-		return
-	}
-
 	for i := range attempts {
 		if err := s.sendPeerExchange(peerAddr); err == nil {
 			return
@@ -715,18 +896,52 @@ func (s *FileServer) announceTo(peerAddr string) {
 		}
 
 		select {
-		case <-time.After(1 * time.Second):
+		case <-time.After(250 * time.Millisecond):
 		case <-s.quitch:
 			return
 		}
 	}
 }
 
+// Handshake is the first thing exchanged on a new connection.
 type Handshake struct {
-	ListenAddr string
+	Version uint32
+	NodeID  string
+
+	// ListenPort is the port this node accepts connections on. Only the port
+	// is sent: the receiver already knows which address the connection came
+	// from and pairs the two, so a node configured with a bare ":3000" is
+	// still reachable by peers on other machines.
+	ListenPort string
 }
 
-func GetHandshakeFunc(listenAddr string) p2p.HandshakeFunc {
+// portSource reports the port this node accepts connections on. It is read at
+// handshake time rather than captured up front, so a node configured with
+// port 0 advertises the port it actually bound.
+type portSource interface {
+	Address() string
+	BoundAddr() string
+}
+
+// localListenPort returns the port peers should use to reach this node.
+func localListenPort(src portSource) string {
+	for _, candidate := range []string{src.BoundAddr(), src.Address()} {
+		if candidate == "" {
+			continue
+		}
+		if _, port, err := net.SplitHostPort(candidate); err == nil && port != "" && port != "0" {
+			return port
+		}
+	}
+	return ""
+}
+
+// GetHandshakeFunc builds the handshake run on every new connection.
+//
+// It settles three things before any file traffic is allowed: that both sides
+// speak the same protocol version, that the peer is not this node reached by
+// a roundabout route, and what address other nodes should use to reach it.
+func GetHandshakeFunc(nodeID string, src portSource) p2p.HandshakeFunc {
 	return func(p any) error {
 		peer, ok := p.(*p2p.TCPPeer)
 		if !ok {
@@ -734,7 +949,9 @@ func GetHandshakeFunc(listenAddr string) p2p.HandshakeFunc {
 		}
 
 		hs := Handshake{
-			ListenAddr: listenAddr,
+			Version:    p2p.ProtocolVersion,
+			NodeID:     nodeID,
+			ListenPort: localListenPort(src),
 		}
 
 		// 1. Send our handshake
@@ -752,12 +969,36 @@ func GetHandshakeFunc(listenAddr string) p2p.HandshakeFunc {
 		if err := gob.NewDecoder(peer).Decode(&remoteHS); err != nil {
 			return err
 		}
-		if remoteHS.ListenAddr == "" {
-			return fmt.Errorf("peer advertised an empty listen address")
+
+		if remoteHS.Version != p2p.ProtocolVersion {
+			return fmt.Errorf("protocol version mismatch: peer speaks %d, this node speaks %d",
+				remoteHS.Version, p2p.ProtocolVersion)
+		}
+		if remoteHS.NodeID == "" {
+			return fmt.Errorf("peer did not identify itself")
+		}
+		if remoteHS.NodeID == nodeID {
+			// Gossip hands out addresses, and one of them is eventually our
+			// own. Identity is what tells the difference reliably; comparing
+			// addresses cannot, because a node has several.
+			return fmt.Errorf("refusing to connect to self")
+		}
+		if remoteHS.ListenPort == "" {
+			return fmt.Errorf("peer %s did not advertise a listen port", remoteHS.NodeID)
 		}
 
-		fmt.Printf("[%s] Handshake successful with %s\n", listenAddr, remoteHS.ListenAddr)
-		peer.FullAddr = remoteHS.ListenAddr
+		// Pair the port the peer advertises with the address the connection
+		// actually came from. A peer configured with a bare ":3000" would
+		// otherwise hand out an address that resolves to the wrong host.
+		host := peer.ObservedHost()
+		if host == "" {
+			return fmt.Errorf("could not determine the address peer %s connected from", remoteHS.NodeID)
+		}
+
+		peer.NodeID = remoteHS.NodeID
+		peer.FullAddr = net.JoinHostPort(host, remoteHS.ListenPort)
+
+		fmt.Printf("[%s] Handshake successful with %s at %s\n", src.Address(), remoteHS.NodeID, peer.FullAddr)
 
 		return nil
 	}
@@ -780,6 +1021,42 @@ func (s *FileServer) bootstrapNetwork() error {
 	return nil
 }
 
+// waitForPeerDiscovery waits until the peer set stops growing, and returns
+// the number of peers connected.
+//
+// Gossip reaches further than the bootstrap list names, so a command that
+// acted the moment the first peer connected would replicate to a fraction of
+// the network it could have reached. Waiting for the count to hold steady
+// adapts to how long discovery actually takes, where a fixed sleep is either
+// too short on a slow network or wasted time on a fast one.
+func (s *FileServer) waitForPeerDiscovery(quiet, max time.Duration) int {
+	const poll = 25 * time.Millisecond
+
+	deadline := time.Now().Add(max)
+	last := s.peerCount()
+	stableSince := time.Now()
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-time.After(poll):
+		case <-s.quitch:
+			return s.peerCount()
+		}
+
+		count := s.peerCount()
+		if count != last {
+			last = count
+			stableSince = time.Now()
+			continue
+		}
+		if count > 0 && time.Since(stableSince) >= quiet {
+			return count
+		}
+	}
+
+	return s.peerCount()
+}
+
 // waitForPeers waits for at least one peer connection, with a timeout
 func (s *FileServer) waitForPeers(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
@@ -795,6 +1072,8 @@ func (s *FileServer) waitForPeers(timeout time.Duration) error {
 func init() {
 	gob.Register(MessageStoreFile{})
 	gob.Register(MessageGetFile{})
+	gob.Register(MessageFileOffer{})
+	gob.Register(MessageFetchFile{})
 	gob.Register(MessageDeleteFile{})
 	gob.Register(MessagePeerExchange{})
 	gob.Register(PeerInfo{})
@@ -802,6 +1081,7 @@ func init() {
 }
 
 type FileServerOpts struct {
+	NodeID            string
 	EncryptionKey     []byte
 	StorageRoot       string
 	PathTransformFunc PathTransformFunc
@@ -820,13 +1100,17 @@ type FileServer struct {
 	quitch   chan struct{}
 	stopOnce sync.Once
 
-	// transferLock guards all three transfer maps below. They are written by
-	// the caller's goroutine (Get) and by the server loop, so they cannot be
+	// transferLock guards the transfer maps below. They are written by the
+	// caller's goroutine (Get) and by the server loop, so they cannot be
 	// touched without it.
-	transferLock         sync.Mutex
+	transferLock sync.Mutex
+
+	// pendingFileTransfers holds the announcement a peer sent just before the
+	// stream that follows it, keyed by peer address.
 	pendingFileTransfers map[string]MessageStoreFile
-	downloadChannels     map[string]chan struct{}
-	satisfiedDownloads   map[string]time.Time
+
+	// requests holds outstanding Gets, keyed by request id.
+	requests map[string]*fileRequest
 }
 
 func NewFileServer(opts FileServerOpts) *FileServer {
@@ -840,8 +1124,7 @@ func NewFileServer(opts FileServerOpts) *FileServer {
 		quitch:               make(chan struct{}),
 		peers:                make(map[string]p2p.Peer),
 		pendingFileTransfers: make(map[string]MessageStoreFile),
-		downloadChannels:     make(map[string]chan struct{}),
-		satisfiedDownloads:   make(map[string]time.Time),
+		requests:             make(map[string]*fileRequest),
 	}
 }
 
@@ -849,17 +1132,50 @@ type Message struct {
 	Payload any
 }
 
+// MessageStoreFile announces that a file stream follows immediately on the
+// same connection. RequestID is empty when the file is pushed unsolicited by
+// a Store, and echoes the requester's id when it answers a fetch.
+//
+// Digest identifies the contents; Name travels with it so the receiving node
+// can list what it holds under the name its owner gave it.
 type MessageStoreFile struct {
-	Key  string
-	Size int64
+	RequestID string
+	Name      string
+	Digest    string
+	Size      int64
 }
 
+// MessageGetFile asks every peer whether it holds anything under Name.
 type MessageGetFile struct {
-	Key string
+	RequestID string
+	Name      string
 }
 
+// MessageFileOffer answers a MessageGetFile, resolving the name to the
+// contents the answering peer holds for it. Peers that hold nothing answer
+// too, with Have false, so the requester can give up as soon as every peer
+// has spoken instead of waiting out the timeout.
+type MessageFileOffer struct {
+	RequestID string
+	Name      string
+	Have      bool
+	Digest    string
+	Size      int64
+}
+
+// MessageFetchFile asks the single peer chosen from the offers to send the
+// contents. It names a digest rather than a file name: the requester knows
+// exactly which bytes it expects, and can reject anything else.
+type MessageFetchFile struct {
+	RequestID string
+	Name      string
+	Digest    string
+}
+
+// MessageDeleteFile asks peers to forget a name. The contents behind it are
+// removed only once no name on that peer still refers to them.
 type MessageDeleteFile struct {
-	Key string
+	Name string
 }
 
 type MessagePeerExchange struct {
@@ -868,5 +1184,6 @@ type MessagePeerExchange struct {
 
 type PeerInfo struct {
 	Address  string
+	NodeID   string
 	LastSeen time.Time
 }

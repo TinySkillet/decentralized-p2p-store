@@ -180,14 +180,52 @@ func TestCopyEncryptRejectsBadKeyLength(t *testing.T) {
 	}
 }
 
-func TestHashKeyIsStable(t *testing.T) {
-	if hashKey("hello") != hashKey("hello") {
-		t.Fatal("hashKey is not deterministic")
+func TestNameKeyIsStable(t *testing.T) {
+	if nameKey("hello") != nameKey("hello") {
+		t.Fatal("nameKey is not deterministic")
 	}
-	if hashKey("hello") == hashKey("world") {
-		t.Fatal("distinct keys collided")
+	if nameKey("hello") == nameKey("world") {
+		t.Fatal("distinct names collided")
 	}
-	if len(hashKey("hello")) != 32 {
-		t.Fatalf("hashKey length = %d, want 32 hex chars", len(hashKey("hello")))
+	if len(nameKey("hello")) != digestSize {
+		t.Fatalf("nameKey length = %d, want %d hex chars", len(nameKey("hello")), digestSize)
+	}
+}
+
+func TestContentKeyIdentifiesContents(t *testing.T) {
+	payload := []byte("the same bytes")
+
+	// The whole point of content addressing: identity follows the bytes, not
+	// the name they happen to be stored under.
+	if contentKey(payload) != contentKey([]byte("the same bytes")) {
+		t.Fatal("identical contents produced different keys")
+	}
+	if contentKey(payload) == contentKey([]byte("different bytes")) {
+		t.Fatal("different contents produced the same key")
+	}
+	if len(contentKey(payload)) != digestSize {
+		t.Fatalf("contentKey length = %d, want %d hex chars", len(contentKey(payload)), digestSize)
+	}
+
+	// A known vector, so a change of hash function is caught rather than
+	// silently accepted.
+	const wantEmpty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	if got := contentKey(nil); got != wantEmpty {
+		t.Errorf("contentKey of empty input = %s, want the SHA-256 of the empty string %s", got, wantEmpty)
+	}
+}
+
+func TestDigesterMatchesContentKey(t *testing.T) {
+	payload := []byte("streamed through a digester")
+
+	dg := newDigester()
+	if _, err := io.Copy(io.Discard, dg.tee(bytes.NewReader(payload))); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+
+	// The streaming digest and the one-shot digest must agree, or a file
+	// would fail verification against its own recorded hash.
+	if dg.sum() != contentKey(payload) {
+		t.Errorf("digester gave %s, contentKey gave %s", dg.sum(), contentKey(payload))
 	}
 }
