@@ -116,6 +116,10 @@ func (s *FileServer) sweepLoop() {
 // deleted, which is how a deletion reaches nodes that were offline when it was
 // broadcast. Callers should report this as copies offered, not placed.
 func (s *FileServer) RepairOnce() (int, error) {
+	return s.repairOnceFor(s.ReplicationFactor)
+}
+
+func (s *FileServer) repairOnceFor(target int) (int, error) {
 	if s.DB == nil {
 		return 0, nil
 	}
@@ -144,7 +148,7 @@ func (s *FileServer) RepairOnce() (int, error) {
 		seen[f.Hash] = true
 		checked++
 
-		n, err := s.repairFile(f)
+		n, err := s.repairFile(f, target)
 		if err != nil {
 			log.Printf("[%s] Could not repair %s: %v", s.Transport.Address(), short(f.Hash), err)
 			continue
@@ -163,8 +167,8 @@ func (s *FileServer) RepairOnce() (int, error) {
 
 // repairFile brings one file back up to the replication target, and reports
 // how many new copies it placed.
-func (s *FileServer) repairFile(f dbpkg.File) (int, error) {
-	health, lacking, err := s.checkFile(f)
+func (s *FileServer) repairFile(f dbpkg.File, target int) (int, error) {
+	health, lacking, err := s.checkFile(f, target)
 	if err != nil {
 		return 0, err
 	}
@@ -210,12 +214,12 @@ func (s *FileServer) repairFile(f dbpkg.File) (int, error) {
 //
 // A peer that answers with a different digest for the same name is counted as
 // lacking this file: it holds something else under that name, not this.
-func (s *FileServer) checkFile(f dbpkg.File) (FileHealth, []string, error) {
+func (s *FileServer) checkFile(f dbpkg.File, target int) (FileHealth, []string, error) {
 	health := FileHealth{
 		Name:   f.Name,
 		Digest: f.Hash,
 		Size:   f.Size,
-		Target: s.ReplicationFactor,
+		Target: target,
 	}
 
 	// A command borrows the storage of the node that owns the database. Its
@@ -332,6 +336,10 @@ func (s *FileServer) pushTo(addr string, f dbpkg.File) error {
 
 // ReplicationStatus reports how well replicated every file this node holds is.
 func (s *FileServer) ReplicationStatus() ([]FileHealth, error) {
+	return s.replicationStatusFor(s.ReplicationFactor)
+}
+
+func (s *FileServer) replicationStatusFor(target int) ([]FileHealth, error) {
 	if s.DB == nil {
 		return nil, nil
 	}
@@ -346,7 +354,7 @@ func (s *FileServer) ReplicationStatus() ([]FileHealth, error) {
 		if !s.store.Has(f.Hash) {
 			continue
 		}
-		health, _, err := s.checkFile(f)
+		health, _, err := s.checkFile(f, target)
 		if err != nil {
 			return nil, err
 		}

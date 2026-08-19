@@ -240,7 +240,7 @@ func TestCheckFileIgnoresDifferentContentUnderTheSameName(t *testing.T) {
 		if f.Name != "notes" {
 			continue
 		}
-		health, _, err := first.checkFile(f)
+		health, _, err := first.checkFile(f, 2)
 		if err != nil {
 			t.Fatalf("checkFile: %v", err)
 		}

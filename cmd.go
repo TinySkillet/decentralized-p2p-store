@@ -37,6 +37,50 @@ func withBootstrap(bootstrap []string, addr string) []string {
 	return append(bootstrap, addr)
 }
 
+// replicationHealth reports file health, asking the running node when there is
+// one so its own copy is not counted twice.
+func replicationHealth(dbPath, listen string, bootstrap []string, replicas int) ([]FileHealth, error) {
+	if node, ok := dialControl(dbPath); ok {
+		return node.status(replicas)
+	}
+
+	d, err := openDB(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer d.Close()
+
+	s, stop, err := startClientNode(listen, d, bootstrap, replicas)
+	if err != nil {
+		return nil, err
+	}
+	defer stop()
+
+	return s.ReplicationStatus()
+}
+
+// runRepair restores under-replicated files, through the running node when
+// there is one.
+func runRepair(dbPath, listen string, bootstrap []string, replicas int) (int, error) {
+	if node, ok := dialControl(dbPath); ok {
+		return node.repair(replicas)
+	}
+
+	d, err := openDB(dbPath)
+	if err != nil {
+		return 0, err
+	}
+	defer d.Close()
+
+	s, stop, err := startClientNode(listen, d, bootstrap, replicas)
+	if err != nil {
+		return 0, err
+	}
+	defer stop()
+
+	return s.RepairOnce()
+}
+
 // openDB opens and migrates the node database.
 func openDB(path string) (*dbpkg.DB, error) {
 	d, err := dbpkg.Open(path)
@@ -160,6 +204,12 @@ func setupCommands() *cobra.Command {
 				return err
 			}
 
+			// Commands ask this node to act rather than starting one of their
+			// own against the same storage.
+			if err := s.ListenControl(ControlSocketPath(dbPath)); err != nil {
+				return err
+			}
+
 			// Shut down cleanly on Ctrl-C so the database is closed and
 			// in-flight writes are not cut off mid-file.
 			sigs := make(chan os.Signal, 1)
@@ -194,6 +244,17 @@ func setupCommands() *cobra.Command {
 			}
 			defer f.Close()
 
+			// A running node owns this database and its storage, so it does
+			// the work. Starting a second node against the same files is what
+			// produced races, miscounted replicas and unowned files.
+			if node, ok := dialControl(dbPath); ok {
+				info, err := f.Stat()
+				if err != nil {
+					return err
+				}
+				return node.store(key, info.Size(), f)
+			}
+
 			d, err := openDB(dbPath)
 			if err != nil {
 				return err
@@ -221,6 +282,22 @@ func setupCommands() *cobra.Command {
 			key := args[0]
 			out, _ := cmd.Flags().GetString("out")
 
+			writeOut := func(fn func(io.Writer) error) error {
+				if out == "" {
+					return fn(os.Stdout)
+				}
+				of, err := os.Create(out)
+				if err != nil {
+					return err
+				}
+				defer of.Close()
+				return fn(of)
+			}
+
+			if node, ok := dialControl(dbPath); ok {
+				return writeOut(func(w io.Writer) error { return node.get(key, w) })
+			}
+
 			d, err := openDB(dbPath)
 			if err != nil {
 				return err
@@ -241,17 +318,10 @@ func setupCommands() *cobra.Command {
 				defer rc.Close()
 			}
 
-			var w io.Writer = os.Stdout
-			if out != "" {
-				of, err := os.Create(out)
-				if err != nil {
-					return err
-				}
-				defer of.Close()
-				w = of
-			}
-			_, err = io.Copy(w, r)
-			return err
+			return writeOut(func(w io.Writer) error {
+				_, err := io.Copy(w, r)
+				return err
+			})
 		},
 	}
 	getCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address")
@@ -265,6 +335,10 @@ func setupCommands() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			key := args[0]
+
+			if node, ok := dialControl(dbPath); ok {
+				return node.delete(key)
+			}
 
 			d, err := openDB(dbPath)
 			if err != nil {
@@ -410,19 +484,7 @@ func setupCommands() *cobra.Command {
 		Use:   "status",
 		Short: "Report how well replicated the local files are",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			d, err := openDB(dbPath)
-			if err != nil {
-				return err
-			}
-			defer d.Close()
-
-			s, stop, err := startClientNode(listen, d, bootstrap, replicas)
-			if err != nil {
-				return err
-			}
-			defer stop()
-
-			health, err := s.ReplicationStatus()
+			health, err := replicationHealth(dbPath, listen, bootstrap, replicas)
 			if err != nil {
 				return err
 			}
@@ -460,19 +522,7 @@ func setupCommands() *cobra.Command {
 		Use:   "repair",
 		Short: "Place missing copies of under-replicated files",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			d, err := openDB(dbPath)
-			if err != nil {
-				return err
-			}
-			defer d.Close()
-
-			s, stop, err := startClientNode(listen, d, bootstrap, replicas)
-			if err != nil {
-				return err
-			}
-			defer stop()
-
-			placed, err := s.RepairOnce()
+			placed, err := runRepair(dbPath, listen, bootstrap, replicas)
 			if err != nil {
 				return err
 			}

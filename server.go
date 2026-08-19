@@ -1069,6 +1069,10 @@ func (s *FileServer) Stop() {
 		// Closing the listener only stops new connections. Established ones
 		// must be closed too, otherwise peers keep this node in their peer
 		// set and go on broadcasting to a process that has exited.
+		if s.controlListener != nil {
+			s.controlListener.Close()
+		}
+
 		peers, _ := s.connectedPeers()
 		for _, p := range peers {
 			p.Close()
@@ -1465,6 +1469,10 @@ type FileServer struct {
 	store    *Store
 	quitch   chan struct{}
 	stopOnce sync.Once
+
+	// controlListener accepts commands from the CLI, when this node is the one
+	// that owns the database.
+	controlListener net.Listener
 
 	// transferLock guards the transfer maps below. They are written by the
 	// caller's goroutine (Get) and by the server loop, so they cannot be
