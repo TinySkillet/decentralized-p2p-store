@@ -1,15 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
-	"encoding/gob"
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/TinySkillet/DecentralizedP2PStorage/p2p"
 )
 
 func (s *FileServer) handleMessagePeerExchange(from string, msg MessagePeerExchange) error {
@@ -22,7 +17,8 @@ func (s *FileServer) handleMessagePeerExchange(from string, msg MessagePeerExcha
 
 func (s *FileServer) discoverPeers(peers []PeerInfo) {
 	myAddr := s.Transport.Address()
-	maxAttempts := 10
+	const maxAttempts = 10
+
 	attempted := 0
 	connected := 0
 
@@ -31,24 +27,29 @@ func (s *FileServer) discoverPeers(peers []PeerInfo) {
 			break
 		}
 
-		if peerInfo.Address == myAddr {
+		if peerInfo.Address == myAddr || peerInfo.Address == "" {
 			continue
 		}
 
-		s.peersLock.Lock()
-		_, alreadyConnected := s.peers[peerInfo.Address]
-		s.peersLock.Unlock()
-
-		if alreadyConnected {
+		if _, alreadyConnected := s.peer(peerInfo.Address); alreadyConnected {
 			continue
 		}
 
-		err := s.Transport.Dial(peerInfo.Address)
-		if err == nil {
-			fmt.Printf("[%s] Connected to discovered peer %s\n", myAddr, peerInfo.Address)
-			connected++
-			attempted++
-			time.Sleep(100 * time.Millisecond)
+		// Counted whether or not the dial succeeds. Only counting successes
+		// let a list of dead addresses run far past the limit.
+		attempted++
+
+		if err := s.Transport.Dial(peerInfo.Address); err != nil {
+			continue
+		}
+
+		fmt.Printf("[%s] Connected to discovered peer %s\n", myAddr, peerInfo.Address)
+		connected++
+
+		select {
+		case <-time.After(100 * time.Millisecond):
+		case <-s.quitch:
+			return
 		}
 	}
 
@@ -80,30 +81,18 @@ func (s *FileServer) sendPeerExchange(peerAddr string) error {
 
 	fmt.Printf("[%s] Sending %d peer(s) to %s\n", s.Transport.Address(), len(peerInfos), peerAddr)
 
+	peer, ok := s.peer(peerAddr)
+	if !ok {
+		return fmt.Errorf("peer %s not found in connected peers", peerAddr)
+	}
+
 	msg := Message{
 		Payload: MessagePeerExchange{
 			Peers: peerInfos,
 		},
 	}
 
-	s.peersLock.Lock()
-	peer, ok := s.peers[peerAddr]
-	s.peersLock.Unlock()
-
-	if !ok {
-		return fmt.Errorf("peer %s not found in connected peers", peerAddr)
-	}
-
-	buf := new(bytes.Buffer)
-	if err := gob.NewEncoder(buf).Encode(msg); err != nil {
-		return err
-	}
-
-	peer.Send([]byte{p2p.IncomingMessage})
-	binary.Write(peer, binary.LittleEndian, int64(buf.Len()))
-	err = peer.Send(buf.Bytes())
-
-	if err != nil && !isExpectedNetworkError(err) {
+	if err := sendMessage(peer, &msg); err != nil && !isExpectedNetworkError(err) {
 		return err
 	}
 

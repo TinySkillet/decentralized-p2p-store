@@ -1,13 +1,29 @@
 DEFAULT_TARGET: build
 
-.PHONY: build run test
+.PHONY: build run test test-race vet fmt check clean
 
 build:
 	@go build -o bin/p2p
 
-run: 
+run:
 	@./bin/p2p
 
-test: 
-	@go test ./... -v
+# The unit suite. Multi-node tests bring real nodes up on loopback ports, so
+# allow more than the default 10 minute timeout on a slow machine.
+test:
+	@go test ./... -timeout 300s
 
+# The concurrency fixes are only meaningful if this stays clean.
+test-race:
+	@go test ./... -race -timeout 900s
+
+vet:
+	@go vet ./...
+
+fmt:
+	@gofmt -l .
+
+check: fmt vet test-race
+
+clean:
+	@rm -rf bin/

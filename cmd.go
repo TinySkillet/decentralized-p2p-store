@@ -5,14 +5,66 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	dbpkg "github.com/TinySkillet/DecentralizedP2PStorage/db"
 	"github.com/spf13/cobra"
 )
+
+// peerWaitTimeout bounds how long a one-shot command waits for the network
+// before giving up and acting on whatever it is connected to.
+const peerWaitTimeout = 10 * time.Second
+
+// openDB opens and migrates the node database.
+func openDB(path string) (*dbpkg.DB, error) {
+	d, err := dbpkg.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.Migrate(context.Background()); err != nil {
+		d.Close()
+		return nil, err
+	}
+	return d, nil
+}
+
+// startClientNode brings up a short-lived node for a one-shot command and
+// returns it together with a shutdown function.
+//
+// Listen is synchronous, so a bind failure (a port already in use, most
+// often) is reported here rather than crashing a background goroutine.
+func startClientNode(listen string, d *dbpkg.DB, bootstrap []string) (*FileServer, func(), error) {
+	keyBytes, err := loadOrInitKey(d)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	s, err := makeServerWithDB(listen, d, bootstrap...)
+	if err != nil {
+		return nil, nil, err
+	}
+	s.EncryptionKey = keyBytes
+
+	if err := s.Listen(); err != nil {
+		return nil, nil, fmt.Errorf("starting node on %s: %w", listen, err)
+	}
+	go s.Serve()
+
+	if len(bootstrap) > 0 {
+		if err := s.waitForPeers(peerWaitTimeout); err != nil {
+			fmt.Printf("Warning: %v. Proceeding anyway.\n", err)
+		}
+		// Peer exchange runs after the first connection settles; give
+		// discovery a moment to reach the rest of the network.
+		time.Sleep(2 * time.Second)
+	}
+
+	return s, s.Stop, nil
+}
 
 func setupCommands() *cobra.Command {
 	var (
@@ -46,21 +98,40 @@ func setupCommands() *cobra.Command {
 				}
 			}
 
-			d, err := dbpkg.Open(dbPath)
+			d, err := openDB(dbPath)
 			if err != nil {
 				return err
 			}
 			defer d.Close()
-			if err := d.Migrate(context.Background()); err != nil {
-				return err
-			}
+
 			keyBytes, err := loadOrInitKey(d)
 			if err != nil {
 				return err
 			}
-			s := makeServerWithDB(listen, d, bootstrap...)
+			s, err := makeServerWithDB(listen, d, bootstrap...)
+			if err != nil {
+				return err
+			}
 			s.EncryptionKey = keyBytes
-			return s.Start()
+
+			if err := s.Listen(); err != nil {
+				return err
+			}
+
+			// Shut down cleanly on Ctrl-C so the database is closed and
+			// in-flight writes are not cut off mid-file.
+			sigs := make(chan os.Signal, 1)
+			signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+			defer signal.Stop(sigs)
+
+			go func() {
+				sig := <-sigs
+				fmt.Printf("\nReceived %s, shutting down...\n", sig)
+				s.Stop()
+			}()
+
+			s.Serve()
+			return nil
 		},
 	}
 	serveCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address")
@@ -80,30 +151,18 @@ func setupCommands() *cobra.Command {
 			}
 			defer f.Close()
 
-			d, err := dbpkg.Open(dbPath)
+			d, err := openDB(dbPath)
 			if err != nil {
 				return err
 			}
 			defer d.Close()
-			if err := d.Migrate(context.Background()); err != nil {
-				return err
-			}
 
-			keyBytes, err := loadOrInitKey(d)
+			s, stop, err := startClientNode(listen, d, bootstrap)
 			if err != nil {
 				return err
 			}
-			s := makeServerWithDB(listen, d, bootstrap...)
-			s.EncryptionKey = keyBytes
-			go func() { log.Fatal(s.Start()) }()
-			time.Sleep(1 * time.Second)
-			if len(bootstrap) > 0 {
-				if err := s.waitForPeers(10 * time.Second); err != nil {
-					fmt.Printf("Warning: %v. Proceeding with store anyway.\n", err)
-				}
-				// Give peer discovery a bit more time to connect to ALL peers
-				time.Sleep(2 * time.Second)
-			}
+			defer stop()
+
 			return s.Store(key, f)
 		},
 	}
@@ -119,33 +178,26 @@ func setupCommands() *cobra.Command {
 			key := args[0]
 			out, _ := cmd.Flags().GetString("out")
 
-			d, err := dbpkg.Open(dbPath)
+			d, err := openDB(dbPath)
 			if err != nil {
 				return err
 			}
 			defer d.Close()
-			if err := d.Migrate(context.Background()); err != nil {
-				return err
-			}
 
-			keyBytes, err := loadOrInitKey(d)
+			s, stop, err := startClientNode(listen, d, bootstrap)
 			if err != nil {
 				return err
 			}
-			s := makeServerWithDB(listen, d, bootstrap...)
-			s.EncryptionKey = keyBytes
-			go func() { log.Fatal(s.Start()) }()
-			time.Sleep(1 * time.Second)
-			if len(bootstrap) > 0 {
-				if err := s.waitForPeers(10 * time.Second); err != nil {
-					fmt.Printf("Warning: %v. Proceeding with get anyway.\n", err)
-				}
-				time.Sleep(1 * time.Second)
-			}
+			defer stop()
+
 			_, r, err := s.Get(key)
 			if err != nil {
 				return err
 			}
+			if rc, ok := r.(io.Closer); ok {
+				defer rc.Close()
+			}
+
 			var w io.Writer = os.Stdout
 			if out != "" {
 				of, err := os.Create(out)
@@ -171,29 +223,18 @@ func setupCommands() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			key := args[0]
 
-			d, err := dbpkg.Open(dbPath)
+			d, err := openDB(dbPath)
 			if err != nil {
 				return err
 			}
 			defer d.Close()
-			if err := d.Migrate(context.Background()); err != nil {
-				return err
-			}
 
-			keyBytes, err := loadOrInitKey(d)
+			s, stop, err := startClientNode(listen, d, bootstrap)
 			if err != nil {
 				return err
 			}
-			s := makeServerWithDB(listen, d, bootstrap...)
-			s.EncryptionKey = keyBytes
-			go func() { log.Fatal(s.Start()) }()
-			time.Sleep(1 * time.Second)
-			if len(bootstrap) > 0 {
-				if err := s.waitForPeers(10 * time.Second); err != nil {
-					fmt.Printf("Warning: %v. Proceeding with delete anyway.\n", err)
-				}
-				time.Sleep(1 * time.Second)
-			}
+			defer stop()
+
 			return s.Delete(key)
 		},
 	}
@@ -206,14 +247,12 @@ func setupCommands() *cobra.Command {
 		Use:   "list",
 		Short: "List known files",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			d, err := dbpkg.Open(dbPath)
+			d, err := openDB(dbPath)
 			if err != nil {
 				return err
 			}
 			defer d.Close()
-			if err := d.Migrate(context.Background()); err != nil {
-				return err
-			}
+
 			ff, err := d.ListFiles(context.Background())
 			if err != nil {
 				return err
@@ -240,14 +279,12 @@ func setupCommands() *cobra.Command {
 		Use:   "shares",
 		Short: "List file shares (files stored in other peers)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			d, err := dbpkg.Open(dbPath)
+			d, err := openDB(dbPath)
 			if err != nil {
 				return err
 			}
 			defer d.Close()
-			if err := d.Migrate(context.Background()); err != nil {
-				return err
-			}
+
 			shares, err := d.ListShares(context.Background())
 			if err != nil {
 				return err
@@ -275,14 +312,11 @@ func setupCommands() *cobra.Command {
 		Use:   "peers",
 		Short: "List connected and known peers",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			d, err := dbpkg.Open(dbPath)
+			d, err := openDB(dbPath)
 			if err != nil {
 				return err
 			}
 			defer d.Close()
-			if err := d.Migrate(context.Background()); err != nil {
-				return err
-			}
 
 			peers, err := d.GetActivePeers(context.Background(), 24*time.Hour, 100)
 			if err != nil {
@@ -312,14 +346,11 @@ func setupCommands() *cobra.Command {
 		Use:   "cleanup",
 		Short: "Remove stale peer records from database",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			d, err := dbpkg.Open(dbPath)
+			d, err := openDB(dbPath)
 			if err != nil {
 				return err
 			}
 			defer d.Close()
-			if err := d.Migrate(context.Background()); err != nil {
-				return err
-			}
 
 			removed, err := d.CleanupStalePeers(context.Background(), 1*time.Hour)
 			if err != nil {
@@ -336,21 +367,46 @@ func setupCommands() *cobra.Command {
 		Use:   "demo",
 		Short: "Run the local 3-node demo",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			s1 := makeServer(":3000", "")
-			s2 := makeServer(":4000", ":3000")
-			s3 := makeServer(":5000", ":3000", ":4000")
+			servers := make([]*FileServer, 0, 3)
+			specs := []struct {
+				listen    string
+				bootstrap []string
+			}{
+				{":3000", nil},
+				{":4000", []string{":3000"}},
+				{":5000", []string{":3000", ":4000"}},
+			}
 
-			go func() { log.Fatal(s1.Start()) }()
-			time.Sleep(1 * time.Second)
-			go func() { log.Fatal(s2.Start()) }()
-			time.Sleep(1 * time.Second)
-			go s3.Start()
+			for _, spec := range specs {
+				s, err := makeServer(spec.listen, spec.bootstrap...)
+				if err != nil {
+					return err
+				}
+				if err := s.Listen(); err != nil {
+					return err
+				}
+				go s.Serve()
+				defer s.Stop()
+
+				servers = append(servers, s)
+				time.Sleep(500 * time.Millisecond)
+			}
+
+			s3 := servers[2]
+			if err := s3.waitForPeers(peerWaitTimeout); err != nil {
+				return err
+			}
 			time.Sleep(1 * time.Second)
 
 			key := "coolpicture.jpg"
 			data := bytes.NewReader([]byte("my big data file here!"))
-			_ = s3.Store(key, data)
-			_ = s3.Delete(key)
+			if err := s3.Store(key, data); err != nil {
+				return err
+			}
+			if err := s3.Delete(key); err != nil {
+				return err
+			}
+
 			_, r, err := s3.Get(key)
 			if err != nil {
 				return err

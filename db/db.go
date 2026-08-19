@@ -13,11 +13,22 @@ type DB struct {
 }
 
 func Open(path string) (*DB, error) {
-	dsn := path + "?_pragma=busy_timeout=5000&_pragma=journal_mode=WAL"
+	dsn := path + "?_pragma=busy_timeout=5000&_pragma=journal_mode=WAL&_pragma=foreign_keys=on"
 	d, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
+
+	// SQLite permits a single writer. Letting database/sql open a pool of
+	// connections turns concurrent writes into "database is locked" errors
+	// that busy_timeout cannot always absorb.
+	d.SetMaxOpenConns(1)
+
+	if err := d.PingContext(context.Background()); err != nil {
+		d.Close()
+		return nil, err
+	}
+
 	return &DB{sql: d, path: path}, nil
 }
 
@@ -60,6 +71,14 @@ func (d *DB) Migrate(ctx context.Context) error {
 			direction TEXT NOT NULL,
 			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);`,
+
+		// Every lookup below is a hot path: resolving a hash back to a file
+		// name on each incoming request, listing peers by recency, and
+		// finding the peers that hold a file when it is deleted.
+		`CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash);`,
+		`CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen);`,
+		`CREATE INDEX IF NOT EXISTS idx_shares_file_id ON shares(file_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_shares_file_direction ON shares(file_id, direction);`,
 	}
 	tx, err := d.sql.BeginTx(ctx, nil)
 	if err != nil {

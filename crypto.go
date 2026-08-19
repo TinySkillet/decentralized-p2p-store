@@ -7,13 +7,24 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 )
 
-func newEcryptionKey() []byte {
+// ivSize is the length of the initialisation vector prefixed to every
+// encrypted file on disk. It equals the AES block size.
+const ivSize = aes.BlockSize
+
+// newEncryptionKey returns a fresh 256 bit AES key.
+//
+// An error from the system RNG must not be ignored: silently falling back to
+// the zero value would produce an all-zero key and encrypt every file with it.
+func newEncryptionKey() ([]byte, error) {
 	keyBuf := make([]byte, 32)
-	io.ReadFull(rand.Reader, keyBuf)
-	return keyBuf
+	if _, err := io.ReadFull(rand.Reader, keyBuf); err != nil {
+		return nil, fmt.Errorf("generating encryption key: %w", err)
+	}
+	return keyBuf, nil
 }
 
 func hashKey(key string) string {
@@ -21,21 +32,27 @@ func hashKey(key string) string {
 	return hex.EncodeToString(hash[:])
 }
 
+// copyDecrypt reads an IV-prefixed ciphertext from src and writes the
+// plaintext to dest. It returns the number of plaintext bytes written.
 func copyDecrypt(key []byte, src io.Reader, dest io.Writer) (int, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return 0, err
 	}
 
+	// io.ReadFull, not Read: a short read would leave the tail of the IV
+	// zeroed and decrypt the whole file to garbage without reporting an error.
 	iv := make([]byte, block.BlockSize())
-	if _, err := src.Read(iv); err != nil {
-		return 0, err
+	if _, err := io.ReadFull(src, iv); err != nil {
+		return 0, fmt.Errorf("reading iv: %w", err)
 	}
 
 	stream := cipher.NewCTR(block, iv)
-	return copyStream(stream, block.BlockSize(), src, dest)
+	return copyStream(stream, 0, src, dest)
 }
 
+// copyEncrypt writes a random IV followed by the ciphertext of src to dest.
+// It returns the total number of bytes written, including the IV.
 func copyEncrypt(key []byte, src io.Reader, dest io.Writer) (int, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -44,7 +61,7 @@ func copyEncrypt(key []byte, src io.Reader, dest io.Writer) (int, error) {
 
 	iv := make([]byte, block.BlockSize())
 	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("generating iv: %w", err)
 	}
 
 	if _, err := dest.Write(iv); err != nil {
@@ -55,18 +72,19 @@ func copyEncrypt(key []byte, src io.Reader, dest io.Writer) (int, error) {
 	return copyStream(stream, block.BlockSize(), src, dest)
 }
 
-func copyStream(stream cipher.Stream, blockSize int, src io.Reader, dest io.Writer) (int, error) {
-	var (
-		buf = make([]byte, 32*1024)
-		nw  = blockSize
-	)
+// copyStream applies stream to src and writes the result to dest. written is
+// the number of bytes already emitted to dest by the caller (the IV, when
+// encrypting) and is included in the returned count.
+func copyStream(stream cipher.Stream, written int, src io.Reader, dest io.Writer) (int, error) {
+	buf := make([]byte, 32*1024)
+	nw := written
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
-			stream.XORKeyStream(buf, buf[:n])
+			stream.XORKeyStream(buf[:n], buf[:n])
 			c, err := dest.Write(buf[:n])
 			if err != nil {
-				return 0, err
+				return nw, err
 			}
 			nw += c
 		}
@@ -74,7 +92,7 @@ func copyStream(stream cipher.Stream, blockSize int, src io.Reader, dest io.Writ
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			return 0, err
+			return nw, err
 		}
 	}
 	return nw, nil

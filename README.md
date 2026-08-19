@@ -1,20 +1,54 @@
 # Decentralized P2P Storage
 
-Peer-to-peer file storage with automatic peer discovery, file replication, SQLite-backed metadata, and optional `systemd` service support.
+Peer-to-peer file storage with gossip-based peer discovery, file replication,
+SQLite-backed metadata, and optional `systemd` service support.
 
 ## Features
 
-- Automatic peer discovery via gossip
-- Distributed file replication across peers
+- Peer discovery via gossip between connected nodes
+- File replication to the peers a node is connected to
+- AES-256-CTR encryption of files at rest
 - SQLite-backed metadata storage
 - CLI commands for serving, storing, fetching, listing, deleting, and inspecting peers
 - Optional `systemd` service installation
 
+## Current limitations
+
+The project is a work in progress. What it does not yet do:
+
+- **Files travel between peers in plaintext.** Encryption is applied at rest
+  only, and each node holds its own key in the SQLite database beside the data
+  it protects.
+- **Peers are not authenticated.** Any node that can connect may store files
+  or broadcast a deletion.
+- **Transfers are not integrity checked.** A short transfer is detected by its
+  announced length, but contents are not verified against a digest.
+- **Replication has no target factor and no repair.** A file goes to whichever
+  peers happen to be connected when it is stored; nothing re-replicates it if
+  those peers later leave.
+- **Nodes advertise the address given to `--listen`.** A port-only value such
+  as `:3000` is not routable from another machine, so discovery across hosts
+  needs an explicit `host:port`.
+
 ## Build
 
 ```bash
-go build -o bin/p2p
+make build          # builds bin/p2p
 ```
+
+## Tests
+
+```bash
+make test           # unit and multi-node tests
+make test-race      # the same suite under the race detector
+make check          # gofmt, go vet, then the race suite
+```
+
+The suite covers the storage layer, the crypto helpers, the SQLite repository,
+the TCP transport and frame decoder, and a set of multi-node tests that bring
+several real nodes up on loopback ports to exercise store, fetch, delete and
+gossip end to end. The transport and server are concurrent throughout, so
+`make test-race` is the run that matters.
 
 ## CLI
 
@@ -59,23 +93,26 @@ Use the helper script to prepare three local nodes:
 ./setup_local_nodes.sh
 ```
 
-Start each node in a separate terminal:
+Start each node in a separate terminal. Nodes advertise whatever is passed to
+`--listen`, so use an explicit host when peers are on different machines:
 
 ```bash
-./bin/p2p serve --listen :3000 --db node_3000/p2p.db
-./bin/p2p serve --listen :4000 --db node_4000/p2p.db --bootstrap localhost:3000
-./bin/p2p serve --listen :5000 --db node_5000/p2p.db --bootstrap localhost:4000
+./bin/p2p serve --listen 127.0.0.1:3000 --db node_3000/p2p.db
+./bin/p2p serve --listen 127.0.0.1:4000 --db node_4000/p2p.db --bootstrap 127.0.0.1:3000
+./bin/p2p serve --listen 127.0.0.1:5000 --db node_5000/p2p.db --bootstrap 127.0.0.1:4000
 ```
+
+Each node shuts down cleanly on Ctrl-C.
 
 Use node `5000` for client operations:
 
 ```bash
 echo "Hello P2P World" > hello.txt
 
-./bin/p2p store hello hello.txt --listen :6000 --db node_5000/p2p.db --bootstrap localhost:4000
+./bin/p2p store hello hello.txt --listen 127.0.0.1:6000 --db node_5000/p2p.db --bootstrap 127.0.0.1:4000
 ./bin/p2p files list --db node_5000/p2p.db
-./bin/p2p get hello --listen :6000 --db node_5000/p2p.db --bootstrap localhost:4000 --out retrieved_hello.txt
-./bin/p2p delete hello --listen :6000 --db node_5000/p2p.db --bootstrap localhost:4000
+./bin/p2p get hello --listen 127.0.0.1:6000 --db node_5000/p2p.db --bootstrap 127.0.0.1:4000 --out retrieved_hello.txt
+./bin/p2p delete hello --listen 127.0.0.1:6000 --db node_5000/p2p.db --bootstrap 127.0.0.1:4000
 ./bin/p2p peers --db node_5000/p2p.db
 ```
 

@@ -8,12 +8,24 @@ import (
 	"sync"
 )
 
-func (t TCPTransport) Close() error {
+func (t *TCPTransport) Close() error {
+	if t.listener == nil {
+		return nil
+	}
 	return t.listener.Close()
 }
 
+// Address returns the address this node advertises to peers. It is the
+// configured ListenAddr, not the bound socket address, because that is the
+// value exchanged during the handshake and stored by remote peers.
 func (t *TCPTransport) Address() string {
 	return t.ListenAddr
+}
+
+// BoundAddr returns the address the listener actually bound, which differs
+// from ListenAddr when the configured port is 0.
+func (t *TCPTransport) BoundAddr() string {
+	return t.boundAddr
 }
 
 func (t *TCPTransport) Consume() <-chan RPC {
@@ -36,20 +48,24 @@ func (t *TCPTransport) ListenAndAccept() error {
 		return err
 	}
 	t.listener = ln
+	t.boundAddr = ln.Addr().String()
 
 	go t.startAcceptLoop()
 	return nil
 }
 
 func (t *TCPTransport) startAcceptLoop() {
-	log.Printf("Listening on TCP at PORT %s\n", t.ListenAddr)
+	log.Printf("Listening on TCP at %s\n", t.ListenAddr)
 	for {
 		conn, err := t.listener.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
+			// Must continue rather than fall through: on a transient error
+			// conn is nil, and touching it panics the whole node.
 			fmt.Printf("[%s] TCP accept error: %v\n", t.ListenAddr, err)
+			continue
 		}
 
 		fmt.Printf("[%s] New Incoming Connection: %+v\n", t.ListenAddr, conn.RemoteAddr().String())
@@ -60,12 +76,23 @@ func (t *TCPTransport) startAcceptLoop() {
 func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 	var err error
 
-	defer func() {
-		fmt.Printf("[%s] Dropping peer connection: %v\n", t.ListenAddr, err)
-		conn.Close()
-	}()
-
 	peer := NewTCPPeer(conn, outbound)
+	registered := false
+
+	defer func() {
+		if err != nil {
+			fmt.Printf("[%s] Dropping peer connection: %v\n", t.ListenAddr, err)
+		} else {
+			fmt.Printf("[%s] Closing peer connection to %s\n", t.ListenAddr, peer.RemoteAddr())
+		}
+		conn.Close()
+
+		// Tell the owner the peer is gone. Without this the server keeps
+		// broadcasting to a dead connection forever.
+		if registered && t.OnPeerDisconnect != nil {
+			t.OnPeerDisconnect(peer)
+		}
+	}()
 
 	if err = t.HandshakeFunc(peer); err != nil {
 		return
@@ -76,6 +103,7 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 			return
 		}
 	}
+	registered = true
 
 	for {
 		rpc := RPC{}
@@ -109,6 +137,11 @@ type TCPPeer struct {
 
 	wg *sync.WaitGroup
 
+	// writeLock serialises writes to the connection. Several goroutines send
+	// to the same peer (broadcasts, stream replies, peer exchange), and
+	// without this their bytes interleave and corrupt the frame stream.
+	writeLock sync.Mutex
+
 	// FullAddr is the verified listening address of the peer
 	FullAddr string
 }
@@ -124,8 +157,18 @@ func (p *TCPPeer) RemoteAddr() net.Addr {
 }
 
 func (p *TCPPeer) Send(b []byte) error {
+	p.writeLock.Lock()
+	defer p.writeLock.Unlock()
 	_, err := p.Conn.Write(b)
 	return err
+}
+
+// Write satisfies net.Conn and takes the same lock as Send, so callers
+// streaming a file body cannot interleave with a concurrent Send.
+func (p *TCPPeer) Write(b []byte) (int, error) {
+	p.writeLock.Lock()
+	defer p.writeLock.Unlock()
+	return p.Conn.Write(b)
 }
 
 func (p *TCPPeer) CloseStream() {
@@ -145,12 +188,17 @@ type TCPTransportOpts struct {
 	HandshakeFunc HandshakeFunc
 	Decoder       Decoder
 	OnPeer        func(Peer) error
+
+	// OnPeerDisconnect is called once for every peer that completed OnPeer,
+	// when its connection ends.
+	OnPeerDisconnect func(Peer)
 }
 
 type TCPTransport struct {
 	TCPTransportOpts
-	listener net.Listener
-	rpcChan  chan RPC
+	listener  net.Listener
+	boundAddr string
+	rpcChan   chan RPC
 }
 
 func NewTCPTransport(opts TCPTransportOpts) *TCPTransport {

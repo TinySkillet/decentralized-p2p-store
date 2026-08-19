@@ -2,6 +2,10 @@ package db
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log"
 	"strings"
 	"time"
 )
@@ -38,17 +42,81 @@ type Share struct {
 	CreatedAt time.Time
 }
 
+// timeLayout is the canonical on-disk format for timestamps this package
+// writes. Values are normalised to UTC so string ordering matches time
+// ordering, which is what the SQL comparisons in this file rely on.
+const timeLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+// formatTime renders t for storage.
+//
+// Passing a time.Time straight to the driver previously stored Go's
+// time.Time.String() output, complete with a monotonic clock suffix, which
+// then had to be unpicked by hand on the way back out.
+func formatTime(t time.Time) string {
+	return t.UTC().Format(timeLayout)
+}
+
+// parseTime reads a stored timestamp. It accepts the canonical format, the
+// format SQLite's CURRENT_TIMESTAMP produces, and the legacy time.Time.String()
+// output written by earlier versions, so an existing database still loads.
+func parseTime(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, errors.New("empty timestamp")
+	}
+
+	// Legacy rows carry a monotonic clock reading that no layout can parse.
+	if idx := strings.Index(s, " m="); idx != -1 {
+		s = strings.TrimSpace(s[:idx])
+	}
+	// Legacy rows also repeat the zone twice ("+0545 +0545"); keep the first.
+	if fields := strings.Fields(s); len(fields) > 3 {
+		s = strings.Join(fields[:3], " ")
+	}
+
+	layouts := []string{
+		timeLayout,
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999 -0700 MST",
+		"2006-01-02 15:04:05.999999999 -0700",
+		"2006-01-02 15:04:05 -0700",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unrecognised timestamp %q", s)
+}
+
 func (d *DB) UpsertPeer(ctx context.Context, p Peer) error {
+	var lastSeen any
+	if p.LastSeen != nil {
+		lastSeen = formatTime(*p.LastSeen)
+	}
+
+	// Conflicts can arrive on either unique column, so both are handled.
 	_, err := d.sql.ExecContext(ctx, `
 		INSERT INTO peers(id,address,status,last_seen)
 		VALUES(?,?,?,?)
 		ON CONFLICT(address) DO UPDATE SET
 			status=excluded.status,
 			last_seen=excluded.last_seen
-	`, p.ID, p.Address, p.Status, p.LastSeen)
+		ON CONFLICT(id) DO UPDATE SET
+			address=excluded.address,
+			status=excluded.status,
+			last_seen=excluded.last_seen
+	`, p.ID, p.Address, p.Status, lastSeen)
 	return err
 }
 
+// InsertFileWithKey records a file and the key it was encrypted under.
+//
+// Storing the same key twice is a normal operation (overwriting a file), so
+// this upserts rather than failing on the primary key.
 func (d *DB) InsertFileWithKey(ctx context.Context, f File, keyID string) error {
 	tx, err := d.sql.BeginTx(ctx, nil)
 	if err != nil {
@@ -59,6 +127,12 @@ func (d *DB) InsertFileWithKey(ctx context.Context, f File, keyID string) error 
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO files(id,name,hash,size,local_path)
 		VALUES(?,?,?,?,?)
+		ON CONFLICT(id) DO UPDATE SET
+			name=excluded.name,
+			hash=excluded.hash,
+			size=excluded.size,
+			local_path=excluded.local_path,
+			created_at=CURRENT_TIMESTAMP
 	`, f.ID, f.Name, f.Hash, f.Size, f.LocalPath); err != nil {
 		return err
 	}
@@ -92,13 +166,33 @@ func (d *DB) ListFiles(ctx context.Context) ([]File, error) {
 	return out, rows.Err()
 }
 
-// Returns recently active peers for discovery
+// FindFileByHash returns the file with the given hash, or nil if there is
+// none. It replaces scanning the entire file list on every incoming request.
+func (d *DB) FindFileByHash(ctx context.Context, hash string) (*File, error) {
+	row := d.sql.QueryRowContext(ctx, `
+		SELECT id,name,hash,size,local_path,created_at FROM files WHERE hash=? LIMIT 1
+	`, hash)
+
+	var f File
+	if err := row.Scan(&f.ID, &f.Name, &f.Hash, &f.Size, &f.LocalPath, &f.CreatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &f, nil
+}
+
+// GetActivePeers returns recently active peers for discovery.
+//
+// A row with an unreadable timestamp is skipped rather than failing the whole
+// query: one malformed record should not blind the node to every other peer.
 func (d *DB) GetActivePeers(ctx context.Context, maxAge time.Duration, limit int) ([]Peer, error) {
-	cutoff := time.Now().Add(-maxAge)
+	cutoff := formatTime(time.Now().Add(-maxAge))
 	rows, err := d.sql.QueryContext(ctx, `
-		SELECT id, address, status, last_seen 
-		FROM peers 
-		WHERE last_seen > ?
+		SELECT id, address, status, last_seen
+		FROM peers
+		WHERE last_seen IS NOT NULL AND last_seen > ?
 		ORDER BY last_seen DESC
 		LIMIT ?
 	`, cutoff, limit)
@@ -110,39 +204,19 @@ func (d *DB) GetActivePeers(ctx context.Context, maxAge time.Duration, limit int
 	var out []Peer
 	for rows.Next() {
 		var p Peer
-		var lastSeenStr string
+		var lastSeen sql.NullString
 
-		if err := rows.Scan(&p.ID, &p.Address, &p.Status, &lastSeenStr); err != nil {
+		if err := rows.Scan(&p.ID, &p.Address, &p.Status, &lastSeen); err != nil {
 			return nil, err
 		}
 
-		// Parse the timestamp string to time.Time
-		if lastSeenStr != "" {
-			// SQLite stores time.Time as its String() representation, which includes monotonic clock
-			// Format: "2025-12-07 21:16:45.473359503 +0545 +0545 m=+0.014968535"
-			// We need to strip the monotonic clock part (everything from " m=" onwards)
-
-			// Find and remove the monotonic clock component
-			if idx := strings.Index(lastSeenStr, " m="); idx != -1 {
-				lastSeenStr = lastSeenStr[:idx]
-			}
-
-			parts := strings.Fields(lastSeenStr)
-			if len(parts) >= 3 {
-				// parts = ["2025-12-07", "21:16:45.473359503", "+0545", "+0545"]
-				// Keep only first 3 parts (date, time, first timezone)
-				lastSeenStr = strings.Join(parts[:3], " ")
-			}
-
-			parsedTime, err := time.Parse("2006-01-02 15:04:05.999999999 -0700", lastSeenStr)
+		if lastSeen.Valid {
+			parsed, err := parseTime(lastSeen.String)
 			if err != nil {
-				// Try without nanoseconds
-				parsedTime, err = time.Parse("2006-01-02 15:04:05 -0700", lastSeenStr)
-				if err != nil {
-					return nil, err
-				}
+				log.Printf("skipping peer %s: %v", p.Address, err)
+				continue
 			}
-			p.LastSeen = &parsedTime
+			p.LastSeen = &parsed
 		}
 
 		out = append(out, p)
@@ -150,11 +224,11 @@ func (d *DB) GetActivePeers(ctx context.Context, maxAge time.Duration, limit int
 	return out, rows.Err()
 }
 
-// Removes stale peer records
+// CleanupStalePeers removes peer records not seen within maxAge.
 func (d *DB) CleanupStalePeers(ctx context.Context, maxAge time.Duration) (int, error) {
-	cutoff := time.Now().Add(-maxAge)
+	cutoff := formatTime(time.Now().Add(-maxAge))
 	result, err := d.sql.ExecContext(ctx, `
-		DELETE FROM peers WHERE last_seen < ?
+		DELETE FROM peers WHERE last_seen IS NULL OR last_seen < ?
 	`, cutoff)
 	if err != nil {
 		return 0, err
@@ -191,20 +265,36 @@ func (d *DB) PutKey(ctx context.Context, k Key) error {
 	return err
 }
 
-func (d *DB) GetOrCreateDefaultKey(ctx context.Context, gen func() []byte) ([]byte, error) {
+// GetOrCreateDefaultKey returns the node's encryption key, generating one on
+// first use.
+//
+// Only a genuine "no such row" may trigger generation. Treating any error as
+// absent (as an earlier version did) would mint a fresh key after a transient
+// database fault and leave every previously stored file undecryptable.
+func (d *DB) GetOrCreateDefaultKey(ctx context.Context, gen func() ([]byte, error)) ([]byte, error) {
 	const id = "default"
+
 	k, err := d.GetKey(ctx, id)
-	if err == nil {
+	switch {
+	case err == nil:
 		return k.KeyBytes, nil
+	case errors.Is(err, sql.ErrNoRows):
+		// fall through and create one
+	default:
+		return nil, fmt.Errorf("loading encryption key: %w", err)
 	}
-	keyBytes := gen()
+
+	keyBytes, err := gen()
+	if err != nil {
+		return nil, err
+	}
 	if err := d.PutKey(ctx, Key{
 		ID:       id,
 		Label:    "default",
 		Algo:     "AES-CTR-256",
 		KeyBytes: keyBytes,
 	}); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("storing encryption key: %w", err)
 	}
 	return keyBytes, nil
 }
@@ -253,7 +343,7 @@ func (d *DB) ListShares(ctx context.Context) ([]ShareInfo, error) {
 // GetOutgoingSharePeers returns peer addresses that have received the file (outgoing shares).
 func (d *DB) GetOutgoingSharePeers(ctx context.Context, fileID string) ([]string, error) {
 	rows, err := d.sql.QueryContext(ctx, `
-		SELECT peer_id FROM shares WHERE file_id = ? AND direction = 'outgoing'
+		SELECT DISTINCT peer_id FROM shares WHERE file_id = ? AND direction = 'outgoing'
 	`, fileID)
 	if err != nil {
 		return nil, err

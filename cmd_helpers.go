@@ -18,56 +18,49 @@ func getStorageRoot(listenAddr string) string {
 	return "node_" + port + "_data"
 }
 
-func makeServer(listenAddr string, nodes ...string) *FileServer {
-	tcpTransportOpts := p2p.TCPTransportOpts{
-		ListenAddr:    listenAddr,
-		HandshakeFunc: GetHandshakeFunc(listenAddr),
-		Decoder:       p2p.DefaultDecoder{},
-	}
-	tcpTransport := p2p.NewTCPTransport(tcpTransportOpts)
-
-	fileServerOpts := FileServerOpts{
-		EncryptionKey:     newEcryptionKey(),
-		PathTransformFunc: CASPathTransformFunc,
-		StorageRoot:       getStorageRoot(listenAddr),
-		Transport:         tcpTransport,
-		BootstrapNodes:    nodes,
-	}
-	s := NewFileServer(fileServerOpts)
-	tcpTransport.OnPeer = s.OnPeer
-
-	return s
+func makeServer(listenAddr string, nodes ...string) (*FileServer, error) {
+	return newServer(listenAddr, nil, getStorageRoot(listenAddr), nodes...)
 }
 
-func makeServerWithDB(listenAddr string, db *dbpkg.DB, nodes ...string) *FileServer {
-	tcpTransportOpts := p2p.TCPTransportOpts{
+func makeServerWithDB(listenAddr string, db *dbpkg.DB, nodes ...string) (*FileServer, error) {
+	storageRoot := getStorageRoot(listenAddr)
+	if db != nil {
+		// Keep a node's files beside the database that indexes them, so the
+		// two cannot be separated by moving one of them.
+		storageRoot = filepath.Join(filepath.Dir(db.Path()), "files")
+	}
+	return newServer(listenAddr, db, storageRoot, nodes...)
+}
+
+func newServer(listenAddr string, db *dbpkg.DB, storageRoot string, nodes ...string) (*FileServer, error) {
+	// A per-process key is only a placeholder; commands with a database
+	// replace it with the node's persisted key.
+	key, err := newEncryptionKey()
+	if err != nil {
+		return nil, err
+	}
+
+	tcpTransport := p2p.NewTCPTransport(p2p.TCPTransportOpts{
 		ListenAddr:    listenAddr,
 		HandshakeFunc: GetHandshakeFunc(listenAddr),
 		Decoder:       p2p.DefaultDecoder{},
-	}
-	tcpTransport := p2p.NewTCPTransport(tcpTransportOpts)
+	})
 
-	var storageRoot string
-	if db != nil {
-		dbDir := filepath.Dir(db.Path())
-		storageRoot = filepath.Join(dbDir, "files")
-	} else {
-		storageRoot = getStorageRoot(listenAddr)
-	}
-
-	fileServerOpts := FileServerOpts{
-		EncryptionKey:     newEcryptionKey(),
+	s := NewFileServer(FileServerOpts{
+		EncryptionKey:     key,
 		PathTransformFunc: CASPathTransformFunc,
 		StorageRoot:       storageRoot,
 		Transport:         tcpTransport,
 		BootstrapNodes:    nodes,
 		DB:                db,
-	}
-	s := NewFileServer(fileServerOpts)
+	})
+
 	tcpTransport.OnPeer = s.OnPeer
-	return s
+	tcpTransport.OnPeerDisconnect = s.OnPeerDisconnect
+
+	return s, nil
 }
 
 func loadOrInitKey(d *dbpkg.DB) ([]byte, error) {
-	return d.GetOrCreateDefaultKey(context.Background(), newEcryptionKey)
+	return d.GetOrCreateDefaultKey(context.Background(), newEncryptionKey)
 }
