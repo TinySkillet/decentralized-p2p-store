@@ -3,8 +3,8 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -74,59 +74,60 @@ func TestIsDigest(t *testing.T) {
 	}
 }
 
-func TestStoreWriteReadRoundTrip(t *testing.T) {
-	s := newTestStore(t)
-	payload := []byte("some jpg bytes")
-
-	n, err := s.Write("picture", bytes.NewReader(payload))
+// openFDCount reports how many file descriptors this process holds.
+func openFDCount(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
-		t.Fatalf("Write: %v", err)
+		t.Skipf("cannot count open descriptors on this platform: %v", err)
 	}
-	if n != int64(len(payload)) {
-		t.Errorf("Write returned %d, want %d", n, len(payload))
-	}
-
-	size, r, err := s.Read("picture")
-	if err != nil {
-		t.Fatalf("Read: %v", err)
-	}
-	defer r.Close()
-
-	if size != int64(len(payload)) {
-		t.Errorf("Read size = %d, want %d", size, len(payload))
-	}
-	got, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatalf("ReadAll: %v", err)
-	}
-	if !bytes.Equal(got, payload) {
-		t.Errorf("read %q, want %q", got, payload)
-	}
+	return len(entries)
 }
 
-func TestStoreWriteEncryptReadDecrypt(t *testing.T) {
+// errReader fails after the readers before it are drained.
+type errReader struct{ err error }
+
+func (r *errReader) Read([]byte) (int, error) { return 0, r.err }
+
+// mustWrite stores payload and returns the digest it landed under.
+func mustWrite(t *testing.T, s *Store, key []byte, payload []byte) string {
+	t.Helper()
+	digest, size, err := s.WriteContent(key, bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("WriteContent: %v", err)
+	}
+	if size != int64(len(payload)) {
+		t.Fatalf("WriteContent reported %d bytes, want %d", size, len(payload))
+	}
+	return digest
+}
+
+func TestWriteContentIsAddressedByItsContents(t *testing.T) {
 	s := newTestStore(t)
 	key := mustKey(t)
-	payload := bytes.Repeat([]byte("secret payload "), 5000)
+	payload := bytes.Repeat([]byte("addressed by content "), 500)
 
-	n, err := s.WriteEncrypt(key, "doc", bytes.NewReader(payload))
+	digest := mustWrite(t, s, key, payload)
+	if digest != contentKey(payload) {
+		t.Errorf("digest = %q, want the SHA-256 of the contents", digest)
+	}
+	if !s.Has(digest) {
+		t.Error("the contents are not readable under their digest")
+	}
+
+	// The file on disk must be ciphertext, and its size the plaintext plus one IV.
+	onDisk, err := os.ReadFile(s.FullPathForKey(digest))
 	if err != nil {
-		t.Fatalf("WriteEncrypt: %v", err)
+		t.Fatalf("reading the stored file: %v", err)
 	}
-	if want := int64(len(payload) + ivSize); n != want {
-		t.Errorf("WriteEncrypt returned %d, want %d", n, want)
+	if bytes.Contains(onDisk, []byte("addressed by content")) {
+		t.Error("plaintext found on disk")
 	}
-
-	// What sits on disk must not be the plaintext.
-	onDisk, err := os.ReadFile(s.FullPathForKey("doc"))
-	if err != nil {
-		t.Fatalf("reading stored file: %v", err)
-	}
-	if bytes.Contains(onDisk, []byte("secret payload")) {
-		t.Error("plaintext found in the file on disk")
+	if want := len(payload) + ivSize; len(onDisk) != want {
+		t.Errorf("stored %d bytes, want %d", len(onDisk), want)
 	}
 
-	size, r, err := s.ReadDecrypt(key, "doc")
+	size, r, err := s.ReadDecrypt(key, digest)
 	if err != nil {
 		t.Fatalf("ReadDecrypt: %v", err)
 	}
@@ -138,25 +139,40 @@ func TestStoreWriteEncryptReadDecrypt(t *testing.T) {
 		t.Fatalf("ReadAll: %v", err)
 	}
 	if !bytes.Equal(got, payload) {
-		t.Error("decrypted contents differ from the original")
+		t.Error("the round trip did not preserve the contents")
+	}
+}
+
+func TestWriteContentStoresIdenticalBytesOnce(t *testing.T) {
+	s := newTestStore(t)
+	key := mustKey(t)
+	payload := []byte("stored twice, kept once")
+
+	first := mustWrite(t, s, key, payload)
+	second := mustWrite(t, s, key, payload)
+
+	if first != second {
+		t.Errorf("identical contents gave different digests: %s and %s", short(first), short(second))
+	}
+	if n := countStoredFiles(t, s.Root); n != 1 {
+		t.Errorf("%d files on disk, want 1", n)
 	}
 }
 
 func TestStoreHas(t *testing.T) {
 	s := newTestStore(t)
 
-	if s.Has("absent") {
-		t.Error("Has reported a key that was never written")
+	if s.Has(contentKey([]byte("never stored"))) {
+		t.Error("Has reported contents that were never written")
 	}
-	if _, err := s.Write("present", bytes.NewReader([]byte("x"))); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	if !s.Has("present") {
-		t.Error("Has did not report a key that was written")
+	if digest := mustWrite(t, s, mustKey(t), []byte("x")); !s.Has(digest) {
+		t.Error("Has did not report contents that were written")
 	}
 }
 
-func TestStoreHasReportsUnreadableKeyAsAbsent(t *testing.T) {
+// TestStoreHasReportsUnreadableContentAsAbsent is a regression test: reporting
+// something we cannot stat as present makes callers attempt reads that must fail.
+func TestStoreHasReportsUnreadableContentAsAbsent(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("permission semantics differ on windows")
 	}
@@ -165,279 +181,194 @@ func TestStoreHasReportsUnreadableKeyAsAbsent(t *testing.T) {
 	}
 
 	s := newTestStore(t)
-	if _, err := s.Write("blocked", bytes.NewReader([]byte("x"))); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
+	digest := mustWrite(t, s, mustKey(t), []byte("blocked"))
 
-	// Make the containing directory unsearchable, so stat fails with a
-	// permission error rather than "not found". Has must still say absent.
-	dir := filepath.Dir(s.FullPathForKey("blocked"))
+	dir := filepath.Dir(s.FullPathForKey(digest))
 	if err := os.Chmod(dir, 0o000); err != nil {
 		t.Fatalf("Chmod: %v", err)
 	}
 	t.Cleanup(func() { os.Chmod(dir, dirPerm) })
 
-	if s.Has("blocked") {
-		t.Error("Has reported a key it cannot stat as present")
+	if s.Has(digest) {
+		t.Error("Has reported contents it cannot stat as present")
 	}
 }
 
-// TestStoreDeleteLeavesUnrelatedKeys is a regression test. Delete used to
-// remove the entire top-level prefix directory, which destroyed every other
-// file whose hash began with the same characters.
-func TestStoreDeleteLeavesUnrelatedKeys(t *testing.T) {
-	// A transform that deliberately places both keys under a shared prefix
-	// directory, which is exactly what a hash prefix collision looks like.
+// TestDeleteLeavesUnrelatedContents is a regression test. Delete used to
+// remove the whole top-level prefix directory, destroying every other file
+// whose path began with the same characters.
+func TestDeleteLeavesUnrelatedContents(t *testing.T) {
+	// A transform that files everything under one shared prefix, which is what
+	// a hash prefix collision looks like.
 	sharedPrefix := func(key string) PathKey {
-		return PathKey{
-			Pathname: filepath.Join("abcde", "fghij"),
-			Filename: key,
-		}
+		return PathKey{Pathname: filepath.Join("abcde", "fghij"), Filename: key}
 	}
 	s := NewStore(StoreOpts{Root: t.TempDir(), PathTransformFunc: sharedPrefix})
+	key := mustKey(t)
 
-	if _, err := s.Write("victim", bytes.NewReader([]byte("delete me"))); err != nil {
-		t.Fatalf("Write victim: %v", err)
-	}
-	if _, err := s.Write("bystander", bytes.NewReader([]byte("keep me"))); err != nil {
-		t.Fatalf("Write bystander: %v", err)
-	}
+	victim := mustWrite(t, s, key, []byte("delete me"))
+	bystander := mustWrite(t, s, key, []byte("keep me"))
 
-	if err := s.Delete("victim"); err != nil {
+	if err := s.Delete(victim); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 
-	if s.Has("victim") {
-		t.Error("victim survived deletion")
+	if s.Has(victim) {
+		t.Error("the deleted contents survived")
 	}
-	if !s.Has("bystander") {
-		t.Fatal("deleting one key also destroyed an unrelated key sharing its prefix")
-	}
-
-	got, err := os.ReadFile(s.FullPathForKey("bystander"))
-	if err != nil {
-		t.Fatalf("reading bystander: %v", err)
-	}
-	if string(got) != "keep me" {
-		t.Errorf("bystander contents = %q, want %q", got, "keep me")
+	if !s.Has(bystander) {
+		t.Fatal("deleting one file destroyed an unrelated file sharing its prefix")
 	}
 }
 
-func TestStoreDeleteIsIdempotent(t *testing.T) {
+func TestDeleteIsIdempotent(t *testing.T) {
 	s := newTestStore(t)
 
 	// Deletions are broadcast to peers that may never have held the file, so
-	// deleting an absent key must succeed rather than fail the whole request.
-	if err := s.Delete("never-stored"); err != nil {
-		t.Errorf("deleting an absent key returned %v, want nil", err)
+	// deleting something absent must succeed rather than fail the request.
+	if err := s.Delete(contentKey([]byte("never stored"))); err != nil {
+		t.Errorf("deleting absent contents returned %v, want nil", err)
 	}
 
-	if _, err := s.Write("once", bytes.NewReader([]byte("x"))); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	if err := s.Delete("once"); err != nil {
-		t.Fatalf("first Delete: %v", err)
-	}
-	if err := s.Delete("once"); err != nil {
-		t.Errorf("second Delete returned %v, want nil", err)
+	digest := mustWrite(t, s, mustKey(t), []byte("x"))
+	for i := range 2 {
+		if err := s.Delete(digest); err != nil {
+			t.Errorf("Delete call %d returned %v, want nil", i+1, err)
+		}
 	}
 }
 
-func TestStoreDeletePrunesEmptyDirectories(t *testing.T) {
+func TestDeletePrunesEmptyDirectories(t *testing.T) {
 	s := newTestStore(t)
-	root := s.Root
 
-	if _, err := s.Write("lonely", bytes.NewReader([]byte("x"))); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	if err := s.Delete("lonely"); err != nil {
+	digest := mustWrite(t, s, mustKey(t), []byte("lonely"))
+	if err := s.Delete(digest); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 
-	entries, err := os.ReadDir(root)
+	entries, err := os.ReadDir(s.Root)
 	if err != nil {
 		t.Fatalf("ReadDir: %v", err)
 	}
 	if len(entries) != 0 {
-		t.Errorf("store root still holds %d entries after deleting the only file", len(entries))
+		t.Errorf("the root still holds %d entries after deleting the only file", len(entries))
 	}
-
 	// Pruning must stop at the root and never remove it.
-	if _, err := os.Stat(root); err != nil {
-		t.Errorf("store root was removed: %v", err)
+	if _, err := os.Stat(s.Root); err != nil {
+		t.Errorf("the store root was removed: %v", err)
 	}
 }
 
-func TestStoreClear(t *testing.T) {
+func TestReadMissingContents(t *testing.T) {
 	s := newTestStore(t)
-	if _, err := s.Write("a", bytes.NewReader([]byte("x"))); err != nil {
-		t.Fatalf("Write: %v", err)
+	absent := contentKey([]byte("nope"))
+
+	if _, _, err := s.Read(absent); err == nil {
+		t.Error("expected an error reading missing contents, got nil")
 	}
-	if err := s.Clear(); err != nil {
-		t.Fatalf("Clear: %v", err)
-	}
-	if s.Has("a") {
-		t.Error("key survived Clear")
+	if _, _, err := s.ReadDecrypt(mustKey(t), absent); err == nil {
+		t.Error("expected an error decrypting missing contents, got nil")
 	}
 }
 
-func TestStoreReadMissingKey(t *testing.T) {
-	s := newTestStore(t)
-	if _, _, err := s.Read("nope"); err == nil {
-		t.Error("expected an error reading a missing key, got nil")
-	}
-	if _, _, err := s.ReadDecrypt(mustKey(t), "nope"); err == nil {
-		t.Error("expected an error decrypting a missing key, got nil")
-	}
-}
-
-// openFDCount reports how many file descriptors this process holds.
-func openFDCount(t *testing.T) int {
-	t.Helper()
-	entries, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		t.Skipf("cannot count open descriptors on this platform: %v", err)
-	}
-	return len(entries)
-}
-
-// TestStoreWritesDoNotLeakDescriptors is a regression test: WriteEncrypt used
-// to return without closing the file, exhausting the process descriptor limit
-// after enough stores and eventually breaking accept() too.
-func TestStoreWritesDoNotLeakDescriptors(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("descriptor counting relies on /proc")
-	}
+// TestWriteIsAtomicForReaders checks the rename: a reader that has opened the
+// contents must not see them replaced underneath it.
+func TestWriteIsAtomicForReaders(t *testing.T) {
 	s := newTestStore(t)
 	key := mustKey(t)
+	payload := bytes.Repeat([]byte("in flight"), 4096)
 
-	// Warm up first, so one-off allocations are not counted as leaks.
-	if _, err := s.WriteEncrypt(key, "warmup", bytes.NewReader([]byte("x"))); err != nil {
-		t.Fatalf("WriteEncrypt: %v", err)
-	}
+	digest := mustWrite(t, s, key, payload)
 
-	before := openFDCount(t)
-	for i := range 50 {
-		if _, err := s.WriteEncrypt(key, string(rune('a'+i%26))+"-enc", bytes.NewReader([]byte("payload"))); err != nil {
-			t.Fatalf("WriteEncrypt: %v", err)
-		}
-		if _, err := s.Write(string(rune('a'+i%26))+"-plain", bytes.NewReader([]byte("payload"))); err != nil {
-			t.Fatalf("Write: %v", err)
-		}
-	}
-	after := openFDCount(t)
-
-	if after-before > 5 {
-		t.Errorf("open descriptors grew from %d to %d across 100 writes", before, after)
-	}
-}
-
-// TestStoreWriteIsAtomicForReaders is a regression test. Writes went straight
-// to the destination file, so a reader that had already opened a key saw it
-// truncated underneath them when a second copy of the same file arrived.
-func TestStoreWriteIsAtomicForReaders(t *testing.T) {
-	s := newTestStore(t)
-	key := mustKey(t)
-
-	original := bytes.Repeat([]byte("original"), 4096)
-	if _, err := s.WriteEncrypt(key, "doc", bytes.NewReader(original)); err != nil {
-		t.Fatalf("WriteEncrypt: %v", err)
-	}
-
-	// Open the file, then overwrite the key while the reader is still open.
-	_, reader, err := s.ReadDecrypt(key, "doc")
+	_, reader, err := s.ReadDecrypt(key, digest)
 	if err != nil {
 		t.Fatalf("ReadDecrypt: %v", err)
 	}
 
-	replacement := bytes.Repeat([]byte("replaced"), 4096)
-	if _, err := s.WriteEncrypt(key, "doc", bytes.NewReader(replacement)); err != nil {
-		t.Fatalf("second WriteEncrypt: %v", err)
+	// The same contents written again while the reader holds the old file.
+	if _, _, err := s.WriteContent(key, bytes.NewReader(payload)); err != nil {
+		t.Fatalf("second WriteContent: %v", err)
 	}
 
 	got, err := io.ReadAll(reader)
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}
-	if !bytes.Equal(got, original) {
-		t.Errorf("the in-progress read returned %d bytes that are not the original contents", len(got))
-	}
-
-	// The new contents must nonetheless be what a fresh read sees.
-	_, reader2, err := s.ReadDecrypt(key, "doc")
-	if err != nil {
-		t.Fatalf("ReadDecrypt after overwrite: %v", err)
-	}
-	got2, err := io.ReadAll(reader2)
-	if err != nil {
-		t.Fatalf("ReadAll: %v", err)
-	}
-	if !bytes.Equal(got2, replacement) {
-		t.Error("a fresh read did not see the replacement contents")
+	if !bytes.Equal(got, payload) {
+		t.Error("a write during a read disturbed the reader")
 	}
 }
 
-// TestStoreFailedWriteLeavesPreviousContents pins that an error partway
-// through a write does not destroy the copy already stored.
-func TestStoreFailedWriteLeavesPreviousContents(t *testing.T) {
+// TestFailedWriteLeavesNothingBehind pins that an interrupted transfer neither
+// becomes readable nor leaves a partial file for the sweep to trip over.
+func TestFailedWriteLeavesNothingBehind(t *testing.T) {
 	s := newTestStore(t)
 	key := mustKey(t)
 
-	original := []byte("the good copy")
-	if _, err := s.WriteEncrypt(key, "doc", bytes.NewReader(original)); err != nil {
-		t.Fatalf("WriteEncrypt: %v", err)
-	}
+	existing := mustWrite(t, s, key, []byte("already here"))
 
 	failing := io.MultiReader(
 		bytes.NewReader(bytes.Repeat([]byte("partial"), 1000)),
 		&errReader{err: errors.New("connection reset")},
 	)
-	if _, err := s.WriteEncrypt(key, "doc", failing); err == nil {
+	if _, _, err := s.WriteContent(key, failing); err == nil {
 		t.Fatal("a failed write reported success")
 	}
 
-	_, r, err := s.ReadDecrypt(key, "doc")
-	if err != nil {
-		t.Fatalf("ReadDecrypt: %v", err)
+	if n := countStoredFiles(t, s.Root); n != 1 {
+		t.Errorf("%d files on disk, want only the one already stored", n)
 	}
-	got, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatalf("ReadAll: %v", err)
-	}
-	if !bytes.Equal(got, original) {
-		t.Errorf("got %q after a failed write, want the previous contents %q", got, original)
+	if !s.Has(existing) {
+		t.Error("a failed write destroyed unrelated contents")
 	}
 }
 
-// TestStoreFailedWriteLeavesNoResidue checks the temporary file is cleaned up.
-func TestStoreFailedWriteLeavesNoResidue(t *testing.T) {
+// TestWriteContentExpectingRejectsMismatch covers the guarantee the fetch
+// protocol relies on: contents that do not hash to what was asked for never
+// become readable.
+func TestWriteContentExpectingRejectsMismatch(t *testing.T) {
 	s := newTestStore(t)
+	key := mustKey(t)
 
-	failing := io.MultiReader(
-		bytes.NewReader([]byte("partial")),
-		&errReader{err: errors.New("connection reset")},
-	)
-	if _, err := s.WriteEncrypt(mustKey(t), "doc", failing); err == nil {
-		t.Fatal("a failed write reported success")
+	actual := []byte("the real bytes")
+	wrong := contentKey([]byte("something else entirely"))
+
+	if _, err := s.WriteContentExpecting(key, wrong, bytes.NewReader(actual)); err == nil {
+		t.Fatal("contents that did not match the announced digest were accepted")
+	}
+	if s.Has(contentKey(actual)) {
+		t.Error("the rejected contents were stored anyway")
+	}
+	if n := countStoredFiles(t, s.Root); n != 0 {
+		t.Errorf("%d files left after a rejected write, want 0", n)
 	}
 
-	if s.Has("doc") {
-		t.Error("a failed write left the key readable")
+	if _, err := s.WriteContentExpecting(key, contentKey(actual), bytes.NewReader(actual)); err != nil {
+		t.Fatalf("WriteContentExpecting: %v", err)
 	}
-
-	var files int
-	filepath.WalkDir(s.Root, func(_ string, d fs.DirEntry, err error) error {
-		if err == nil && !d.IsDir() {
-			files++
-		}
-		return nil
-	})
-	if files != 0 {
-		t.Errorf("a failed write left %d file(s) behind", files)
+	if !s.Has(contentKey(actual)) {
+		t.Error("matching contents were not stored")
 	}
 }
 
-// errReader fails after the readers before it are drained.
-type errReader struct{ err error }
+// TestWritesDoNotLeakDescriptors is a regression test: the write path used to
+// return without closing its file, exhausting the process descriptor limit.
+func TestWritesDoNotLeakDescriptors(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("descriptor counting relies on /proc")
+	}
+	s := newTestStore(t)
+	key := mustKey(t)
 
-func (r *errReader) Read([]byte) (int, error) { return 0, r.err }
+	mustWrite(t, s, key, []byte("warmup"))
+
+	before := openFDCount(t)
+	for i := range 100 {
+		if _, _, err := s.WriteContent(key, bytes.NewReader([]byte(fmt.Sprintf("payload %d", i)))); err != nil {
+			t.Fatalf("WriteContent: %v", err)
+		}
+	}
+	if after := openFDCount(t); after-before > 5 {
+		t.Errorf("open descriptors grew from %d to %d across 100 writes", before, after)
+	}
+}

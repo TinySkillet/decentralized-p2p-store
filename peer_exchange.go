@@ -15,6 +15,9 @@ func (s *FileServer) handleMessagePeerExchange(from string, msg MessagePeerExcha
 	return nil
 }
 
+// maxGossipedPeers bounds how many peers a single exchange carries.
+const maxGossipedPeers = 50
+
 func (s *FileServer) discoverPeers(peers []PeerInfo) {
 	myAddr := s.Transport.Address()
 	const maxAttempts = 10
@@ -72,7 +75,7 @@ func (s *FileServer) sendPeerExchange(peerAddr string) error {
 		return nil
 	}
 
-	activePeers, err := s.DB.GetActivePeers(context.Background(), 30*time.Minute, 50)
+	activePeers, err := s.DB.GetActivePeers(context.Background(), peerRecency, maxGossipedPeers)
 	if err != nil {
 		fmt.Printf("[%s] Error getting active peers: %v\n", s.Transport.Address(), err)
 		return err

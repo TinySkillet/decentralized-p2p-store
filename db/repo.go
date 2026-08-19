@@ -320,16 +320,6 @@ func (d *DB) ReferencedHashes(ctx context.Context) (map[string]struct{}, error) 
 	return out, rows.Err()
 }
 
-// CountNamesForHash reports how many names refer to the given contents.
-//
-// Deduplication means one blob on disk can back several names, so the bytes
-// may only be removed once the last name referring to them has gone.
-func (d *DB) CountNamesForHash(ctx context.Context, hash string) (int, error) {
-	var n int
-	err := d.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM files WHERE hash=?`, hash).Scan(&n)
-	return n, err
-}
-
 // DeleteFileByName removes one name and reports whether the contents it
 // referred to are now unreferenced.
 //
@@ -547,18 +537,6 @@ func (d *DB) GetKey(ctx context.Context, id string) (*Key, error) {
 	return &k, nil
 }
 
-func (d *DB) PutKey(ctx context.Context, k Key) error {
-	_, err := d.sql.ExecContext(ctx, `
-		INSERT INTO keys(id,label,algo,key_bytes,created_at)
-		VALUES(?,?,?,?,CURRENT_TIMESTAMP)
-		ON CONFLICT(id) DO UPDATE SET
-			label=excluded.label,
-			algo=excluded.algo,
-			key_bytes=excluded.key_bytes
-	`, k.ID, k.Label, k.Algo, k.KeyBytes)
-	return err
-}
-
 // GetOrCreateDefaultKey returns the node's encryption key, generating one on
 // first use.
 //
@@ -718,35 +696,6 @@ func (d *DB) GetOutgoingSharePeers(ctx context.Context, fileID string) ([]string
 		peers = append(peers, peerID)
 	}
 	return peers, rows.Err()
-}
-
-func (d *DB) DeleteFile(ctx context.Context, fileID string) error {
-
-	tx, err := d.sql.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM file_keys WHERE file_id = ?
-	`, fileID); err != nil {
-		return err
-	}
-
-	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM shares WHERE file_id = ?
-	`, fileID); err != nil {
-		return err
-	}
-
-	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM files WHERE id = ?
-	`, fileID); err != nil {
-		return err
-	}
-
-	return tx.Commit()
 }
 
 // GetSetting returns a stored setting, or ok=false if it is not set.

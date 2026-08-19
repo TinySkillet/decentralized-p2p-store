@@ -73,17 +73,6 @@ func (s *Store) Read(key string) (int64, io.ReadCloser, error) {
 	return s.readStream(key)
 }
 
-func (s *Store) Write(key string, r io.Reader) (int64, error) {
-	return s.writeStream(key, r)
-}
-
-func (s *Store) WriteEncrypt(encryptionKey []byte, key string, r io.Reader) (int64, error) {
-	return s.atomicWrite(key, func(w io.Writer) (int64, error) {
-		n, err := copyEncrypt(encryptionKey, r, w)
-		return int64(n), err
-	})
-}
-
 // WriteContent encrypts r to disk and files it under the digest of its own
 // contents, which it returns along with the plaintext size.
 //
@@ -192,65 +181,6 @@ func (s *Store) ReadDecrypt(encryptionKey []byte, key string) (int64, io.Reader,
 
 func (s *Store) openFileForReading(key string) (*os.File, error) {
 	return os.Open(s.FullPathForKey(key))
-}
-
-func (s *Store) writeStream(key string, r io.Reader) (int64, error) {
-	return s.atomicWrite(key, func(w io.Writer) (int64, error) {
-		return io.Copy(w, r)
-	})
-}
-
-// atomicWrite stores the output of write under key by filling a temporary
-// file in the destination directory and renaming it into place.
-//
-// Writing in place would mean a reader that already opened the file sees it
-// truncated underneath them, and an interrupted transfer would leave a short
-// file that looks complete. A rename is atomic, so the key either holds the
-// previous contents or the new ones, never a mixture.
-func (s *Store) atomicWrite(key string, write func(io.Writer) (int64, error)) (int64, error) {
-	pathKey := s.PathTransformFunc(key)
-
-	dir := filepath.Join(s.Root, pathKey.Pathname)
-	if err := os.MkdirAll(dir, dirPerm); err != nil {
-		return 0, err
-	}
-
-	tmp, err := os.CreateTemp(dir, "."+pathKey.Filename+".tmp")
-	if err != nil {
-		return 0, err
-	}
-	tmpName := tmp.Name()
-
-	// Both are no-ops once the file has been closed and renamed, and clean up
-	// the partial file on every failure path.
-	defer func() {
-		tmp.Close()
-		os.Remove(tmpName)
-	}()
-
-	if err := tmp.Chmod(filePerm); err != nil {
-		return 0, err
-	}
-
-	n, err := write(tmp)
-	if err != nil {
-		return n, err
-	}
-
-	// Flush before the rename, so a crash cannot leave the key pointing at a
-	// file whose contents never reached the disk.
-	if err := tmp.Sync(); err != nil {
-		return n, err
-	}
-	if err := tmp.Close(); err != nil {
-		return n, err
-	}
-
-	if err := os.Rename(tmpName, filepath.Join(s.Root, pathKey.FullPath())); err != nil {
-		return n, err
-	}
-
-	return n, nil
 }
 
 // Delete removes the file stored under key. It is idempotent: deleting a key
@@ -366,10 +296,6 @@ func (s *Store) RemoveStaleTemporaries(before time.Time) (int, error) {
 	return removed, nil
 }
 
-func (s *Store) Clear() error {
-	return os.RemoveAll(s.Root)
-}
-
 // ModTime returns when the contents under key were last written.
 func (s *Store) ModTime(key string) (time.Time, bool) {
 	info, err := os.Stat(s.FullPathForKey(key))
@@ -417,13 +343,6 @@ func (p PathKey) FullPath() string {
 	return filepath.Join(p.Pathname, p.Filename)
 }
 
-func DefaultPathTransformFunc(key string) PathKey {
-	return PathKey{
-		Pathname: key,
-		Filename: key,
-	}
-}
-
 type Store struct {
 	StoreOpts
 }
@@ -436,7 +355,9 @@ type StoreOpts struct {
 func NewStore(opts StoreOpts) *Store {
 
 	if opts.PathTransformFunc == nil {
-		opts.PathTransformFunc = DefaultPathTransformFunc
+		// There is no meaningful alternative: contents have to live at the
+		// path their own digest determines, or nothing can find them again.
+		opts.PathTransformFunc = CASPathTransformFunc
 	}
 	if len(opts.Root) == 0 {
 		opts.Root = DEFAULT_ROOT_FOLDER

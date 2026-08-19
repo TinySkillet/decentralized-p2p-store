@@ -385,8 +385,8 @@ func TestDeleteFileRemovesRelatedRows(t *testing.T) {
 		t.Fatalf("InsertShare: %v", err)
 	}
 
-	if err := d.DeleteFile(ctx, "f1"); err != nil {
-		t.Fatalf("DeleteFile: %v", err)
+	if _, _, err := d.DeleteFileByName(ctx, "hello", "", "", nil); err != nil {
+		t.Fatalf("DeleteFileByName: %v", err)
 	}
 
 	files, err := d.ListFiles(ctx)
@@ -417,8 +417,8 @@ func TestDeleteFileRemovesRelatedRows(t *testing.T) {
 func TestDeleteMissingFileIsNotAnError(t *testing.T) {
 	d := newTestDB(t)
 	// Deletions are broadcast to peers that may not hold the file.
-	if err := d.DeleteFile(context.Background(), "never-existed"); err != nil {
-		t.Errorf("DeleteFile for a missing id returned %v, want nil", err)
+	if _, _, err := d.DeleteFileByName(context.Background(), "never-existed", "", "", nil); err != nil {
+		t.Errorf("deleting a missing name returned %v, want nil", err)
 	}
 }
 
@@ -564,12 +564,27 @@ func TestSeveralNamesShareOneHash(t *testing.T) {
 		}
 	}
 
-	n, err := d.CountNamesForHash(ctx, "shared-digest")
+	files, err := d.ListFiles(ctx)
 	if err != nil {
-		t.Fatalf("CountNamesForHash: %v", err)
+		t.Fatalf("ListFiles: %v", err)
 	}
-	if n != 3 {
-		t.Errorf("CountNamesForHash = %d, want 3", n)
+	sharing := 0
+	for _, f := range files {
+		if f.Hash == "shared-digest" {
+			sharing++
+		}
+	}
+	if sharing != 3 {
+		t.Errorf("%d names refer to the shared contents, want 3", sharing)
+	}
+
+	// And exactly one blob is reachable, however many names point at it.
+	referenced, err := d.ReferencedHashes(ctx)
+	if err != nil {
+		t.Fatalf("ReferencedHashes: %v", err)
+	}
+	if len(referenced) != 1 {
+		t.Errorf("%d distinct hashes referenced, want 1", len(referenced))
 	}
 }
 

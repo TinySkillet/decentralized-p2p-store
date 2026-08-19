@@ -525,34 +525,6 @@ func TestHandleStreamRejectsSubstitutedContents(t *testing.T) {
 	}
 }
 
-// TestWriteContentExpectingRejectsMismatch covers the store-level guarantee
-// the protocol relies on.
-func TestWriteContentExpectingRejectsMismatch(t *testing.T) {
-	s := NewStore(StoreOpts{Root: t.TempDir(), PathTransformFunc: CASPathTransformFunc})
-	key := mustKey(t)
-
-	actual := []byte("the real bytes")
-	wrong := contentKey([]byte("something else entirely"))
-
-	if _, err := s.WriteContentExpecting(key, wrong, bytes.NewReader(actual)); err == nil {
-		t.Fatal("WriteContentExpecting accepted contents that did not match")
-	}
-	if s.Has(contentKey(actual)) {
-		t.Error("the rejected contents were stored")
-	}
-	if n := countStoredFiles(t, s.Root); n != 0 {
-		t.Errorf("%d files left behind after a rejected write, want 0", n)
-	}
-
-	// The matching case must still succeed.
-	if _, err := s.WriteContentExpecting(key, contentKey(actual), bytes.NewReader(actual)); err != nil {
-		t.Fatalf("WriteContentExpecting: %v", err)
-	}
-	if !s.Has(contentKey(actual)) {
-		t.Error("matching contents were not stored")
-	}
-}
-
 // TestOfferForUnknownRequestIsIgnored checks the correlation ids do their job:
 // a reply that belongs to no outstanding request is dropped rather than
 // satisfying whichever request happens to be waiting.

@@ -3,28 +3,10 @@ package main
 import (
 	"context"
 	"path/filepath"
-	"strings"
 
 	dbpkg "github.com/TinySkillet/DecentralizedP2PStorage/db"
 	"github.com/TinySkillet/DecentralizedP2PStorage/p2p"
 )
-
-func getStorageRoot(listenAddr string) string {
-	port := strings.TrimPrefix(listenAddr, ":")
-	if strings.Contains(port, ":") {
-		parts := strings.Split(port, ":")
-		port = parts[len(parts)-1]
-	}
-	return "node_" + port + "_data"
-}
-
-func makeServer(listenAddr string, nodes ...string) (*FileServer, error) {
-	identity, err := newIdentity()
-	if err != nil {
-		return nil, err
-	}
-	return newServer(listenAddr, identity, identity, nil, getStorageRoot(listenAddr), nodes...)
-}
 
 // makeServerWithDB builds a long-lived node whose identity is persisted in db.
 func makeServerWithDB(listenAddr string, db *dbpkg.DB, nodes ...string) (*FileServer, error) {
@@ -33,7 +15,7 @@ func makeServerWithDB(listenAddr string, db *dbpkg.DB, nodes ...string) (*FileSe
 		return nil, err
 	}
 
-	return newServer(listenAddr, identity, identity, db, storageRootFor(listenAddr, db), nodes...)
+	return newServer(listenAddr, identity, identity, db, storageRootFor(db), nodes...)
 }
 
 // loadOrInitIdentity returns the node's signing identity, persisted in db so
@@ -91,7 +73,7 @@ func makeClientNode(listenAddr string, db *dbpkg.DB, nodes ...string) (*FileServ
 		return nil, err
 	}
 
-	s, err := newServer(listenAddr, identity, owner, db, storageRootFor(listenAddr, db), nodes...)
+	s, err := newServer(listenAddr, identity, owner, db, storageRootFor(db), nodes...)
 	if err != nil {
 		return nil, err
 	}
@@ -106,10 +88,7 @@ func makeClientNode(listenAddr string, db *dbpkg.DB, nodes ...string) (*FileServ
 
 // storageRootFor keeps a node's files beside the database that indexes them,
 // so the two cannot be separated by moving one of them.
-func storageRootFor(listenAddr string, db *dbpkg.DB) string {
-	if db == nil {
-		return getStorageRoot(listenAddr)
-	}
+func storageRootFor(db *dbpkg.DB) string {
 	return filepath.Join(filepath.Dir(db.Path()), "files")
 }
 

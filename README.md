@@ -243,11 +243,11 @@ Command formats:
 
 - `serve --listen <addr> [--db <path>] [--bootstrap <host:port>] [--config <path>]`
   Starts a node and keeps it running. Use this for long-lived peers.
-- `store <key> <file> --listen <addr> [--db <path>] [--bootstrap <host:port>]`
+- `store <key> <file> [--db <path>]`
   Stores a local file under a key and broadcasts it to peers.
-- `get <key> --listen <addr> [--db <path>] [--bootstrap <host:port>] [--out <file>]`
+- `get <key> [--db <path>] [--out <file>]`
   Fetches a file by key from the local node or the network. If `--out` is omitted, the file is written to stdout.
-- `delete <key> --listen <addr> [--db <path>] [--bootstrap <host:port>]`
+- `delete <key> [--db <path>]`
   Deletes a file by key locally and propagates the deletion to peers.
 - `files list [--db <path>]`
   Lists files known to the local database.
@@ -264,7 +264,8 @@ Command formats:
 - `cleanup [--db <path>]`
   Removes stale peer records from the database.
 - `demo`
-  Starts the built-in local three-node demo flow.
+  Starts three nodes in temporary directories, stores a file on one, fetches it
+  from another, then deletes it and confirms it is gone.
 
 ## Local Testing
 

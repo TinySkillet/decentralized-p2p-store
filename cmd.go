@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -37,48 +38,41 @@ func withBootstrap(bootstrap []string, addr string) []string {
 	return append(bootstrap, addr)
 }
 
-// replicationHealth reports file health, asking the running node when there is
-// one so its own copy is not counted twice.
-func replicationHealth(dbPath, listen string, bootstrap []string, replicas int) ([]FileHealth, error) {
-	if node, ok := dialControl(dbPath); ok {
-		return node.status(replicas)
-	}
+// nodeTarget describes where a command should send its work: the node already
+// running against this database, or a temporary one it starts itself.
+type nodeTarget struct {
+	// running is set when a node owns this database and can be asked to act.
+	running *controlClient
 
-	d, err := openDB(dbPath)
-	if err != nil {
-		return nil, err
-	}
-	defer d.Close()
-
-	s, stop, err := startClientNode(listen, d, bootstrap, replicas)
-	if err != nil {
-		return nil, err
-	}
-	defer stop()
-
-	return s.ReplicationStatus()
+	// local is set instead, and is a node started for this command alone.
+	local *FileServer
 }
 
-// runRepair restores under-replicated files, through the running node when
-// there is one.
-func runRepair(dbPath, listen string, bootstrap []string, replicas int) (int, error) {
+// onNode runs work against whichever node should carry it out.
+//
+// A running node owns the database and its storage, so it does the work; a
+// command that started a second node against the same files is what produced
+// races, miscounted replica counts and files owned by a key that vanished.
+// Starting a temporary node is safe only when there is no running one, which is
+// exactly when this takes that path.
+func onNode(dbPath, listen string, bootstrap []string, replicas int, work func(nodeTarget) error) error {
 	if node, ok := dialControl(dbPath); ok {
-		return node.repair(replicas)
+		return work(nodeTarget{running: node})
 	}
 
 	d, err := openDB(dbPath)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer d.Close()
 
 	s, stop, err := startClientNode(listen, d, bootstrap, replicas)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer stop()
 
-	return s.RepairOnce()
+	return work(nodeTarget{local: s})
 }
 
 // openDB opens and migrates the node database.
@@ -244,34 +238,20 @@ func setupCommands() *cobra.Command {
 			}
 			defer f.Close()
 
-			// A running node owns this database and its storage, so it does
-			// the work. Starting a second node against the same files is what
-			// produced races, miscounted replicas and unowned files.
-			if node, ok := dialControl(dbPath); ok {
-				info, err := f.Stat()
-				if err != nil {
-					return err
+			return onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+				if t.running != nil {
+					info, err := f.Stat()
+					if err != nil {
+						return err
+					}
+					return t.running.store(key, info.Size(), f)
 				}
-				return node.store(key, info.Size(), f)
-			}
-
-			d, err := openDB(dbPath)
-			if err != nil {
-				return err
-			}
-			defer d.Close()
-
-			s, stop, err := startClientNode(listen, d, bootstrap, 0)
-			if err != nil {
-				return err
-			}
-			defer stop()
-
-			return s.Store(key, f)
+				return t.local.Store(key, f)
+			})
 		},
 	}
-	storeCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address")
-	storeCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes")
+	storeCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
+	storeCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
 	root.AddCommand(storeCmd)
 
 	getCmd := &cobra.Command{
@@ -294,38 +274,27 @@ func setupCommands() *cobra.Command {
 				return fn(of)
 			}
 
-			if node, ok := dialControl(dbPath); ok {
-				return writeOut(func(w io.Writer) error { return node.get(key, w) })
-			}
+			return onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+				if t.running != nil {
+					return writeOut(func(w io.Writer) error { return t.running.get(key, w) })
+				}
 
-			d, err := openDB(dbPath)
-			if err != nil {
-				return err
-			}
-			defer d.Close()
-
-			s, stop, err := startClientNode(listen, d, bootstrap, 0)
-			if err != nil {
-				return err
-			}
-			defer stop()
-
-			_, r, err := s.Get(key)
-			if err != nil {
-				return err
-			}
-			if rc, ok := r.(io.Closer); ok {
-				defer rc.Close()
-			}
-
-			return writeOut(func(w io.Writer) error {
-				_, err := io.Copy(w, r)
-				return err
+				_, r, err := t.local.Get(key)
+				if err != nil {
+					return err
+				}
+				if rc, ok := r.(io.Closer); ok {
+					defer rc.Close()
+				}
+				return writeOut(func(w io.Writer) error {
+					_, err := io.Copy(w, r)
+					return err
+				})
 			})
 		},
 	}
-	getCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address")
-	getCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes")
+	getCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
+	getCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
 	getCmd.Flags().String("out", "", "output file path")
 	root.AddCommand(getCmd)
 
@@ -336,27 +305,16 @@ func setupCommands() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			key := args[0]
 
-			if node, ok := dialControl(dbPath); ok {
-				return node.delete(key)
-			}
-
-			d, err := openDB(dbPath)
-			if err != nil {
-				return err
-			}
-			defer d.Close()
-
-			s, stop, err := startClientNode(listen, d, bootstrap, 0)
-			if err != nil {
-				return err
-			}
-			defer stop()
-
-			return s.Delete(key)
+			return onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+				if t.running != nil {
+					return t.running.delete(key)
+				}
+				return t.local.Delete(key)
+			})
 		},
 	}
-	deleteCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address")
-	deleteCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes")
+	deleteCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
+	deleteCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
 	root.AddCommand(deleteCmd)
 
 	filesCmd := &cobra.Command{Use: "files", Short: "File operations"}
@@ -484,7 +442,16 @@ func setupCommands() *cobra.Command {
 		Use:   "status",
 		Short: "Report how well replicated the local files are",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			health, err := replicationHealth(dbPath, listen, bootstrap, replicas)
+			var health []FileHealth
+			err := onNode(dbPath, listen, bootstrap, replicas, func(t nodeTarget) error {
+				var err error
+				if t.running != nil {
+					health, err = t.running.status(replicas)
+				} else {
+					health, err = t.local.ReplicationStatus()
+				}
+				return err
+			})
 			if err != nil {
 				return err
 			}
@@ -513,8 +480,8 @@ func setupCommands() *cobra.Command {
 			return nil
 		},
 	}
-	statusCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address")
-	statusCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes")
+	statusCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
+	statusCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
 	statusCmd.Flags().IntVar(&replicas, "replicas", DefaultReplicationFactor, "replication target to measure against")
 	root.AddCommand(statusCmd)
 
@@ -522,7 +489,16 @@ func setupCommands() *cobra.Command {
 		Use:   "repair",
 		Short: "Place missing copies of under-replicated files",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			placed, err := runRepair(dbPath, listen, bootstrap, replicas)
+			var placed int
+			err := onNode(dbPath, listen, bootstrap, replicas, func(t nodeTarget) error {
+				var err error
+				if t.running != nil {
+					placed, err = t.running.repair(replicas)
+				} else {
+					placed, err = t.local.RepairOnce()
+				}
+				return err
+			})
 			if err != nil {
 				return err
 			}
@@ -536,8 +512,8 @@ func setupCommands() *cobra.Command {
 			return nil
 		},
 	}
-	repairCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address")
-	repairCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes")
+	repairCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
+	repairCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
 	repairCmd.Flags().IntVar(&replicas, "replicas", DefaultReplicationFactor, "replication target to restore")
 	root.AddCommand(repairCmd)
 
@@ -545,7 +521,6 @@ func setupCommands() *cobra.Command {
 		Use:   "demo",
 		Short: "Run the local 3-node demo",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			servers := make([]*FileServer, 0, 3)
 			specs := []struct {
 				listen    string
 				bootstrap []string
@@ -555,11 +530,38 @@ func setupCommands() *cobra.Command {
 				{":5000", []string{":3000", ":4000"}},
 			}
 
-			for _, spec := range specs {
-				s, err := makeServer(spec.listen, spec.bootstrap...)
+			// Every node needs its own database: it is what maps a name to the
+			// contents stored under it, so a node without one cannot answer
+			// for anything by name.
+			root, err := os.MkdirTemp("", "p2p-demo-*")
+			if err != nil {
+				return err
+			}
+			defer os.RemoveAll(root)
+			fmt.Printf("demo data in %s\n", root)
+
+			servers := make([]*FileServer, 0, len(specs))
+			for i, spec := range specs {
+				dir := filepath.Join(root, fmt.Sprintf("node%d", i+1))
+				if err := os.MkdirAll(dir, 0o700); err != nil {
+					return err
+				}
+
+				d, err := openDB(filepath.Join(dir, "p2p.db"))
 				if err != nil {
 					return err
 				}
+				defer d.Close()
+
+				s, err := makeServerWithDB(spec.listen, d, spec.bootstrap...)
+				if err != nil {
+					return err
+				}
+				key, err := loadOrInitKey(d)
+				if err != nil {
+					return err
+				}
+				s.EncryptionKey = key
 				if err := s.Listen(); err != nil {
 					return err
 				}
@@ -569,30 +571,47 @@ func setupCommands() *cobra.Command {
 				servers = append(servers, s)
 			}
 
-			s3 := servers[2]
-			if err := s3.waitForPeers(peerWaitTimeout); err != nil {
-				return err
-			}
-			s3.waitForPeerDiscovery(discoveryQuietPeriod, discoverySettleTimeout)
+			origin, other := servers[0], servers[2]
 
-			key := "coolpicture.jpg"
-			data := bytes.NewReader([]byte("my big data file here!"))
-			if err := s3.Store(key, data); err != nil {
+			if err := other.waitForPeers(peerWaitTimeout); err != nil {
 				return err
 			}
-			if err := s3.Delete(key); err != nil {
-				return err
-			}
+			other.waitForPeerDiscovery(discoveryQuietPeriod, discoverySettleTimeout)
 
-			_, r, err := s3.Get(key)
+			// Store on one node.
+			const key = "coolpicture.jpg"
+			payload := []byte("my big data file here!")
+			if err := origin.Store(key, bytes.NewReader(payload)); err != nil {
+				return fmt.Errorf("storing: %w", err)
+			}
+			fmt.Printf("stored %q on %s\n", key, origin.Transport.Address())
+
+			// Read it back from a different node, which is the point of the
+			// exercise: the file is available from a peer that did not store it.
+			_, r, err := other.Get(key)
+			if err != nil {
+				return fmt.Errorf("fetching from %s: %w", other.Transport.Address(), err)
+			}
+			got, err := io.ReadAll(r)
 			if err != nil {
 				return err
 			}
-			b, err := io.ReadAll(r)
-			if err != nil {
-				return err
+			fmt.Printf("fetched from %s: %s\n", other.Transport.Address(), got)
+
+			if !bytes.Equal(got, payload) {
+				return fmt.Errorf("fetched contents differ from what was stored")
 			}
-			fmt.Println(string(b))
+
+			// Then delete it, and show it is gone rather than fetching it again
+			// straight afterwards, which could never have succeeded.
+			if err := origin.Delete(key); err != nil {
+				return fmt.Errorf("deleting: %w", err)
+			}
+			if _, _, err := origin.Get(key); err == nil {
+				return fmt.Errorf("%q is still readable after deletion", key)
+			}
+			fmt.Printf("deleted %q\n", key)
+
 			return nil
 		},
 	}

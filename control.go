@@ -104,8 +104,8 @@ type controlRequest struct {
 type controlResponse struct {
 	Error string
 
-	Health []FileHealth
-	Placed int
+	Health  []FileHealth
+	Offered int
 
 	// Size is the number of payload bytes that follow this message, used when
 	// fetching a file.
@@ -221,11 +221,13 @@ func (s *FileServer) runControl(req controlRequest, body io.Reader) (controlResp
 		return controlResponse{Health: health}, nil
 
 	case opRepair:
-		placed, err := s.repairOnceFor(target)
+		// Offered, not placed: a peer refuses contents it has deleted, which
+		// is how a deletion reaches nodes that missed it.
+		offered, err := s.repairOnceFor(target)
 		if err != nil {
 			return controlResponse{Error: err.Error()}, nil
 		}
-		return controlResponse{Placed: placed}, nil
+		return controlResponse{Offered: offered}, nil
 
 	case opStore:
 		if err := s.Store(req.Name, io.LimitReader(body, req.Size)); err != nil {
@@ -329,7 +331,7 @@ func (c *controlClient) repair(replicas int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return resp.Placed, nil
+	return resp.Offered, nil
 }
 
 func (c *controlClient) store(name string, size int64, body io.Reader) error {
