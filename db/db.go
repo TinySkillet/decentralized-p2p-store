@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 
 	_ "modernc.org/sqlite"
 )
@@ -108,6 +109,7 @@ func (d *DB) Migrate(ctx context.Context) error {
 	// statement skipped rather than treated as a failure.
 	altered := []struct{ table, column, ddl string }{
 		{"peers", "node_id", `ALTER TABLE peers ADD COLUMN node_id TEXT NOT NULL DEFAULT ''`},
+		{"peers", "addrs", `ALTER TABLE peers ADD COLUMN addrs TEXT NOT NULL DEFAULT ''`},
 		{"peers", "host", `ALTER TABLE peers ADD COLUMN host TEXT NOT NULL DEFAULT ''`},
 		{"files", "digest", `ALTER TABLE files ADD COLUMN digest TEXT NOT NULL DEFAULT ''`},
 		{"files", "owner", `ALTER TABLE files ADD COLUMN owner TEXT NOT NULL DEFAULT ''`},
@@ -128,7 +130,6 @@ func (d *DB) Migrate(ctx context.Context) error {
 	}
 
 	for _, stmt := range []string{
-		`CREATE INDEX IF NOT EXISTS idx_peers_node_id ON peers(node_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_peers_host ON peers(host)`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
@@ -137,6 +138,10 @@ func (d *DB) Migrate(ctx context.Context) error {
 	}
 
 	if err := backfillPeerHosts(ctx, tx); err != nil {
+		return err
+	}
+
+	if err := repointPeersToIdentity(ctx, tx); err != nil {
 		return err
 	}
 
@@ -176,6 +181,81 @@ func backfillPeerHosts(ctx context.Context, tx *sql.Tx) error {
 			return err
 		}
 	}
+	return nil
+}
+
+// repointPeersToIdentity rekeys the peer table by node identity.
+//
+// A peer used to be keyed by the address it was reached at, which is wrong in
+// two directions: one node has several addresses over its life, so it
+// accumulated a row per address, and an address says nothing about who is
+// there. Identity is the thing that persists, so it becomes the key.
+//
+// Unlike an added column this cannot be detected by inspecting the schema, so a
+// settings sentinel records that it has run.
+func repointPeersToIdentity(ctx context.Context, tx *sql.Tx) error {
+	var done string
+	err := tx.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, PeerKeySchemaSetting).Scan(&done)
+	if err == nil && done != "" {
+		return nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	stmts := []string{
+		// No UNIQUE on address: one identity legitimately has several, and
+		// several nodes on one machine share a host.
+		`CREATE TABLE peers_new (
+			id        TEXT PRIMARY KEY,
+			address   TEXT NOT NULL DEFAULT '',
+			addrs     TEXT NOT NULL DEFAULT '',
+			host      TEXT NOT NULL DEFAULT '',
+			status    TEXT NOT NULL,
+			last_seen TIMESTAMP
+		);`,
+
+		// One row per identity, keeping the most recently seen address. Rows
+		// with no identity are dropped rather than carried across under an
+		// invented key: they are relearned on the next gossip.
+		`INSERT INTO peers_new(id,address,addrs,host,status,last_seen)
+			SELECT node_id,
+			       address,
+			       COALESCE(addrs,''),
+			       host,
+			       status,
+			       MAX(last_seen)
+			FROM peers
+			WHERE node_id != ''
+			GROUP BY node_id;`,
+
+		// Shares recorded against an address follow the identity that held it.
+		`UPDATE shares SET peer_id = (
+			SELECT node_id FROM peers
+			WHERE peers.id = shares.peer_id AND peers.node_id != ''
+		) WHERE EXISTS (
+			SELECT 1 FROM peers
+			WHERE peers.id = shares.peer_id AND peers.node_id != ''
+		);`,
+
+		`DROP TABLE peers;`,
+		`ALTER TABLE peers_new RENAME TO peers;`,
+		`CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen);`,
+		`CREATE INDEX IF NOT EXISTS idx_peers_host ON peers(host);`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO settings(key,value) VALUES(?, 'identity')
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value
+	`, PeerKeySchemaSetting); err != nil {
+		return err
+	}
+
 	return nil
 }
 

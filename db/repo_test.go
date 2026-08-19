@@ -3,6 +3,7 @@ package db
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -89,7 +90,7 @@ func TestUpsertPeerAndGetActivePeers(t *testing.T) {
 	ctx := context.Background()
 
 	now := time.Now()
-	if err := d.UpsertPeer(ctx, Peer{ID: ":4000", Address: ":4000", Status: "connected", LastSeen: &now}); err != nil {
+	if err := d.UpsertPeer(ctx, Peer{NodeID: ":4000", Address: ":4000", Status: "connected", LastSeen: &now}); err != nil {
 		t.Fatalf("UpsertPeer: %v", err)
 	}
 
@@ -124,7 +125,7 @@ func TestUpsertPeerUpdatesExistingRow(t *testing.T) {
 		status string
 		seen   time.Time
 	}{{"connected", first}, {"disconnected", second}} {
-		if err := d.UpsertPeer(ctx, Peer{ID: ":4000", Address: ":4000", Status: tc.status, LastSeen: &tc.seen}); err != nil {
+		if err := d.UpsertPeer(ctx, Peer{NodeID: ":4000", Address: ":4000", Status: tc.status, LastSeen: &tc.seen}); err != nil {
 			t.Fatalf("UpsertPeer: %v", err)
 		}
 	}
@@ -150,9 +151,9 @@ func TestGetActivePeersExcludesStaleAndOrdersByRecency(t *testing.T) {
 	stale := time.Now().Add(-48 * time.Hour)
 
 	for _, p := range []Peer{
-		{ID: ":1", Address: ":1", Status: "connected", LastSeen: &older},
-		{ID: ":2", Address: ":2", Status: "connected", LastSeen: &recent},
-		{ID: ":3", Address: ":3", Status: "connected", LastSeen: &stale},
+		{NodeID: ":1", Address: ":1", Status: "connected", LastSeen: &older},
+		{NodeID: ":2", Address: ":2", Status: "connected", LastSeen: &recent},
+		{NodeID: ":3", Address: ":3", Status: "connected", LastSeen: &stale},
 	} {
 		if err := d.UpsertPeer(ctx, p); err != nil {
 			t.Fatalf("UpsertPeer: %v", err)
@@ -178,7 +179,7 @@ func TestGetActivePeersRespectsLimit(t *testing.T) {
 	now := time.Now()
 	for i := range 5 {
 		addr := string(rune('a' + i))
-		if err := d.UpsertPeer(ctx, Peer{ID: addr, Address: addr, Status: "connected", LastSeen: &now}); err != nil {
+		if err := d.UpsertPeer(ctx, Peer{NodeID: addr, Address: addr, Status: "connected", LastSeen: &now}); err != nil {
 			t.Fatalf("UpsertPeer: %v", err)
 		}
 	}
@@ -197,7 +198,7 @@ func TestGetActivePeersSkipsUnparseableRow(t *testing.T) {
 	ctx := context.Background()
 
 	now := time.Now()
-	if err := d.UpsertPeer(ctx, Peer{ID: ":good", Address: ":good", Status: "connected", LastSeen: &now}); err != nil {
+	if err := d.UpsertPeer(ctx, Peer{NodeID: ":good", Address: ":good", Status: "connected", LastSeen: &now}); err != nil {
 		t.Fatalf("UpsertPeer: %v", err)
 	}
 	// A corrupt row must not blind the node to every other peer.
@@ -223,8 +224,8 @@ func TestCleanupStalePeers(t *testing.T) {
 	recent := time.Now()
 	stale := time.Now().Add(-2 * time.Hour)
 	for _, p := range []Peer{
-		{ID: ":keep", Address: ":keep", Status: "connected", LastSeen: &recent},
-		{ID: ":drop", Address: ":drop", Status: "connected", LastSeen: &stale},
+		{NodeID: ":keep", Address: ":keep", Status: "connected", LastSeen: &recent},
+		{NodeID: ":drop", Address: ":drop", Status: "connected", LastSeen: &stale},
 	} {
 		if err := d.UpsertPeer(ctx, p); err != nil {
 			t.Fatalf("UpsertPeer: %v", err)
@@ -673,10 +674,10 @@ func TestCountActivePeersForHost(t *testing.T) {
 	stale := time.Now().Add(-2 * time.Hour)
 
 	peers := []Peer{
-		{ID: "a", Address: "10.0.0.5:3000", NodeID: "n1", Status: "connected", LastSeen: &now},
-		{ID: "b", Address: "10.0.0.5:3001", NodeID: "n2", Status: "connected", LastSeen: &now},
-		{ID: "c", Address: "10.0.0.6:3000", NodeID: "n3", Status: "connected", LastSeen: &now},
-		{ID: "d", Address: "10.0.0.5:3002", NodeID: "n4", Status: "connected", LastSeen: &stale},
+		{NodeID: "n1", Address: "10.0.0.5:3000", Status: "connected", LastSeen: &now},
+		{NodeID: "n2", Address: "10.0.0.5:3001", Status: "connected", LastSeen: &now},
+		{NodeID: "n3", Address: "10.0.0.6:3000", Status: "connected", LastSeen: &now},
+		{NodeID: "n4", Address: "10.0.0.5:3002", Status: "connected", LastSeen: &stale},
 	}
 	for _, p := range peers {
 		if err := d.UpsertPeer(ctx, p); err != nil {
@@ -711,9 +712,8 @@ func TestGetActivePeersLimitsIdentitiesPerHost(t *testing.T) {
 	for i := range 10 {
 		seen := base.Add(-time.Duration(i) * time.Second)
 		if err := d.UpsertPeer(ctx, Peer{
-			ID:       fmt.Sprintf("sybil-%d", i),
-			Address:  fmt.Sprintf("10.0.0.5:%d", 3000+i),
 			NodeID:   fmt.Sprintf("sybil-node-%d", i),
+			Address:  fmt.Sprintf("10.0.0.5:%d", 3000+i),
 			Status:   "connected",
 			LastSeen: &seen,
 		}); err != nil {
@@ -723,9 +723,8 @@ func TestGetActivePeersLimitsIdentitiesPerHost(t *testing.T) {
 	for i := range 2 {
 		seen := base.Add(-time.Duration(i) * time.Second)
 		if err := d.UpsertPeer(ctx, Peer{
-			ID:       fmt.Sprintf("real-%d", i),
-			Address:  fmt.Sprintf("10.0.0.%d:3000", 20+i),
 			NodeID:   fmt.Sprintf("real-node-%d", i),
+			Address:  fmt.Sprintf("10.0.0.%d:3000", 20+i),
 			Status:   "connected",
 			LastSeen: &seen,
 		}); err != nil {
@@ -762,9 +761,8 @@ func TestGetActivePeersExemptsLoopback(t *testing.T) {
 	for i := range 6 {
 		seen := base.Add(-time.Duration(i) * time.Second)
 		if err := d.UpsertPeer(ctx, Peer{
-			ID:       fmt.Sprintf("local-%d", i),
-			Address:  fmt.Sprintf("127.0.0.1:%d", 3000+i),
 			NodeID:   fmt.Sprintf("local-node-%d", i),
+			Address:  fmt.Sprintf("127.0.0.1:%d", 3000+i),
 			Status:   "connected",
 			LastSeen: &seen,
 		}); err != nil {
@@ -855,5 +853,139 @@ func TestConcurrentNodeIDCreationAgreesOnOneID(t *testing.T) {
 
 	if ids[0] != ids[1] {
 		t.Fatalf("two callers got different node ids: %q vs %q", ids[0], ids[1])
+	}
+}
+
+// buildLegacyPeerSchema creates the address-keyed peers table an older build
+// would have written, so the migration can be exercised against it.
+func buildLegacyPeerSchema(t *testing.T, path string) {
+	t.Helper()
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer raw.Close()
+
+	stmts := []string{
+		`CREATE TABLE peers (
+			id TEXT PRIMARY KEY,
+			address TEXT NOT NULL UNIQUE,
+			status TEXT NOT NULL,
+			last_seen TIMESTAMP,
+			node_id TEXT NOT NULL DEFAULT '',
+			host TEXT NOT NULL DEFAULT ''
+		);`,
+		`CREATE TABLE files (
+			id TEXT PRIMARY KEY, name TEXT NOT NULL, hash TEXT NOT NULL,
+			size INTEGER NOT NULL, local_path TEXT NOT NULL,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE TABLE shares (
+			id TEXT PRIMARY KEY, file_id TEXT NOT NULL, peer_id TEXT NOT NULL,
+			direction TEXT NOT NULL,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);`,
+		// One identity seen at two addresses, which the old key could not
+		// express, plus a row from before identities were recorded.
+		`INSERT INTO peers(id,address,status,last_seen,node_id,host) VALUES
+			('10.0.0.5:3000','10.0.0.5:3000','disconnected','2025-01-01T00:00:00.000000000Z','identity-a','10.0.0.5'),
+			('10.0.0.5:4000','10.0.0.5:4000','connected',   '2025-06-01T00:00:00.000000000Z','identity-a','10.0.0.5'),
+			('10.0.0.9:3000','10.0.0.9:3000','connected',   '2025-06-01T00:00:00.000000000Z','identity-b','10.0.0.9'),
+			('10.0.0.7:3000','10.0.0.7:3000','connected',   '2025-06-01T00:00:00.000000000Z','',          '10.0.0.7');`,
+		`INSERT INTO files(id,name,hash,size,local_path) VALUES ('f1','hello','h1',5,'/tmp/hello');`,
+		`INSERT INTO shares(id,file_id,peer_id,direction) VALUES ('s1','f1','10.0.0.5:4000','outgoing');`,
+	}
+	for _, stmt := range stmts {
+		if _, err := raw.Exec(stmt); err != nil {
+			t.Fatalf("seeding legacy schema: %v", err)
+		}
+	}
+}
+
+// TestMigrateRekeysPeersByIdentity covers the upgrade path. An address-keyed
+// table held a row per address, so one node that had moved appeared as several
+// peers, and a share recorded against an address could not be resolved back to
+// whoever holds it.
+func TestMigrateRekeysPeersByIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	buildLegacyPeerSchema(t, path)
+
+	d, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	ctx := context.Background()
+	if err := d.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	peers, err := d.GetActivePeers(ctx, 100*365*24*time.Hour, 100)
+	if err != nil {
+		t.Fatalf("GetActivePeers: %v", err)
+	}
+
+	byIdentity := map[string]Peer{}
+	for _, p := range peers {
+		if _, seen := byIdentity[p.NodeID]; seen {
+			t.Errorf("identity %s appears more than once", p.NodeID)
+		}
+		byIdentity[p.NodeID] = p
+	}
+
+	// The node seen at two addresses collapses to one row, keeping the most
+	// recent address.
+	a, ok := byIdentity["identity-a"]
+	if !ok {
+		t.Fatal("identity-a did not survive the migration")
+	}
+	if a.Address != "10.0.0.5:4000" {
+		t.Errorf("identity-a address = %q, want the most recently seen one", a.Address)
+	}
+	if _, ok := byIdentity["identity-b"]; !ok {
+		t.Error("identity-b did not survive the migration")
+	}
+
+	// A row from before identities were recorded cannot be keyed, so it is
+	// dropped and relearned rather than carried under an invented key.
+	if _, ok := byIdentity[""]; ok {
+		t.Error("a peer with no identity was carried across")
+	}
+	if len(byIdentity) != 2 {
+		t.Errorf("got %d peers, want 2", len(byIdentity))
+	}
+
+	// The share follows the identity that held it.
+	holders, err := d.GetOutgoingSharePeers(ctx, "f1")
+	if err != nil {
+		t.Fatalf("GetOutgoingSharePeers: %v", err)
+	}
+	if len(holders) != 1 || holders[0] != "identity-a" {
+		t.Errorf("share holders = %v, want [identity-a]", holders)
+	}
+
+	// And that identity resolves back to somewhere dialable.
+	addrs, err := d.AddressesForNodes(ctx, holders)
+	if err != nil {
+		t.Fatalf("AddressesForNodes: %v", err)
+	}
+	if addrs["identity-a"] != "10.0.0.5:4000" {
+		t.Errorf("resolved address = %q, want 10.0.0.5:4000", addrs["identity-a"])
+	}
+
+	// Migrate runs on every startup, so it must be safe to repeat.
+	for i := range 2 {
+		if err := d.Migrate(ctx); err != nil {
+			t.Fatalf("Migrate repeat %d: %v", i+2, err)
+		}
+	}
+	again, err := d.GetActivePeers(ctx, 100*365*24*time.Hour, 100)
+	if err != nil {
+		t.Fatalf("GetActivePeers: %v", err)
+	}
+	if len(again) != len(peers) {
+		t.Errorf("repeating Migrate changed the peer count from %d to %d", len(peers), len(again))
 	}
 }
