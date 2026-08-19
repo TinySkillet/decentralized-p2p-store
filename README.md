@@ -65,7 +65,10 @@ The project is a work in progress. What it does not yet do:
   may store files or broadcast a deletion. Contents cannot be substituted, as
   a fetch is verified against the digest it asked for, but a peer can still
   answer an availability query with a digest for contents nobody asked for.
-  The system assumes the out-of-band trust of a private group.
+  The system assumes the out-of-band trust of a private group: joining
+  requires knowing a bootstrap address, and the number of identities accepted
+  from any one host is capped so a single machine cannot flood the peer table.
+  Loopback is exempt, so several nodes can share a machine for local testing.
 - **Replication has no target factor and no repair.** A file goes to whichever
   peers happen to be connected when it is stored; nothing re-replicates it if
   those peers later leave.
