@@ -3,6 +3,7 @@ package p2p
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -142,8 +143,27 @@ type TCPPeer struct {
 	// without this their bytes interleave and corrupt the frame stream.
 	writeLock sync.Mutex
 
-	// FullAddr is the verified listening address of the peer
+	// FullAddr is the address other nodes can reach this peer on. The
+	// handshake fills it in by pairing the port the peer advertises with the
+	// source address the connection actually arrived from, so it stays
+	// routable even when the peer was configured with a bare ":3000".
 	FullAddr string
+
+	// NodeID is the peer's stable identifier, learned during the handshake.
+	NodeID string
+}
+
+// ID returns the peer's node identifier.
+func (p *TCPPeer) ID() string { return p.NodeID }
+
+// ObservedHost returns the host half of the address this connection came
+// from. The handshake pairs it with the port the peer advertises.
+func (p *TCPPeer) ObservedHost() string {
+	host, _, err := net.SplitHostPort(p.Conn.RemoteAddr().String())
+	if err != nil {
+		return ""
+	}
+	return host
 }
 
 func (p *TCPPeer) RemoteAddr() net.Addr {
@@ -169,6 +189,24 @@ func (p *TCPPeer) Write(b []byte) (int, error) {
 	p.writeLock.Lock()
 	defer p.writeLock.Unlock()
 	return p.Conn.Write(b)
+}
+
+// SendStream writes header, the stream tag, and then body, holding the
+// connection's write lock for the whole transfer so that nothing else can be
+// written into the middle of it.
+func (p *TCPPeer) SendStream(header []byte, body io.Reader) (int64, error) {
+	p.writeLock.Lock()
+	defer p.writeLock.Unlock()
+
+	// Writes go to the embedded connection directly: the lock is already
+	// held, and Send and Write would try to take it again.
+	if _, err := p.Conn.Write(header); err != nil {
+		return 0, err
+	}
+	if _, err := p.Conn.Write([]byte{IncomingStream}); err != nil {
+		return 0, err
+	}
+	return io.Copy(p.Conn, body)
 }
 
 func (p *TCPPeer) CloseStream() {
