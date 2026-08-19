@@ -3,6 +3,47 @@
 Peer-to-peer file storage with gossip-based peer discovery, file replication,
 SQLite-backed metadata, and optional `systemd` service support.
 
+## Releases
+
+This project began as an undergraduate thesis and has continued since. Tags
+mark the states worth distinguishing:
+
+| Tag | What it is |
+| --- | --- |
+| `v1.0-thesis` | The artifact as the thesis describes it. Every claim in the report holds of this code. |
+| `v1.1-durability` | Adds a replication target with automatic repair. |
+| `v1.2-consistency` | Fixes the data-integrity bugs found by auditing the two releases above. |
+
+**Run `v1.2-consistency` or later.** The earlier tags are kept as reference
+points, not as versions to deploy.
+
+### Known issues in `v1.0-thesis`
+
+Auditing the submitted artifact afterwards turned up six bugs that could lose
+or misreport data. They do not affect the report's claims, which hold of that
+code as written, but they matter if you intend to run it.
+
+| Issue | Fixed in |
+| --- | --- |
+| A copy arriving from a peer under a name already used here overwrote the local mapping, so any peer could silently repoint one of your files at its own contents. | `v1.1` |
+| Two processes sharing a database could each generate an encryption key and overwrite the other's, leaving files encrypted under the loser undecryptable. | `v1.2` |
+| The same race on node identity, which peers remember and use to recognise a connection back to a node. | `v1.2` |
+| Replacing a file left the previous contents on disk with nothing referring to them, and nothing reclaimed the space. | `v1.2` |
+| Deleting a name decided the contents were unreferenced and then unlinked them as two separate steps, so a name recorded in between was left pointing at deleted data. | `v1.2` |
+| A deletion travelled by name alone, so deleting your file also deleted a peer's different file of the same name. | `v1.2` |
+
+### Known issues in `v1.1-durability`
+
+Automatic repair introduced one problem of its own, alongside the `v1.0` issues
+above that were still outstanding:
+
+| Issue | Fixed in |
+| --- | --- |
+| A peer offline during a deletion still held the file, and its repair cycle offered it back to every node that had removed it, undoing the deletion across the network. | `v1.2` |
+
+Every issue listed here has a regression test that fails against the code
+before its fix.
+
 ## Features
 
 - Peer discovery via gossip between connected nodes
