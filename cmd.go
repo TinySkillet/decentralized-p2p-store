@@ -480,7 +480,9 @@ func setupCommands() *cobra.Command {
 				fmt.Println("Nothing to repair.")
 				return nil
 			}
-			fmt.Printf("Placed %d missing replica(s).\n", placed)
+			// A peer refuses contents it has deleted, so an offer is not
+			// always a copy kept. Run status afterwards to see the result.
+			fmt.Printf("Offered %d missing replica(s). Run 'p2p status' to confirm.\n", placed)
 			return nil
 		},
 	}
