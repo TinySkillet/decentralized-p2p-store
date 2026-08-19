@@ -508,7 +508,7 @@ func TestSharesCannotOutliveTheirFile(t *testing.T) {
 		t.Fatalf("InsertShare: %v", err)
 	}
 
-	if _, _, err := d.DeleteFileByName(ctx, "hello", ""); err != nil {
+	if _, _, err := d.DeleteFileByName(ctx, "hello", "", "", nil); err != nil {
 		t.Fatalf("DeleteFileByName: %v", err)
 	}
 
@@ -587,7 +587,7 @@ func TestDeleteFileByNameReportsWhenContentsAreOrphaned(t *testing.T) {
 		}
 	}
 
-	hash, orphaned, err := d.DeleteFileByName(ctx, "goner", "")
+	hash, orphaned, err := d.DeleteFileByName(ctx, "goner", "", "", nil)
 	if err != nil {
 		t.Fatalf("DeleteFileByName: %v", err)
 	}
@@ -598,7 +598,7 @@ func TestDeleteFileByNameReportsWhenContentsAreOrphaned(t *testing.T) {
 		t.Error("contents reported orphaned while another name still refers to them")
 	}
 
-	hash, orphaned, err = d.DeleteFileByName(ctx, "keeper", "")
+	hash, orphaned, err = d.DeleteFileByName(ctx, "keeper", "", "", nil)
 	if err != nil {
 		t.Fatalf("DeleteFileByName: %v", err)
 	}
@@ -613,7 +613,7 @@ func TestDeleteFileByNameReportsWhenContentsAreOrphaned(t *testing.T) {
 func TestDeleteFileByNameForUnknownName(t *testing.T) {
 	d := newTestDB(t)
 
-	hash, orphaned, err := d.DeleteFileByName(context.Background(), "never-stored", "")
+	hash, orphaned, err := d.DeleteFileByName(context.Background(), "never-stored", "", "", nil)
 	if err != nil {
 		t.Fatalf("DeleteFileByName: %v", err)
 	}

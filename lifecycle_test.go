@@ -61,7 +61,7 @@ func TestDeleteDoesNotUnlinkNewlyReferencedContents(t *testing.T) {
 
 	// Simulate the window inside forget(): the name row is gone and the
 	// contents look orphaned, but a new name is recorded before the unlink.
-	hash, orphaned, err := node.db.DeleteFileByName(context.Background(), "first", "")
+	hash, orphaned, err := node.db.DeleteFileByName(context.Background(), "first", "", "", nil)
 	if err != nil {
 		t.Fatalf("DeleteFileByName: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestDeleteDoesNotUnlinkNewlyReferencedContents(t *testing.T) {
 	}
 
 	// A replica arrives for the same contents, right now.
-	if err := node.recordReplica("second", digest, int64(len(payload))); err != nil {
+	if err := node.recordReplica("second", digest, int64(len(payload)), node.NodeID()); err != nil {
 		t.Fatalf("recordReplica: %v", err)
 	}
 
@@ -153,7 +153,7 @@ func TestDeletionSurvivesAPeerThatMissedIt(t *testing.T) {
 
 	// The origin deletes it while the straggler is not listening, so only the
 	// origin forgets. forget() is the local half of a delete broadcast.
-	if err := origin.forget("secret", digest); err != nil {
+	if err := origin.forget("secret", digest, origin.NodeID(), origin.Identity.Sign(deleteTranscript("secret", digest))); err != nil {
 		t.Fatalf("forget: %v", err)
 	}
 	if _, err := origin.SweepOrphans(0); err != nil {

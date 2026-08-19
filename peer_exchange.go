@@ -33,7 +33,7 @@ func (s *FileServer) discoverPeers(peers []PeerInfo) {
 		// Gossip eventually hands this node its own address back. Identity
 		// catches that reliably; the handshake rejects it as a backstop for
 		// entries that predate node ids.
-		if peerInfo.NodeID != "" && peerInfo.NodeID == s.NodeID {
+		if peerInfo.NodeID != "" && peerInfo.NodeID == s.NodeID() {
 			continue
 		}
 

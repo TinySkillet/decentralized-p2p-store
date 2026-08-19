@@ -13,8 +13,9 @@ mark the states worth distinguishing:
 | `v1.0-thesis` | The artifact as the thesis describes it. Every claim in the report holds of this code. |
 | `v1.1-durability` | Adds a replication target with automatic repair. |
 | `v1.2-consistency` | Fixes the data-integrity bugs found by auditing the two releases above. |
+| `v1.3-identity` | Peers prove who they are, and deleting a file requires its owner's authorisation. |
 
-**Run `v1.2-consistency` or later.** The earlier tags are kept as reference
+**Run the newest tag.** The earlier tags are kept as reference
 points, not as versions to deploy.
 
 ### Known issues in `v1.0-thesis`
@@ -52,6 +53,9 @@ before its fix.
   contents, so identical bytes are stored once however many names refer to them
 - A replication target with automatic repair, so files that fall below it are
   copied back up as peers come and go
+- Cryptographic peer identity: a node is named by its public key and proves it
+  holds the matching private key before any file traffic is allowed
+- Deletion requires the file owner's signed authorisation
 - AES-256-CTR encryption of files at rest
 - SQLite-backed metadata storage
 - CLI commands for serving, storing, fetching, listing, deleting, and inspecting peers
@@ -59,13 +63,21 @@ before its fix.
 
 ## Protocol
 
-Every connection opens with a handshake carrying a protocol version, the
-node's identity, and the port it listens on. A version mismatch ends the
+Every connection opens with a handshake that settles four things: that both
+sides speak the same protocol version, that the peer holds the private key for
+the identity it claims, that it is not this node reached by a roundabout route,
+and what address other nodes should use to reach it.
+
+A node is named by its Ed25519 public key. Each side sends a random challenge
+and signs the other's, over a transcript naming both parties, so a captured
+handshake is useless on another connection. A version mismatch ends the
 connection rather than letting two builds misread each other's frames. The
 receiving node pairs the advertised port with the address the connection
 actually arrived from, so a node configured with a bare `:3000` is still
-recorded at an address its peers can reach. Identity is what lets a node
-recognise a connection back to itself, which gossip eventually produces.
+recorded at an address its peers can reach.
+
+Proving identity is what makes the rest meaningful: an unverified name would
+make any decision about what a peer is allowed to do worthless.
 
 After the handshake, each frame begins with a tag: a length-prefixed message,
 or a file body. A fetch runs in two rounds:
@@ -118,6 +130,19 @@ Deletions carry the content digest as well as the name. Two nodes may
 legitimately use the same name for different files, and a peer only acts when
 its own name refers to the same contents.
 
+Every file records the identity that stored it, and a deletion must carry that
+owner's signature over the name and digest together. Reaching a peer is not by
+itself permission to destroy what it holds. The authorisation is kept with the
+tombstone and replayed to peers that still hold the file, so a relaying node
+does not have to be trusted. Files stored before ownership was recorded have no
+owner and accept unsigned deletions, so upgrading a network does not strand
+data nobody can remove.
+
+Ownership follows the database rather than the process. A one-shot command joins
+the network under a throwaway key, so the node whose database it borrows does
+not refuse the connection as one to itself, but the files it stores belong to
+that database's identity.
+
 What deletion does not promise: a peer that is unreachable keeps its copy until
 it next contacts a node that knows about the deletion.
 
@@ -139,14 +164,15 @@ The project is a work in progress. What it does not yet do:
 - **Files travel between peers in plaintext.** Encryption is applied at rest
   only, and each node holds its own key in the SQLite database beside the data
   it protects.
-- **Peers are not authenticated.** Any node that can complete the handshake
-  may store files or broadcast a deletion. Contents cannot be substituted, as
-  a fetch is verified against the digest it asked for, but a peer can still
-  answer an availability query with a digest for contents nobody asked for.
-  The system assumes the out-of-band trust of a private group: joining
-  requires knowing a bootstrap address, and the number of identities accepted
-  from any one host is capped so a single machine cannot flood the peer table.
+- **Anyone who can complete the handshake may store files.** Identity is
+  proven and deletion is authorised, but there is no admission control on
+  incoming data and no quota, so a peer can fill a node's disk. Joining still
+  depends on knowing a bootstrap address, and the number of identities accepted
+  from one host is capped so a single machine cannot flood the peer table.
   Loopback is exempt, so several nodes can share a machine for local testing.
+- **Anyone with the database can act as its owner.** Signing authority lives in
+  the database beside the encryption key, so file permissions are only as
+  strong as the filesystem permissions on that file.
 - **NAT is not handled.** A node behind NAT advertises a port that may not be
   reachable from outside its network.
 
