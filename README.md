@@ -14,6 +14,7 @@ mark the states worth distinguishing:
 | `v1.1-durability` | Adds a replication target with automatic repair. |
 | `v1.2-consistency` | Fixes the data-integrity bugs found by auditing the two releases above. |
 | `v1.3-identity` | Peers prove who they are, and deleting a file requires its owner's authorisation. |
+| `v1.4-control` | Commands ask the running node to act instead of starting one of their own. |
 
 **Run the newest tag.** The earlier tags are kept as reference
 points, not as versions to deploy.
@@ -176,6 +177,34 @@ The project is a work in progress. What it does not yet do:
 - **NAT is not handled.** A node behind NAT advertises a port that may not be
   reachable from outside its network.
 
+## How commands reach a node
+
+A running node accepts commands on a unix socket beside its database, and
+`store`, `get`, `delete`, `status` and `repair` use it when one is there. That
+means they need no `--listen` or `--bootstrap`:
+
+```bash
+p2p store report report.pdf --db ~/.p2p/p2p.db
+p2p status --db ~/.p2p/p2p.db
+```
+
+Earlier releases had commands start a second node against the running node's
+database and storage. That produced a run of bugs: two writers racing on the
+same row, replica counts that treated the borrowed storage as an extra copy,
+and files owned by a key that vanished when the command exited. Asking the node
+that owns the data to act removes the whole class.
+
+When no node is running, commands still start a temporary one and do the work
+themselves. That path is safe precisely when it is taken: the hazard was ever
+sharing storage with a running node, and that is exactly the case where the
+socket exists.
+
+The socket carries no authentication and grants full authority, including
+deleting files as their owner. It is created with owner-only permissions, which
+is the same boundary as the database beside it. Where the database path is too
+long for a unix socket, the socket moves to the user's runtime directory under a
+name derived from that path, so node and commands still agree where to meet.
+
 ## Build
 
 ```bash
@@ -226,10 +255,10 @@ Command formats:
   Lists file share records for files stored on other peers.
 - `peers [--db <path>]`
   Lists known peers and their last seen status.
-- `status [--db <path>] [--replicas <n>] [--bootstrap <host:port>]`
+- `status [--db <path>] [--replicas <n>]`
   Reports how many copies of each local file the network holds, and which are
   below the replication target.
-- `repair [--db <path>] [--replicas <n>] [--bootstrap <host:port>]`
+- `repair [--db <path>] [--replicas <n>]`
   Places copies of under-replicated files immediately, rather than waiting for
   the next automatic cycle.
 - `cleanup [--db <path>]`
