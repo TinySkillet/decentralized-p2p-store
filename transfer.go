@@ -415,9 +415,9 @@ func (s *FileServer) Get(name string) (int64, io.Reader, error) {
 
 	query := Message{Payload: MessageGetFile{RequestID: requestID, Name: name}}
 	asked := 0
-	for _, addr := range addrs {
-		if err := sendMessage(peers[addr], &query); err != nil {
-			fmt.Printf("[%s] Error asking peer %s: %v\n", s.Transport.Address(), addr, err)
+	for _, nodeID := range addrs {
+		if err := sendMessage(peers[nodeID], &query); err != nil {
+			fmt.Printf("[%s] Error asking peer %s: %v\n", s.Transport.Address(), short(nodeID), err)
 			continue
 		}
 		asked++
@@ -516,15 +516,15 @@ func (s *FileServer) Store(name string, r io.Reader) error {
 	replicated, written := s.replicate(digest, &msg)
 
 	if s.DB != nil {
-		for _, addr := range replicated {
-			shareID := contentKey([]byte(digest + addr + "outgoing"))
+		for _, nodeID := range replicated {
+			shareID := contentKey([]byte(digest + nodeID + "outgoing"))
 			if err := s.DB.InsertShare(context.Background(), dbpkg.Share{
 				ID:        shareID,
 				FileID:    nameKey(name),
-				PeerID:    addr,
+				PeerID:    nodeID,
 				Direction: "outgoing",
 			}); err != nil {
-				log.Printf("[%s] Failed to record outgoing share to %s: %v", s.Transport.Address(), addr, err)
+				log.Printf("[%s] Failed to record outgoing share to %s: %v", s.Transport.Address(), short(nodeID), err)
 			}
 		}
 	}
@@ -552,29 +552,29 @@ func (s *FileServer) replicate(digest string, msg *Message) ([]string, int64) {
 	results := make(chan result, len(addrs))
 
 	var wg sync.WaitGroup
-	for _, addr := range addrs {
+	for _, nodeID := range addrs {
 		wg.Add(1)
-		go func(addr string, peer p2p.Peer) {
+		go func(nodeID string, peer p2p.Peer) {
 			defer wg.Done()
 
 			_, body, err := s.store.ReadDecrypt(s.EncryptionKey, digest)
 			if err != nil {
-				fmt.Printf("[%s] Could not read %s to send to %s: %v\n", s.Transport.Address(), short(digest), addr, err)
+				fmt.Printf("[%s] Could not read %s to send to %s: %v\n", s.Transport.Address(), short(digest), short(nodeID), err)
 				return
 			}
 			if rc, ok := body.(io.Closer); ok {
 				defer rc.Close()
 			}
 
-			fmt.Printf("[%s] Sending message to peer %s\n", s.Transport.Address(), addr)
+			fmt.Printf("[%s] Sending message to peer %s\n", s.Transport.Address(), short(nodeID))
 
 			n, err := sendFile(peer, msg, body)
 			if err != nil {
-				fmt.Printf("[%s] Error sending %s to peer %s: %v\n", s.Transport.Address(), short(digest), addr, err)
+				fmt.Printf("[%s] Error sending %s to peer %s: %v\n", s.Transport.Address(), short(digest), short(nodeID), err)
 				return
 			}
-			results <- result{addr: addr, written: n}
-		}(addr, peers[addr])
+			results <- result{addr: nodeID, written: n}
+		}(nodeID, peers[nodeID])
 	}
 
 	wg.Wait()

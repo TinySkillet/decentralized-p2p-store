@@ -207,12 +207,16 @@ func TestPeerAddressIsRoutable(t *testing.T) {
 
 	waitForPeerCount(t, observer, 1)
 
-	_, addrs := observer.connectedPeers()
-	if len(addrs) != 1 {
-		t.Fatalf("got %d peers, want 1", len(addrs))
+	// Peers are keyed by identity, so the address is asked of the peer itself.
+	peers, ids := observer.connectedPeers()
+	if len(ids) != 1 {
+		t.Fatalf("got %d peers, want 1", len(ids))
 	}
 
-	addr := addrs[0]
+	addr := peerAddress(peers[ids[0]])
+	if addr == "" {
+		t.Fatal("the peer reports no address at all")
+	}
 	if strings.HasPrefix(addr, ":") {
 		t.Fatalf("peer recorded as %q, which names no host and is not reachable from another machine", addr)
 	}
@@ -585,9 +589,8 @@ func TestAdmitLimitsIdentitiesPerHost(t *testing.T) {
 	for i := range 2 {
 		addr := fmt.Sprintf("10.0.0.5:%d", 3000+i)
 		if err := node.db.UpsertPeer(ctx, dbpkg.Peer{
-			ID:       addr,
-			Address:  addr,
 			NodeID:   fmt.Sprintf("sybil-%d", i),
+			Address:  addr,
 			Status:   "connected",
 			LastSeen: &now,
 		}); err != nil {
@@ -615,9 +618,8 @@ func TestAdmitExemptsLoopback(t *testing.T) {
 	for i := range 5 {
 		addr := fmt.Sprintf("127.0.0.1:%d", 3000+i)
 		if err := node.db.UpsertPeer(ctx, dbpkg.Peer{
-			ID:       addr,
-			Address:  addr,
 			NodeID:   fmt.Sprintf("local-%d", i),
+			Address:  addr,
 			Status:   "connected",
 			LastSeen: &now,
 		}); err != nil {
@@ -639,7 +641,7 @@ func TestAdmitAllowsReconnectionOfKnownIdentity(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 	if err := node.db.UpsertPeer(ctx, dbpkg.Peer{
-		ID: "10.0.0.5:3000", Address: "10.0.0.5:3000", NodeID: "returning",
+		NodeID: "returning", Address: "10.0.0.5:3000",
 		Status: "disconnected", LastSeen: &now,
 	}); err != nil {
 		t.Fatalf("UpsertPeer: %v", err)
@@ -647,7 +649,7 @@ func TestAdmitAllowsReconnectionOfKnownIdentity(t *testing.T) {
 
 	peer := &countingPeer{}
 	node.peersLock.Lock()
-	node.peers["10.0.0.5:3000"] = peer
+	node.peers[peer.ID()] = peer
 	node.peersLock.Unlock()
 
 	if err := node.admit("10.0.0.5:3000", peer.ID()); err != nil {

@@ -40,9 +40,8 @@ func (s *FileServer) discoverPeers(peers []PeerInfo) {
 			continue
 		}
 
-		if _, alreadyConnected := s.peer(peerInfo.Address); alreadyConnected {
-			continue
-		}
+		// Identity is the test, not address: the same node may be gossiped
+		// under several addresses, and dialling each again wastes attempts.
 		if s.hasPeerWithNodeID(peerInfo.NodeID) {
 			continue
 		}
@@ -70,7 +69,7 @@ func (s *FileServer) discoverPeers(peers []PeerInfo) {
 	}
 }
 
-func (s *FileServer) sendPeerExchange(peerAddr string) error {
+func (s *FileServer) sendPeerExchange(nodeID string) error {
 	if s.DB == nil {
 		return nil
 	}
@@ -92,11 +91,11 @@ func (s *FileServer) sendPeerExchange(peerAddr string) error {
 		}
 	}
 
-	fmt.Printf("[%s] Sending %d peer(s) to %s\n", s.Transport.Address(), len(peerInfos), peerAddr)
+	fmt.Printf("[%s] Sending %d peer(s) to %s\n", s.Transport.Address(), len(peerInfos), short(nodeID))
 
-	peer, ok := s.peer(peerAddr)
+	peer, ok := s.peer(nodeID)
 	if !ok {
-		return fmt.Errorf("peer %s not found in connected peers", peerAddr)
+		return fmt.Errorf("peer %s not found in connected peers", short(nodeID))
 	}
 
 	msg := Message{

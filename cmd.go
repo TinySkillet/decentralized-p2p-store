@@ -368,12 +368,15 @@ func setupCommands() *cobra.Command {
 				fmt.Println("No shares found.")
 				return nil
 			}
-			fmt.Printf("%-20s\t%-20s\t%-15s\t%-10s\t%s\n", "FILE", "PEER", "DIRECTION", "SIZE", "CREATED")
-			fmt.Println(strings.Repeat("-", 100))
+			// Peers are recorded by identity, which is a full public key. It
+			// is abbreviated here so the table stays readable; the identity
+			// itself is what the record holds.
+			fmt.Printf("%-20s\t%-14s\t%-10s\t%-10s\t%s\n", "FILE", "PEER", "DIRECTION", "SIZE", "CREATED")
+			fmt.Println(strings.Repeat("-", 85))
 			for _, s := range shares {
-				fmt.Printf("%-20s\t%-20s\t%-15s\t%-10d\t%s\n",
+				fmt.Printf("%-20s\t%-14s\t%-10s\t%-10d\t%s\n",
 					s.FileName,
-					s.PeerID,
+					short(s.PeerID),
 					s.Direction,
 					s.FileSize,
 					s.CreatedAt.Format("2006-01-02 15:04:05"))

@@ -20,36 +20,55 @@ func (s *FileServer) connectedPeers() (map[string]p2p.Peer, []string) {
 	defer s.peersLock.Unlock()
 
 	peers := make(map[string]p2p.Peer, len(s.peers))
-	addrs := make([]string, 0, len(s.peers))
-	for addr, peer := range s.peers {
-		peers[addr] = peer
-		addrs = append(addrs, addr)
+	ids := make([]string, 0, len(s.peers))
+	for id, peer := range s.peers {
+		peers[id] = peer
+		ids = append(ids, id)
 	}
-	return peers, addrs
+	return peers, ids
 }
 
-func (s *FileServer) peer(addr string) (p2p.Peer, bool) {
+func (s *FileServer) peer(nodeID string) (p2p.Peer, bool) {
 	s.peersLock.Lock()
 	defer s.peersLock.Unlock()
-	p, ok := s.peers[addr]
+	p, ok := s.peers[nodeID]
 	return p, ok
 }
 
+// peerAddress returns an address this peer can be reached at, or "" when its
+// transport does not deal in addresses.
+//
+// Only the admission limit and the peer records need this; everything else
+// reasons about identity, which every transport has.
+func peerAddress(p p2p.Peer) string {
+	located, ok := p.(p2p.Located)
+	if !ok {
+		return ""
+	}
+	addrs := located.AdvertisedAddrs()
+	if len(addrs) == 0 {
+		return ""
+	}
+	return addrs[0]
+}
+
+// advertisedAddrs returns every address a peer says it can be reached at.
+func advertisedAddrs(p p2p.Peer) []string {
+	located, ok := p.(p2p.Located)
+	if !ok {
+		return nil
+	}
+	return located.AdvertisedAddrs()
+}
+
 // hasPeerWithNodeID reports whether a peer with this identity is already
-// connected, possibly on a different address.
+// connected, possibly at a different address.
 func (s *FileServer) hasPeerWithNodeID(nodeID string) bool {
 	if nodeID == "" {
 		return false
 	}
-
-	s.peersLock.Lock()
-	defer s.peersLock.Unlock()
-	for _, p := range s.peers {
-		if p.ID() == nodeID {
-			return true
-		}
-	}
-	return false
+	_, ok := s.peer(nodeID)
+	return ok
 }
 
 func (s *FileServer) peerCount() int {
@@ -64,10 +83,10 @@ func (s *FileServer) broadcast(msg *Message) error {
 	peers, addrs := s.connectedPeers()
 
 	var lastErr error
-	for _, addr := range addrs {
-		fmt.Printf("[%s] Sending message to peer %s\n", s.Transport.Address(), addr)
-		if err := sendMessage(peers[addr], msg); err != nil {
-			fmt.Printf("[%s] Error sending message to peer %s: %v\n", s.Transport.Address(), addr, err)
+	for _, id := range addrs {
+		fmt.Printf("[%s] Sending message to peer %s\n", s.Transport.Address(), short(id))
+		if err := sendMessage(peers[id], msg); err != nil {
+			fmt.Printf("[%s] Error sending message to peer %s: %v\n", s.Transport.Address(), short(id), err)
 			lastErr = err
 		}
 	}
@@ -76,24 +95,28 @@ func (s *FileServer) broadcast(msg *Message) error {
 }
 
 func (s *FileServer) OnPeer(p p2p.Peer) error {
-	peerAddr := p.RemoteAddr().String()
+	nodeID := p.ID()
+	peerAddr := peerAddress(p)
 
-	if err := s.admit(peerAddr, p.ID()); err != nil {
+	if err := s.admit(peerAddr, nodeID); err != nil {
 		return err
 	}
 
+	// Keyed by identity. The address is recorded alongside as a location hint,
+	// but it is not what the peer is: it changes when the node moves network,
+	// and a peer may be reachable at several.
 	s.peersLock.Lock()
-	s.peers[peerAddr] = p
+	s.peers[nodeID] = p
 	s.peersLock.Unlock()
 
-	fmt.Printf("[%s] Connected with remote %s\n", s.Transport.Address(), peerAddr)
+	fmt.Printf("[%s] Connected with %s at %s\n", s.Transport.Address(), short(nodeID), peerAddr)
 
 	if s.DB != nil {
 		now := time.Now()
 		if err := s.DB.UpsertPeer(context.Background(), dbpkg.Peer{
-			ID:       peerAddr,
+			NodeID:   nodeID,
 			Address:  peerAddr,
-			NodeID:   p.ID(),
+			Addrs:    advertisedAddrs(p),
 			Status:   "connected",
 			LastSeen: &now,
 		}); err != nil {
@@ -101,7 +124,7 @@ func (s *FileServer) OnPeer(p p2p.Peer) error {
 		}
 	}
 
-	go s.announceTo(peerAddr)
+	go s.announceTo(nodeID)
 
 	return nil
 }
@@ -144,20 +167,21 @@ func (s *FileServer) admit(peerAddr, nodeID string) error {
 // OnPeerDisconnect drops a peer whose connection has ended. Without it the
 // node keeps broadcasting to a closed socket and reports stale peer counts.
 func (s *FileServer) OnPeerDisconnect(p p2p.Peer) {
-	peerAddr := p.RemoteAddr().String()
+	nodeID := p.ID()
+	peerAddr := peerAddress(p)
 
 	s.peersLock.Lock()
-	delete(s.peers, peerAddr)
+	delete(s.peers, nodeID)
 	s.peersLock.Unlock()
 
-	fmt.Printf("[%s] Disconnected from %s\n", s.Transport.Address(), peerAddr)
+	fmt.Printf("[%s] Disconnected from %s\n", s.Transport.Address(), short(nodeID))
 
 	if s.DB != nil {
 		now := time.Now()
 		if err := s.DB.UpsertPeer(context.Background(), dbpkg.Peer{
-			ID:       peerAddr,
+			NodeID:   nodeID,
 			Address:  peerAddr,
-			NodeID:   p.ID(),
+			Addrs:    advertisedAddrs(p),
 			Status:   "disconnected",
 			LastSeen: &now,
 		}); err != nil {
@@ -168,15 +192,15 @@ func (s *FileServer) OnPeerDisconnect(p p2p.Peer) {
 
 // announceTo sends this node's peer list to a newly connected peer, retrying
 // briefly while the connection settles.
-func (s *FileServer) announceTo(peerAddr string) {
+func (s *FileServer) announceTo(nodeID string) {
 	const attempts = 5
 
 	for i := range attempts {
-		if err := s.sendPeerExchange(peerAddr); err == nil {
+		if err := s.sendPeerExchange(nodeID); err == nil {
 			return
 		} else {
 			fmt.Printf("[%s] Error sending peer exchange to %s: %v (attempt %d/%d)\n",
-				s.Transport.Address(), peerAddr, err, i+1, attempts)
+				s.Transport.Address(), short(nodeID), err, i+1, attempts)
 		}
 
 		select {
