@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -507,7 +508,7 @@ func TestSharesCannotOutliveTheirFile(t *testing.T) {
 		t.Fatalf("InsertShare: %v", err)
 	}
 
-	if _, _, err := d.DeleteFileByName(ctx, "hello"); err != nil {
+	if _, _, err := d.DeleteFileByName(ctx, "hello", ""); err != nil {
 		t.Fatalf("DeleteFileByName: %v", err)
 	}
 
@@ -586,7 +587,7 @@ func TestDeleteFileByNameReportsWhenContentsAreOrphaned(t *testing.T) {
 		}
 	}
 
-	hash, orphaned, err := d.DeleteFileByName(ctx, "goner")
+	hash, orphaned, err := d.DeleteFileByName(ctx, "goner", "")
 	if err != nil {
 		t.Fatalf("DeleteFileByName: %v", err)
 	}
@@ -597,7 +598,7 @@ func TestDeleteFileByNameReportsWhenContentsAreOrphaned(t *testing.T) {
 		t.Error("contents reported orphaned while another name still refers to them")
 	}
 
-	hash, orphaned, err = d.DeleteFileByName(ctx, "keeper")
+	hash, orphaned, err = d.DeleteFileByName(ctx, "keeper", "")
 	if err != nil {
 		t.Fatalf("DeleteFileByName: %v", err)
 	}
@@ -612,7 +613,7 @@ func TestDeleteFileByNameReportsWhenContentsAreOrphaned(t *testing.T) {
 func TestDeleteFileByNameForUnknownName(t *testing.T) {
 	d := newTestDB(t)
 
-	hash, orphaned, err := d.DeleteFileByName(context.Background(), "never-stored")
+	hash, orphaned, err := d.DeleteFileByName(context.Background(), "never-stored", "")
 	if err != nil {
 		t.Fatalf("DeleteFileByName: %v", err)
 	}
@@ -762,5 +763,82 @@ func TestGetActivePeersExemptsLoopback(t *testing.T) {
 	}
 	if len(peers) != 6 {
 		t.Errorf("got %d loopback peers, want all 6: the limit must not apply locally", len(peers))
+	}
+}
+
+// TestConcurrentKeyCreationAgreesOnOneKey is a regression test. A plain
+// check-then-write let two processes sharing a database each mint an
+// encryption key and overwrite the other's, which silently made every file
+// encrypted under the loser undecryptable.
+func TestConcurrentKeyCreationAgreesOnOneKey(t *testing.T) {
+	d := newTestDB(t)
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	keys := make([][]byte, 2)
+	start := make(chan struct{})
+
+	for i := range 2 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			k, err := d.GetOrCreateDefaultKey(ctx, func() ([]byte, error) {
+				return bytes.Repeat([]byte{byte(i + 1)}, 32), nil
+			})
+			if err != nil {
+				t.Errorf("GetOrCreateDefaultKey: %v", err)
+				return
+			}
+			keys[i] = k
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	if !bytes.Equal(keys[0], keys[1]) {
+		t.Fatalf("two callers got different keys: %x vs %x -- the loser's files are now undecryptable", keys[0][:4], keys[1][:4])
+	}
+
+	// And the key that was handed out must be the one actually stored.
+	stored, err := d.GetKey(ctx, "default")
+	if err != nil {
+		t.Fatalf("GetKey: %v", err)
+	}
+	if !bytes.Equal(stored.KeyBytes, keys[0]) {
+		t.Errorf("the stored key %x is not the one callers received %x", stored.KeyBytes[:4], keys[0][:4])
+	}
+}
+
+// TestConcurrentNodeIDCreationAgreesOnOneID covers the same race on identity,
+// which peers remember and use to recognise a connection back to a node.
+func TestConcurrentNodeIDCreationAgreesOnOneID(t *testing.T) {
+	d := newTestDB(t)
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	ids := make([]string, 2)
+	start := make(chan struct{})
+
+	for i := range 2 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			id, err := d.GetOrCreateNodeID(ctx, func() (string, error) {
+				return []string{"aaaa", "bbbb"}[i], nil
+			})
+			if err != nil {
+				t.Errorf("GetOrCreateNodeID: %v", err)
+				return
+			}
+			ids[i] = id
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	if ids[0] != ids[1] {
+		t.Fatalf("two callers got different node ids: %q vs %q", ids[0], ids[1])
 	}
 }
