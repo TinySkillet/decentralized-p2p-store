@@ -113,7 +113,9 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 			return
 		}
 
-		rpc.From = peer.RemoteAddr().String()
+		// Identity, not address: a node keeps its identity as it moves between
+		// networks, and some transports have no stable address per peer at all.
+		rpc.From = peer.NodeID
 
 		if rpc.Stream {
 			peer.wg.Add(1)
@@ -155,6 +157,20 @@ type TCPPeer struct {
 
 // ID returns the peer's node identifier.
 func (p *TCPPeer) ID() string { return p.NodeID }
+
+// RemoteHost implements Located. It is the host the connection arrived from,
+// which is what the per-host admission limit counts against.
+func (p *TCPPeer) RemoteHost() string { return p.ObservedHost() }
+
+// AdvertisedAddrs implements Located. A TCP peer has exactly one: the host the
+// connection came from paired with the port it advertised.
+func (p *TCPPeer) AdvertisedAddrs() []string {
+	addr := p.RemoteAddr().String()
+	if addr == "" {
+		return nil
+	}
+	return []string{addr}
+}
 
 // ObservedHost returns the host half of the address this connection came
 // from. The handshake pairs it with the port the peer advertises.

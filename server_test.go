@@ -71,8 +71,15 @@ func newTestNodeAt(t *testing.T, addr string, bootstrap ...string) *testNode {
 
 func buildTestNode(t *testing.T, addr string, cfg nodeConfig, bootstrap ...string) *testNode {
 	t.Helper()
+	return buildTestNodeWithDB(t, filepath.Join(t.TempDir(), "p2p.db"), addr, cfg, bootstrap...)
+}
 
-	d, err := dbpkg.Open(filepath.Join(t.TempDir(), "p2p.db"))
+// buildTestNodeWithDB starts a node against a specific database, so a test can
+// restart a node and have it keep the identity stored there.
+func buildTestNodeWithDB(t *testing.T, dbPath, addr string, cfg nodeConfig, bootstrap ...string) *testNode {
+	t.Helper()
+
+	d, err := dbpkg.Open(dbPath)
 	if err != nil {
 		t.Fatalf("opening database: %v", err)
 	}
@@ -438,15 +445,17 @@ func TestGossipDiscoversIndirectPeers(t *testing.T) {
 		return third.peerCount() >= 2
 	})
 
-	_, addrs := third.connectedPeers()
+	// Compared by identity rather than address: that is what the peer set is
+	// keyed by, and it stays correct however the peer is reached.
+	_, ids := third.connectedPeers()
 	found := false
-	for _, a := range addrs {
-		if a == second.addr {
+	for _, id := range ids {
+		if id == second.NodeID() {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("connected peers = %v, want one of them to be %s", addrs, second.addr)
+		t.Errorf("connected peers = %v, want one of them to be %s", ids, second.NodeID())
 	}
 }
 
@@ -550,7 +559,6 @@ func TestConcurrentStoresFromOneNode(t *testing.T) {
 // countingPeer records each write separately, so a test can tell one frame
 // written whole from a frame assembled by several writes.
 type countingPeer struct {
-	net.Conn
 	mu        sync.Mutex
 	writeLock sync.Mutex
 	writes    [][]byte
@@ -713,5 +721,51 @@ func TestHandleStreamWithoutAnnouncementReleasesConnection(t *testing.T) {
 	case <-released:
 	case <-time.After(5 * time.Second):
 		t.Fatal("handleStream did not return; the peer connection would be wedged")
+	}
+}
+
+// TestPeerRecognisedAfterRestartOnANewAddress is the property that keying peers
+// by identity buys, and it could not even be expressed before: a node that
+// restarts somewhere else is the same peer, not a new one.
+//
+// Previously the peer set was keyed by address, so the same node reappearing on
+// a different port was indistinguishable from a stranger, and the old entry
+// lingered as a peer that would never answer again.
+func TestPeerRecognisedAfterRestartOnANewAddress(t *testing.T) {
+	observer := newQuietNode(t)
+
+	// One database, two incarnations at different addresses.
+	dbPath := filepath.Join(t.TempDir(), "restarting.db")
+
+	first := buildTestNodeWithDB(t, dbPath, freeAddr(t),
+		nodeConfig{repairInterval: -1, sweepInterval: -1}, observer.addr)
+	waitForPeerCount(t, observer, 1)
+
+	identity := first.NodeID()
+
+	first.Stop()
+	waitFor(t, "the observer to notice the peer left", 10*time.Second, func() bool {
+		return observer.peerCount() == 0
+	})
+
+	second := buildTestNodeWithDB(t, dbPath, freeAddr(t),
+		nodeConfig{repairInterval: -1, sweepInterval: -1}, observer.addr)
+	waitForPeerCount(t, observer, 1)
+
+	if second.addr == first.addr {
+		t.Fatal("both incarnations bound the same address; the test proves nothing")
+	}
+	if second.NodeID() != identity {
+		t.Fatalf("identity changed across restart: %s then %s", short(identity), short(second.NodeID()))
+	}
+
+	// The observer must hold exactly one peer, under the identity it already
+	// knew — not a second entry for the new address.
+	_, ids := observer.connectedPeers()
+	if len(ids) != 1 {
+		t.Fatalf("observer holds %d peers, want 1: the restart looked like a new node", len(ids))
+	}
+	if ids[0] != identity {
+		t.Errorf("peer recorded as %s, want the identity it kept %s", short(ids[0]), short(identity))
 	}
 }

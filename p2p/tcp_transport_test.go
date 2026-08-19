@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -17,7 +18,10 @@ func newTestTransport(t *testing.T, opts TCPTransportOpts) *TCPTransport {
 
 	opts.ListenAddr = "127.0.0.1:0"
 	if opts.HandshakeFunc == nil {
-		opts.HandshakeFunc = NOPHandshakeFunc
+		// RPC.From carries the peer's identity, which only a handshake can
+		// establish, so the default here assigns one rather than leaving
+		// every peer anonymous.
+		opts.HandshakeFunc = assignTestIdentity
 	}
 	if opts.Decoder == nil {
 		opts.Decoder = DefaultDecoder{}
@@ -30,6 +34,19 @@ func newTestTransport(t *testing.T, opts TCPTransportOpts) *TCPTransport {
 	t.Cleanup(func() { tr.Close() })
 	return tr
 }
+
+// assignTestIdentity is a handshake that gives the peer a unique identity
+// without exchanging anything, standing in for the real one.
+func assignTestIdentity(p any) error {
+	peer, ok := p.(*TCPPeer)
+	if !ok {
+		return fmt.Errorf("unexpected peer type %T", p)
+	}
+	peer.NodeID = fmt.Sprintf("test-node-%d", atomic.AddInt64(&testIdentityCounter, 1))
+	return nil
+}
+
+var testIdentityCounter int64
 
 // recvRPC waits for one RPC or fails the test.
 func recvRPC(t *testing.T, tr *TCPTransport) RPC {
@@ -113,8 +130,10 @@ func TestTransportMessageRoundTrip(t *testing.T) {
 	if !bytes.Equal(rpc.Payload, body) {
 		t.Errorf("Payload = %q, want %q", rpc.Payload, body)
 	}
+	// From is the sender's identity, not its address: a node keeps its
+	// identity as it moves between networks.
 	if rpc.From == "" {
-		t.Error("RPC.From is empty")
+		t.Error("RPC.From is empty, so the receiver cannot tell who sent this")
 	}
 }
 
@@ -334,5 +353,35 @@ func TestSendStreamIsIndivisible(t *testing.T) {
 
 	if len(seen) != transfers {
 		t.Errorf("recovered %d transfers, want %d", len(seen), transfers)
+	}
+}
+
+// TestPeerInterfacesAreSatisfied pins the shape of the transport contract.
+//
+// Peer is deliberately not a net.Conn: a libp2p stream has Read, Write, Close
+// and deadlines but no addresses, and requiring them would exclude it. Located
+// carries addressing separately, for the per-host admission limit that is the
+// one place genuinely needing it.
+func TestPeerInterfacesAreSatisfied(t *testing.T) {
+	var _ Peer = (*TCPPeer)(nil)
+	var _ Located = (*TCPPeer)(nil)
+}
+
+func TestTCPPeerReportsItsLocation(t *testing.T) {
+	receiver := newTestTransport(t, TCPTransportOpts{})
+	sender := newTestTransport(t, TCPTransportOpts{})
+
+	peer := dialPeer(t, sender, receiver.BoundAddr())
+
+	located, ok := peer.(Located)
+	if !ok {
+		t.Fatal("a TCP peer does not implement Located")
+	}
+	if host := located.RemoteHost(); host == "" {
+		t.Error("RemoteHost is empty for a peer on a real socket")
+	}
+	addrs := located.AdvertisedAddrs()
+	if len(addrs) != 1 || addrs[0] == "" {
+		t.Errorf("AdvertisedAddrs = %v, want exactly one usable address", addrs)
 	}
 }
