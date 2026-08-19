@@ -7,10 +7,52 @@ SQLite-backed metadata, and optional `systemd` service support.
 
 - Peer discovery via gossip between connected nodes
 - File replication to the peers a node is connected to
+- Content-addressed storage: files are identified by the SHA-256 of their
+  contents, so identical bytes are stored once however many names refer to them
 - AES-256-CTR encryption of files at rest
 - SQLite-backed metadata storage
 - CLI commands for serving, storing, fetching, listing, deleting, and inspecting peers
 - Optional `systemd` service installation
+
+## Protocol
+
+Every connection opens with a handshake carrying a protocol version, the
+node's identity, and the port it listens on. A version mismatch ends the
+connection rather than letting two builds misread each other's frames. The
+receiving node pairs the advertised port with the address the connection
+actually arrived from, so a node configured with a bare `:3000` is still
+recorded at an address its peers can reach. Identity is what lets a node
+recognise a connection back to itself, which gossip eventually produces.
+
+After the handshake, each frame begins with a tag: a length-prefixed message,
+or a file body. A fetch runs in two rounds:
+
+1. The requester asks every peer whether it holds a name, tagging the question
+   with a request id.
+2. Every peer answers either way, resolving the name to the digest of the
+   contents it holds for it. A name nobody holds therefore fails as soon as
+   the last peer has spoken, rather than waiting out a timeout.
+3. Exactly one peer that answered yes is asked for those contents, by digest.
+   Only that peer streams, so the same bytes do not arrive several times over.
+4. The announcement and the file body are written as one indivisible transfer.
+   The receiver hashes the bytes as they arrive and only moves the file into
+   place if it matches the digest that was asked for, so data that fails
+   verification never becomes readable.
+
+Because the second round names a digest rather than a file, the reply is
+self-verifying: a peer cannot substitute different contents for the ones that
+were requested.
+
+## Storage layout
+
+A file's identity is the SHA-256 of its plaintext. That digest is sharded into
+nested directories, so a digest of `a1b2c3d4e5...` is stored at
+`ROOT/a1b2c/3d4e5/a1b2c3d4e5...`. Spreading files across many directories
+keeps any single one small enough for fast lookups.
+
+Because the path follows the contents, storing the same bytes under two names
+writes one file. The database maps each name to the digest it refers to, and
+the bytes are removed only when the last name pointing at them is deleted.
 
 ## Current limitations
 
@@ -19,16 +61,19 @@ The project is a work in progress. What it does not yet do:
 - **Files travel between peers in plaintext.** Encryption is applied at rest
   only, and each node holds its own key in the SQLite database beside the data
   it protects.
-- **Peers are not authenticated.** Any node that can connect may store files
-  or broadcast a deletion.
-- **Transfers are not integrity checked.** A short transfer is detected by its
-  announced length, but contents are not verified against a digest.
+- **Peers are not authenticated.** Any node that can complete the handshake
+  may store files or broadcast a deletion. Contents cannot be substituted, as
+  a fetch is verified against the digest it asked for, but a peer can still
+  answer an availability query with a digest for contents nobody asked for.
+  The system assumes the out-of-band trust of a private group: joining
+  requires knowing a bootstrap address, and the number of identities accepted
+  from any one host is capped so a single machine cannot flood the peer table.
+  Loopback is exempt, so several nodes can share a machine for local testing.
 - **Replication has no target factor and no repair.** A file goes to whichever
   peers happen to be connected when it is stored; nothing re-replicates it if
   those peers later leave.
-- **Nodes advertise the address given to `--listen`.** A port-only value such
-  as `:3000` is not routable from another machine, so discovery across hosts
-  needs an explicit `host:port`.
+- **NAT is not handled.** A node behind NAT advertises a port that may not be
+  reachable from outside its network.
 
 ## Build
 
@@ -45,10 +90,10 @@ make check          # gofmt, go vet, then the race suite
 ```
 
 The suite covers the storage layer, the crypto helpers, the SQLite repository,
-the TCP transport and frame decoder, and a set of multi-node tests that bring
-several real nodes up on loopback ports to exercise store, fetch, delete and
-gossip end to end. The transport and server are concurrent throughout, so
-`make test-race` is the run that matters.
+the TCP transport and frame decoder, the handshake and fetch protocol, and a
+set of multi-node tests that bring several real nodes up on loopback ports to
+exercise store, fetch, delete and gossip end to end. The transport and server
+are concurrent throughout, so `make test-race` is the run that matters.
 
 ## CLI
 

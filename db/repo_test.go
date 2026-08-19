@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -350,6 +351,10 @@ func TestInsertShareIsIdempotent(t *testing.T) {
 	d := newTestDB(t)
 	ctx := context.Background()
 
+	if err := d.InsertFileWithKey(ctx, File{ID: "f1", Name: "hello", Hash: "h", Size: 5, LocalPath: "/a"}, "default"); err != nil {
+		t.Fatalf("InsertFileWithKey: %v", err)
+	}
+
 	// Share IDs are derived from file, peer and direction, so re-sharing the
 	// same file to the same peer must not accumulate duplicate rows.
 	s := Share{ID: "s1", FileID: "f1", PeerID: ":4000", Direction: "outgoing"}
@@ -480,5 +485,282 @@ func TestGetOrCreateDefaultKeyDoesNotRekeyOnDatabaseError(t *testing.T) {
 	}
 	if generated {
 		t.Error("a database fault caused a new key to be generated, orphaning stored files")
+	}
+}
+
+// TestSharesCannotOutliveTheirFile covers the foreign key: a replication
+// record must not exist for a file that is not there.
+func TestSharesCannotOutliveTheirFile(t *testing.T) {
+	d := newTestDB(t)
+	ctx := context.Background()
+
+	err := d.InsertShare(ctx, Share{ID: "orphan", FileID: "no-such-file", PeerID: ":4000", Direction: "outgoing"})
+	if err == nil {
+		t.Fatal("a share was inserted for a file that does not exist")
+	}
+
+	// And a share must disappear with the file it describes.
+	if err := d.InsertFileWithKey(ctx, File{ID: "f1", Name: "hello", Hash: "h", Size: 5, LocalPath: "/a"}, "default"); err != nil {
+		t.Fatalf("InsertFileWithKey: %v", err)
+	}
+	if err := d.InsertShare(ctx, Share{ID: "s1", FileID: "f1", PeerID: ":4000", Direction: "outgoing"}); err != nil {
+		t.Fatalf("InsertShare: %v", err)
+	}
+
+	if _, _, err := d.DeleteFileByName(ctx, "hello"); err != nil {
+		t.Fatalf("DeleteFileByName: %v", err)
+	}
+
+	shares, err := d.ListShares(ctx)
+	if err != nil {
+		t.Fatalf("ListShares: %v", err)
+	}
+	if len(shares) != 0 {
+		t.Errorf("%d share(s) survived the file they describe, want 0", len(shares))
+	}
+}
+
+func TestFindFileByName(t *testing.T) {
+	d := newTestDB(t)
+	ctx := context.Background()
+
+	if err := d.InsertFileWithKey(ctx, File{ID: "id1", Name: "report.pdf", Hash: "digest1", Size: 42, LocalPath: "/a"}, "default"); err != nil {
+		t.Fatalf("InsertFileWithKey: %v", err)
+	}
+
+	found, err := d.FindFileByName(ctx, "report.pdf")
+	if err != nil {
+		t.Fatalf("FindFileByName: %v", err)
+	}
+	if found == nil {
+		t.Fatal("FindFileByName returned nil for a stored name")
+	}
+	if found.Hash != "digest1" {
+		t.Errorf("Hash = %q, want the content digest it maps to", found.Hash)
+	}
+
+	missing, err := d.FindFileByName(ctx, "absent.pdf")
+	if err != nil {
+		t.Fatalf("FindFileByName: %v", err)
+	}
+	if missing != nil {
+		t.Errorf("FindFileByName for an unknown name = %+v, want nil", missing)
+	}
+}
+
+// TestSeveralNamesShareOneHash is the metadata half of deduplication: the
+// same contents stored under different names are separate rows pointing at
+// one hash.
+func TestSeveralNamesShareOneHash(t *testing.T) {
+	d := newTestDB(t)
+	ctx := context.Background()
+
+	for _, name := range []string{"first", "second", "third"} {
+		if err := d.InsertFileWithKey(ctx, File{
+			ID: name, Name: name, Hash: "shared-digest", Size: 10, LocalPath: "/blob",
+		}, "default"); err != nil {
+			t.Fatalf("InsertFileWithKey %s: %v", name, err)
+		}
+	}
+
+	n, err := d.CountNamesForHash(ctx, "shared-digest")
+	if err != nil {
+		t.Fatalf("CountNamesForHash: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("CountNamesForHash = %d, want 3", n)
+	}
+}
+
+// TestDeleteFileByNameReportsWhenContentsAreOrphaned drives the decision of
+// whether the bytes on disk may be removed.
+func TestDeleteFileByNameReportsWhenContentsAreOrphaned(t *testing.T) {
+	d := newTestDB(t)
+	ctx := context.Background()
+
+	for _, name := range []string{"keeper", "goner"} {
+		if err := d.InsertFileWithKey(ctx, File{
+			ID: name, Name: name, Hash: "shared-digest", Size: 10, LocalPath: "/blob",
+		}, "default"); err != nil {
+			t.Fatalf("InsertFileWithKey %s: %v", name, err)
+		}
+	}
+
+	hash, orphaned, err := d.DeleteFileByName(ctx, "goner")
+	if err != nil {
+		t.Fatalf("DeleteFileByName: %v", err)
+	}
+	if hash != "shared-digest" {
+		t.Errorf("hash = %q, want shared-digest", hash)
+	}
+	if orphaned {
+		t.Error("contents reported orphaned while another name still refers to them")
+	}
+
+	hash, orphaned, err = d.DeleteFileByName(ctx, "keeper")
+	if err != nil {
+		t.Fatalf("DeleteFileByName: %v", err)
+	}
+	if !orphaned {
+		t.Error("contents not reported orphaned after the last name was removed")
+	}
+	if hash != "shared-digest" {
+		t.Errorf("hash = %q, want shared-digest", hash)
+	}
+}
+
+func TestDeleteFileByNameForUnknownName(t *testing.T) {
+	d := newTestDB(t)
+
+	hash, orphaned, err := d.DeleteFileByName(context.Background(), "never-stored")
+	if err != nil {
+		t.Fatalf("DeleteFileByName: %v", err)
+	}
+	if hash != "" || orphaned {
+		t.Errorf("got hash %q orphaned %v, want empty and false", hash, orphaned)
+	}
+}
+
+func TestHostOf(t *testing.T) {
+	cases := map[string]string{
+		"127.0.0.1:3000":   "127.0.0.1",
+		"10.0.0.5:44000":   "10.0.0.5",
+		"[::1]:3000":       "::1",
+		"example.com:3000": "example.com",
+		"10.0.0.5":         "10.0.0.5",
+		"":                 "",
+	}
+	for addr, want := range cases {
+		if got := HostOf(addr); got != want {
+			t.Errorf("HostOf(%q) = %q, want %q", addr, got, want)
+		}
+	}
+}
+
+func TestIsLoopbackHost(t *testing.T) {
+	for _, host := range []string{"127.0.0.1", "::1", "localhost"} {
+		if !IsLoopbackHost(host) {
+			t.Errorf("IsLoopbackHost(%q) = false, want true", host)
+		}
+	}
+	for _, host := range []string{"10.0.0.5", "example.com", ""} {
+		if IsLoopbackHost(host) {
+			t.Errorf("IsLoopbackHost(%q) = true, want false", host)
+		}
+	}
+}
+
+func TestCountActivePeersForHost(t *testing.T) {
+	d := newTestDB(t)
+	ctx := context.Background()
+	now := time.Now()
+	stale := time.Now().Add(-2 * time.Hour)
+
+	peers := []Peer{
+		{ID: "a", Address: "10.0.0.5:3000", NodeID: "n1", Status: "connected", LastSeen: &now},
+		{ID: "b", Address: "10.0.0.5:3001", NodeID: "n2", Status: "connected", LastSeen: &now},
+		{ID: "c", Address: "10.0.0.6:3000", NodeID: "n3", Status: "connected", LastSeen: &now},
+		{ID: "d", Address: "10.0.0.5:3002", NodeID: "n4", Status: "connected", LastSeen: &stale},
+	}
+	for _, p := range peers {
+		if err := d.UpsertPeer(ctx, p); err != nil {
+			t.Fatalf("UpsertPeer: %v", err)
+		}
+	}
+
+	n, err := d.CountActivePeersForHost(ctx, "10.0.0.5", time.Hour)
+	if err != nil {
+		t.Fatalf("CountActivePeersForHost: %v", err)
+	}
+	// The stale identity is not counted.
+	if n != 2 {
+		t.Errorf("count for 10.0.0.5 = %d, want 2", n)
+	}
+
+	if n, err = d.CountActivePeersForHost(ctx, "10.0.0.7", time.Hour); err != nil {
+		t.Fatalf("CountActivePeersForHost: %v", err)
+	} else if n != 0 {
+		t.Errorf("count for an unseen host = %d, want 0", n)
+	}
+}
+
+// TestGetActivePeersLimitsIdentitiesPerHost is the filtering §4.8.1 calls for:
+// one machine must not be able to crowd the peer list this node gossips on.
+func TestGetActivePeersLimitsIdentitiesPerHost(t *testing.T) {
+	d := newTestDB(t)
+	ctx := context.Background()
+
+	// One host claiming many identities, plus a couple of genuine peers.
+	base := time.Now()
+	for i := range 10 {
+		seen := base.Add(-time.Duration(i) * time.Second)
+		if err := d.UpsertPeer(ctx, Peer{
+			ID:       fmt.Sprintf("sybil-%d", i),
+			Address:  fmt.Sprintf("10.0.0.5:%d", 3000+i),
+			NodeID:   fmt.Sprintf("sybil-node-%d", i),
+			Status:   "connected",
+			LastSeen: &seen,
+		}); err != nil {
+			t.Fatalf("UpsertPeer: %v", err)
+		}
+	}
+	for i := range 2 {
+		seen := base.Add(-time.Duration(i) * time.Second)
+		if err := d.UpsertPeer(ctx, Peer{
+			ID:       fmt.Sprintf("real-%d", i),
+			Address:  fmt.Sprintf("10.0.0.%d:3000", 20+i),
+			NodeID:   fmt.Sprintf("real-node-%d", i),
+			Status:   "connected",
+			LastSeen: &seen,
+		}); err != nil {
+			t.Fatalf("UpsertPeer: %v", err)
+		}
+	}
+
+	peers, err := d.getActivePeers(ctx, time.Hour, 100, 3)
+	if err != nil {
+		t.Fatalf("GetActivePeers: %v", err)
+	}
+
+	perHost := map[string]int{}
+	for _, p := range peers {
+		perHost[HostOf(p.Address)]++
+	}
+
+	if perHost["10.0.0.5"] > 3 {
+		t.Errorf("one host contributed %d peers, want at most 3", perHost["10.0.0.5"])
+	}
+	// The genuine peers must survive the filtering.
+	if perHost["10.0.0.20"] != 1 || perHost["10.0.0.21"] != 1 {
+		t.Errorf("legitimate peers were filtered out: %v", perHost)
+	}
+}
+
+// TestGetActivePeersExemptsLoopback keeps the documented local testing setup
+// working, where several nodes share one machine.
+func TestGetActivePeersExemptsLoopback(t *testing.T) {
+	d := newTestDB(t)
+	ctx := context.Background()
+
+	base := time.Now()
+	for i := range 6 {
+		seen := base.Add(-time.Duration(i) * time.Second)
+		if err := d.UpsertPeer(ctx, Peer{
+			ID:       fmt.Sprintf("local-%d", i),
+			Address:  fmt.Sprintf("127.0.0.1:%d", 3000+i),
+			NodeID:   fmt.Sprintf("local-node-%d", i),
+			Status:   "connected",
+			LastSeen: &seen,
+		}); err != nil {
+			t.Fatalf("UpsertPeer: %v", err)
+		}
+	}
+
+	peers, err := d.getActivePeers(ctx, time.Hour, 100, 3)
+	if err != nil {
+		t.Fatalf("GetActivePeers: %v", err)
+	}
+	if len(peers) != 6 {
+		t.Errorf("got %d loopback peers, want all 6: the limit must not apply locally", len(peers))
 	}
 }

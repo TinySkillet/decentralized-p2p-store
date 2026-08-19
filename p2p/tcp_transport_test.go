@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -226,5 +228,111 @@ func TestTransportHandshakeFailureDropsConnection(t *testing.T) {
 	case <-onPeerCalled:
 		t.Fatal("OnPeer fired even though the handshake failed")
 	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// recordingConn captures everything written to it, in order.
+type recordingConn struct {
+	net.Conn
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (c *recordingConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Write(b)
+}
+
+func (c *recordingConn) bytes() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]byte(nil), c.buf.Bytes()...)
+}
+
+// chunkReader hands out data a few bytes at a time, the way a network read
+// does, so a copy loop issues many writes instead of one.
+type chunkReader struct {
+	data  []byte
+	chunk int
+}
+
+func (r *chunkReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := min(min(r.chunk, len(p)), len(r.data))
+	copy(p, r.data[:n])
+	r.data = r.data[n:]
+	return n, nil
+}
+
+// TestSendStreamIsIndivisible is a regression test. A transfer is an
+// announcement followed by a file body. Sending them as separate writes let a
+// concurrent transfer interleave between the two, and the receiver then
+// paired one file's announcement with another file's bytes.
+func TestSendStreamIsIndivisible(t *testing.T) {
+	conn := &recordingConn{}
+	peer := NewTCPPeer(conn, true)
+
+	const transfers = 6
+	const bodyLen = 2048
+
+	var wg sync.WaitGroup
+	for i := range transfers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			header := []byte{'H', byte('0' + i)}
+			body := bytes.Repeat([]byte{byte('a' + i)}, bodyLen)
+
+			// Small chunks widen the window an unsynchronised implementation
+			// would interleave in.
+			if _, err := peer.SendStream(header, &chunkReader{data: body, chunk: 16}); err != nil {
+				t.Errorf("SendStream: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// The connection must read back as a sequence of whole transfers.
+	out := conn.bytes()
+	if want := transfers * (2 + 1 + bodyLen); len(out) != want {
+		t.Fatalf("wrote %d bytes, want %d", len(out), want)
+	}
+
+	seen := make(map[byte]bool)
+	for len(out) > 0 {
+		if len(out) < 3 {
+			t.Fatalf("trailing %d bytes do not form a transfer header", len(out))
+		}
+		if out[0] != 'H' {
+			t.Fatalf("expected a transfer header, found %q: transfers interleaved", out[0])
+		}
+
+		id := out[1]
+		if out[2] != IncomingStream {
+			t.Fatalf("transfer %q: expected the stream tag after the header, found 0x%02x: transfers interleaved", id, out[2])
+		}
+		if seen[id] {
+			t.Fatalf("transfer %q appears twice: transfers interleaved", id)
+		}
+		seen[id] = true
+
+		body := out[3:]
+		if len(body) < bodyLen {
+			t.Fatalf("transfer %q: only %d body bytes remain, want %d", id, len(body), bodyLen)
+		}
+		want := bytes.Repeat([]byte{'a' + (id - '0')}, bodyLen)
+		if !bytes.Equal(body[:bodyLen], want) {
+			t.Fatalf("transfer %q: body does not match its header: transfers interleaved", id)
+		}
+
+		out = body[bodyLen:]
+	}
+
+	if len(seen) != transfers {
+		t.Errorf("recovered %d transfers, want %d", len(seen), transfers)
 	}
 }

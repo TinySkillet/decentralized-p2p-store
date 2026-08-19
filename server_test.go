@@ -41,6 +41,23 @@ type testNode struct {
 
 func newTestNode(t *testing.T, bootstrap ...string) *testNode {
 	t.Helper()
+	return newTestNodeAt(t, freeAddr(t), bootstrap...)
+}
+
+// portOf returns the port half of a host:port pair.
+func portOf(t *testing.T, addr string) string {
+	t.Helper()
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("splitting %q: %v", addr, err)
+	}
+	return port
+}
+
+// newTestNodeAt starts a node on a specific listen address, so a test can
+// choose how the node is configured to advertise itself.
+func newTestNodeAt(t *testing.T, addr string, bootstrap ...string) *testNode {
+	t.Helper()
 
 	d, err := dbpkg.Open(filepath.Join(t.TempDir(), "p2p.db"))
 	if err != nil {
@@ -50,7 +67,6 @@ func newTestNode(t *testing.T, bootstrap ...string) *testNode {
 		t.Fatalf("Migrate: %v", err)
 	}
 
-	addr := freeAddr(t)
 	s, err := makeServerWithDB(addr, d, bootstrap...)
 	if err != nil {
 		t.Fatalf("makeServerWithDB: %v", err)
@@ -163,8 +179,8 @@ func TestStoreReplicatesToPeer(t *testing.T) {
 		t.Fatalf("Store: %v", err)
 	}
 
-	// Replicas are stored under the key's hash.
-	hash := hashKey("shared")
+	// Replicas are stored under the digest of their contents.
+	hash := contentKey(payload)
 	waitFor(t, "the replica to receive the file", 10*time.Second, func() bool {
 		return replica.store.Has(hash)
 	})
@@ -259,7 +275,7 @@ func TestGetWithMultipleRespondersSucceeds(t *testing.T) {
 		t.Fatalf("Store: %v", err)
 	}
 
-	hash := hashKey("contested")
+	hash := contentKey(payload)
 	waitFor(t, "both replicas to receive the file", 10*time.Second, func() bool {
 		return replicaA.store.Has(hash) && replicaB.store.Has(hash)
 	})
@@ -286,7 +302,7 @@ func TestGetWithMultipleRespondersSucceeds(t *testing.T) {
 	}
 }
 
-func TestGetMissingKeyTimesOut(t *testing.T) {
+func TestGetWithNoPeersFailsImmediately(t *testing.T) {
 	node := newTestNode(t)
 
 	start := time.Now()
@@ -296,13 +312,37 @@ func TestGetMissingKeyTimesOut(t *testing.T) {
 	if err == nil {
 		t.Fatal("Get for an unknown key returned nil error")
 	}
-	if !strings.Contains(err.Error(), "timeout") {
-		t.Errorf("error = %v, want a timeout", err)
+	if !strings.Contains(err.Error(), "no peers connected") {
+		t.Errorf("error = %v, want it to say there are no peers", err)
 	}
-	// It must actually wait rather than return instantly, and must not hang
-	// past the documented bound.
-	if elapsed > downloadTimeout+5*time.Second {
-		t.Errorf("Get took %v, well past the %v timeout", elapsed, downloadTimeout)
+	// There is nobody to ask, so there is nothing to wait for.
+	if elapsed > time.Second {
+		t.Errorf("Get took %v with no peers connected, want an immediate failure", elapsed)
+	}
+}
+
+// TestGetNoPeerHasFileFailsFast covers the case where peers are connected but
+// none holds the key. Every peer answers the availability query either way, so
+// the request can fail as soon as the last one has spoken rather than waiting
+// out the download timeout.
+func TestGetNoPeerHasFileFailsFast(t *testing.T) {
+	first := newTestNode(t)
+	second := newTestNode(t, first.addr)
+	waitForPeerCount(t, second, 1)
+	waitForPeerCount(t, first, 1)
+
+	start := time.Now()
+	_, _, err := second.Get("nobody-has-this")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Get for a key no peer holds returned nil error")
+	}
+	if !strings.Contains(err.Error(), "no peer has") {
+		t.Errorf("error = %v, want it to report that no peer holds the key", err)
+	}
+	if elapsed >= downloadTimeout {
+		t.Errorf("Get took %v, want it to fail well before the %v download timeout", elapsed, downloadTimeout)
 	}
 }
 
@@ -313,11 +353,12 @@ func TestDeletePropagatesToPeers(t *testing.T) {
 	waitForPeerCount(t, origin, 1)
 	waitForPeerCount(t, replica, 1)
 
-	if err := origin.Store("doomed", bytes.NewReader([]byte("delete me"))); err != nil {
+	payload := []byte("delete me")
+	if err := origin.Store("doomed", bytes.NewReader(payload)); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 
-	hash := hashKey("doomed")
+	hash := contentKey(payload)
 	waitFor(t, "the replica to receive the file", 10*time.Second, func() bool {
 		return replica.store.Has(hash)
 	})
@@ -442,13 +483,20 @@ func TestConcurrentStoresFromOneNode(t *testing.T) {
 	waitForPeerCount(t, replica, 1)
 
 	// Peer exchange runs on its own goroutine while these stores are in
-	// flight, so the connection carries concurrent writers throughout.
+	// flight, so the connection carries concurrent writers throughout. The
+	// payloads are large enough that each transfer takes many writes, which
+	// is what gives an unsynchronised implementation room to interleave.
 	const files = 8
+	payloads := make([][]byte, files)
+	for i := range files {
+		payloads[i] = randomBytes(t, 256*1024)
+	}
+
 	errs := make(chan error, files)
 	for i := range files {
 		go func(i int) {
 			key := fmt.Sprintf("concurrent-%d", i)
-			errs <- origin.Store(key, bytes.NewReader(randomBytes(t, 2048)))
+			errs <- origin.Store(key, bytes.NewReader(payloads[i]))
 		}(i)
 	}
 	for range files {
@@ -459,7 +507,7 @@ func TestConcurrentStoresFromOneNode(t *testing.T) {
 
 	waitFor(t, "every file to reach the replica", 20*time.Second, func() bool {
 		for i := range files {
-			if !replica.store.Has(hashKey(fmt.Sprintf("concurrent-%d", i))) {
+			if !replica.store.Has(contentKey(payloads[i])) {
 				return false
 			}
 		}
@@ -471,8 +519,9 @@ func TestConcurrentStoresFromOneNode(t *testing.T) {
 // written whole from a frame assembled by several writes.
 type countingPeer struct {
 	net.Conn
-	mu     sync.Mutex
-	writes [][]byte
+	mu        sync.Mutex
+	writeLock sync.Mutex
+	writes    [][]byte
 
 	// body, when set, is what the peer delivers on the stream.
 	body io.Reader
@@ -499,11 +548,24 @@ func (p *countingPeer) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+func (p *countingPeer) SendStream(header []byte, body io.Reader) (int64, error) {
+	p.writeLock.Lock()
+	defer p.writeLock.Unlock()
+
+	p.mu.Lock()
+	p.writes = append(p.writes, append([]byte(nil), header...))
+	p.mu.Unlock()
+
+	return io.Copy(io.Discard, body)
+}
+
 func (p *countingPeer) CloseStream() {}
 
 // Close and RemoteAddr stand in for the embedded net.Conn, which is nil in
 // tests that never put this peer on a real socket.
 func (p *countingPeer) Close() error { return nil }
+
+func (p *countingPeer) ID() string { return "fake-node" }
 
 func (p *countingPeer) RemoteAddr() net.Addr {
 	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
@@ -523,7 +585,7 @@ func (p *countingPeer) writeCount() int {
 func TestSendMessageWritesOneFrame(t *testing.T) {
 	peer := &countingPeer{}
 
-	msg := Message{Payload: MessageStoreFile{Key: "abc", Size: 1234}}
+	msg := Message{Payload: MessageStoreFile{Name: "abc", Digest: contentKey([]byte("abc")), Size: 1234}}
 	if err := sendMessage(peer, &msg); err != nil {
 		t.Fatalf("sendMessage: %v", err)
 	}
@@ -546,8 +608,8 @@ func TestSendMessageWritesOneFrame(t *testing.T) {
 	if !ok {
 		t.Fatalf("payload type = %T, want MessageStoreFile", decoded.Payload)
 	}
-	if store.Key != "abc" || store.Size != 1234 {
-		t.Errorf("payload = %+v, want key abc size 1234", store)
+	if store.Name != "abc" || store.Size != 1234 {
+		t.Errorf("payload = %+v, want name abc size 1234", store)
 	}
 }
 
@@ -556,7 +618,7 @@ func TestSendMessageRejectsOversizedPayload(t *testing.T) {
 
 	// A message the far side would refuse to decode must be rejected here,
 	// rather than written and then killing the connection.
-	msg := Message{Payload: MessageStoreFile{Key: strings.Repeat("k", p2p.MaxMessageSize+1)}}
+	msg := Message{Payload: MessageStoreFile{Name: strings.Repeat("k", p2p.MaxMessageSize+1)}}
 	if err := sendMessage(peer, &msg); err == nil {
 		t.Fatal("an oversized message was sent, want an error")
 	}
@@ -571,8 +633,9 @@ func TestSendMessageRejectsOversizedPayload(t *testing.T) {
 func TestHandleStreamRejectsTruncatedTransfer(t *testing.T) {
 	node := newTestNode(t)
 
-	const announced = 4096
-	delivered := randomBytes(t, 100)
+	full := randomBytes(t, 4096)
+	delivered := full[:100]
+
 	peer := &countingPeer{body: bytes.NewReader(delivered)}
 
 	node.peersLock.Lock()
@@ -580,17 +643,18 @@ func TestHandleStreamRejectsTruncatedTransfer(t *testing.T) {
 	node.peersLock.Unlock()
 
 	node.transferLock.Lock()
-	node.pendingFileTransfers["truncating-peer"] = MessageStoreFile{Key: "short", Size: announced}
+	node.pendingFileTransfers["truncating-peer"] = MessageStoreFile{
+		Name:   "short",
+		Digest: contentKey(full),
+		Size:   int64(len(full)),
+	}
 	node.transferLock.Unlock()
 
 	err := node.handleStream("truncating-peer")
 	if err == nil {
 		t.Fatal("a truncated transfer was accepted")
 	}
-	if !strings.Contains(err.Error(), "truncated") {
-		t.Errorf("error = %v, want it to name the truncation", err)
-	}
-	if node.store.Has("short") {
+	if node.store.Has(contentKey(full)) || node.store.Has(contentKey(delivered)) {
 		t.Error("the truncated file was left in the store")
 	}
 }

@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/sha1"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -21,24 +19,49 @@ const (
 	filePerm os.FileMode = 0o600
 )
 
+// CASPathTransformFunc shards a content digest into a nested directory path.
+//
+// The key is already the hex SHA-256 of the file's contents, so it is split
+// rather than hashed again: a digest of a1b2c3d4e5... becomes
+// ROOT/a1b2c/3d4e5/a1b2c3d4e5..., spreading files across many directories so
+// no single one grows large enough to slow lookups down.
+//
+// Because the path is derived from the contents, two files with identical
+// bytes land on the same path and are stored once, whatever they are named.
 func CASPathTransformFunc(key string) PathKey {
-	hash := sha1.Sum([]byte(key))
-	hashString := hex.EncodeToString(hash[:])
+	const blockSize = 5
 
-	blockSize := 5
-	sliceLen := len(hashString) / blockSize
+	// A key that is not a digest (an unhashed name, in tests or older data)
+	// is hashed first, so every key still produces a valid sharded path.
+	if !isDigest(key) {
+		key = contentKey([]byte(key))
+	}
 
+	sliceLen := len(key) / blockSize
 	paths := make([]string, sliceLen)
-
 	for i := range sliceLen {
 		from, to := i*blockSize, (i+1)*blockSize
-		paths[i] = hashString[from:to]
+		paths[i] = key[from:to]
 	}
 
 	return PathKey{
 		Pathname: filepath.Join(paths...),
-		Filename: hashString,
+		Filename: key,
 	}
+}
+
+// isDigest reports whether key is a hex-encoded SHA-256 digest.
+func isDigest(key string) bool {
+	if len(key) != digestSize {
+		return false
+	}
+	for i := range len(key) {
+		c := key[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Store) Read(key string) (int64, io.ReadCloser, error) {
@@ -54,6 +77,81 @@ func (s *Store) WriteEncrypt(encryptionKey []byte, key string, r io.Reader) (int
 		n, err := copyEncrypt(encryptionKey, r, w)
 		return int64(n), err
 	})
+}
+
+// WriteContent encrypts r to disk and files it under the digest of its own
+// contents, which it returns along with the plaintext size.
+//
+// The digest is only known once the whole stream has been read, so the data
+// is written to a temporary file and moved into place afterwards. Identical
+// contents resolve to the same destination and are therefore stored once.
+func (s *Store) WriteContent(encryptionKey []byte, r io.Reader) (digest string, size int64, err error) {
+	return s.writeContent(encryptionKey, "", r)
+}
+
+// WriteContentExpecting is WriteContent for data received from a peer, which
+// announced in advance what it was about to send.
+//
+// Contents that do not hash to want are rejected before they are moved into
+// place, so a file that fails verification never becomes readable at all.
+func (s *Store) WriteContentExpecting(encryptionKey []byte, want string, r io.Reader) (size int64, err error) {
+	if want == "" {
+		return 0, fmt.Errorf("no digest to verify against")
+	}
+	_, size, err = s.writeContent(encryptionKey, want, r)
+	return size, err
+}
+
+func (s *Store) writeContent(encryptionKey []byte, want string, r io.Reader) (digest string, size int64, err error) {
+	if err := os.MkdirAll(s.Root, dirPerm); err != nil {
+		return "", 0, err
+	}
+
+	tmp, err := os.CreateTemp(s.Root, ".incoming-*")
+	if err != nil {
+		return "", 0, err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		tmp.Close()
+		os.Remove(tmpName)
+	}()
+
+	if err := tmp.Chmod(filePerm); err != nil {
+		return "", 0, err
+	}
+
+	dg := newDigester()
+	written, err := copyEncrypt(encryptionKey, dg.tee(r), tmp)
+	if err != nil {
+		return "", 0, err
+	}
+
+	digest = dg.sum()
+	size = int64(written) - ivSize
+
+	if want != "" && digest != want {
+		return "", 0, fmt.Errorf("content digest %s does not match the announced %s", digest, want)
+	}
+
+	if err := tmp.Sync(); err != nil {
+		return "", 0, err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", 0, err
+	}
+
+	pathKey := s.PathTransformFunc(digest)
+	dir := filepath.Join(s.Root, pathKey.Pathname)
+	if err := os.MkdirAll(dir, dirPerm); err != nil {
+		return "", 0, err
+	}
+
+	if err := os.Rename(tmpName, filepath.Join(s.Root, pathKey.FullPath())); err != nil {
+		return "", 0, err
+	}
+
+	return digest, size, nil
 }
 
 func (s *Store) ReadDecrypt(encryptionKey []byte, key string) (int64, io.Reader, error) {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"strings"
 	"time"
 )
@@ -18,10 +19,18 @@ type Key struct {
 	CreatedAt time.Time
 }
 
+// File maps a name to the content-addressed hash of the bytes stored under
+// it. Several names may share a hash: identical contents are stored once on
+// disk, and each name is a row pointing at the same blob.
 type File struct {
-	ID        string
-	Name      string
-	Hash      string
+	ID   string
+	Name string
+
+	// Hash is the hex SHA-256 of the file's plaintext. It identifies the
+	// contents on disk and on the wire, and is what a peer verifies a
+	// transfer against.
+	Hash string
+
 	Size      int64
 	LocalPath string
 	CreatedAt time.Time
@@ -30,6 +39,7 @@ type File struct {
 type Peer struct {
 	ID       string
 	Address  string
+	NodeID   string
 	Status   string
 	LastSeen *time.Time
 }
@@ -92,6 +102,30 @@ func parseTime(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unrecognised timestamp %q", s)
 }
 
+// HostOf returns the host half of a "host:port" address. An address without a
+// port is treated as a bare host.
+func HostOf(address string) string {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return strings.TrimSpace(address)
+	}
+	return host
+}
+
+// loopbackHosts are exempt from the per-host peer limit. Running several
+// nodes on one machine is a normal development and testing setup, and is the
+// arrangement the local testing instructions describe.
+var loopbackHosts = map[string]bool{
+	"127.0.0.1": true,
+	"::1":       true,
+	"localhost": true,
+}
+
+// IsLoopbackHost reports whether the per-host peer limit should be skipped.
+func IsLoopbackHost(host string) bool {
+	return loopbackHosts[host]
+}
+
 func (d *DB) UpsertPeer(ctx context.Context, p Peer) error {
 	var lastSeen any
 	if p.LastSeen != nil {
@@ -100,16 +134,20 @@ func (d *DB) UpsertPeer(ctx context.Context, p Peer) error {
 
 	// Conflicts can arrive on either unique column, so both are handled.
 	_, err := d.sql.ExecContext(ctx, `
-		INSERT INTO peers(id,address,status,last_seen)
-		VALUES(?,?,?,?)
+		INSERT INTO peers(id,address,node_id,host,status,last_seen)
+		VALUES(?,?,?,?,?,?)
 		ON CONFLICT(address) DO UPDATE SET
+			node_id=excluded.node_id,
+			host=excluded.host,
 			status=excluded.status,
 			last_seen=excluded.last_seen
 		ON CONFLICT(id) DO UPDATE SET
 			address=excluded.address,
+			node_id=excluded.node_id,
+			host=excluded.host,
 			status=excluded.status,
 			last_seen=excluded.last_seen
-	`, p.ID, p.Address, p.Status, lastSeen)
+	`, p.ID, p.Address, p.NodeID, HostOf(p.Address), p.Status, lastSeen)
 	return err
 }
 
@@ -183,19 +221,118 @@ func (d *DB) FindFileByHash(ctx context.Context, hash string) (*File, error) {
 	return &f, nil
 }
 
+// FindFileByName resolves a name to the content it refers to, or nil if this
+// node holds nothing under that name.
+func (d *DB) FindFileByName(ctx context.Context, name string) (*File, error) {
+	row := d.sql.QueryRowContext(ctx, `
+		SELECT id,name,hash,size,local_path,created_at FROM files WHERE name=? LIMIT 1
+	`, name)
+
+	var f File
+	if err := row.Scan(&f.ID, &f.Name, &f.Hash, &f.Size, &f.LocalPath, &f.CreatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &f, nil
+}
+
+// CountNamesForHash reports how many names refer to the given contents.
+//
+// Deduplication means one blob on disk can back several names, so the bytes
+// may only be removed once the last name referring to them has gone.
+func (d *DB) CountNamesForHash(ctx context.Context, hash string) (int, error) {
+	var n int
+	err := d.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM files WHERE hash=?`, hash).Scan(&n)
+	return n, err
+}
+
+// DeleteFileByName removes one name and reports whether the contents it
+// referred to are now unreferenced and safe to remove from disk.
+func (d *DB) DeleteFileByName(ctx context.Context, name string) (hash string, orphaned bool, err error) {
+	tx, err := d.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return "", false, err
+	}
+	defer tx.Rollback()
+
+	var id string
+	err = tx.QueryRowContext(ctx, `SELECT id,hash FROM files WHERE name=? LIMIT 1`, name).Scan(&id, &hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM file_keys WHERE file_id=?`, id); err != nil {
+		return "", false, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM shares WHERE file_id=?`, id); err != nil {
+		return "", false, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM files WHERE id=?`, id); err != nil {
+		return "", false, err
+	}
+
+	var remaining int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM files WHERE hash=?`, hash).Scan(&remaining); err != nil {
+		return "", false, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", false, err
+	}
+
+	return hash, remaining == 0, nil
+}
+
+// CountActivePeersForHost reports how many recently seen peers share an IP.
+//
+// One machine presenting many identities is the shape a Sybil attack takes,
+// so the count is what the per-host admission limit is checked against.
+func (d *DB) CountActivePeersForHost(ctx context.Context, host string, maxAge time.Duration) (int, error) {
+	cutoff := formatTime(time.Now().Add(-maxAge))
+
+	var n int
+	err := d.sql.QueryRowContext(ctx, `
+		SELECT COUNT(DISTINCT node_id) FROM peers
+		WHERE host = ? AND node_id != '' AND last_seen IS NOT NULL AND last_seen > ?
+	`, host, cutoff).Scan(&n)
+	return n, err
+}
+
 // GetActivePeers returns recently active peers for discovery.
+//
+// At most maxPerHost peers are returned for any one IP address, so a single
+// machine cannot crowd out the rest of the network in the peer lists this
+// node gossips onward. Loopback is exempt, because several nodes on one
+// machine is a normal local setup rather than an attack.
 //
 // A row with an unreadable timestamp is skipped rather than failing the whole
 // query: one malformed record should not blind the node to every other peer.
 func (d *DB) GetActivePeers(ctx context.Context, maxAge time.Duration, limit int) ([]Peer, error) {
+	return d.getActivePeers(ctx, maxAge, limit, DefaultMaxPeersPerHost)
+}
+
+// DefaultMaxPeersPerHost bounds how many identities one IP may contribute to
+// the peer list.
+const DefaultMaxPeersPerHost = 3
+
+func (d *DB) getActivePeers(ctx context.Context, maxAge time.Duration, limit, maxPerHost int) ([]Peer, error) {
 	cutoff := formatTime(time.Now().Add(-maxAge))
 	rows, err := d.sql.QueryContext(ctx, `
-		SELECT id, address, status, last_seen
-		FROM peers
-		WHERE last_seen IS NOT NULL AND last_seen > ?
+		SELECT id, address, node_id, status, last_seen FROM (
+			SELECT id, address, node_id, host, status, last_seen,
+			       ROW_NUMBER() OVER (PARTITION BY host ORDER BY last_seen DESC) AS rank_in_host
+			FROM peers
+			WHERE last_seen IS NOT NULL AND last_seen > ?
+		)
+		WHERE rank_in_host <= ? OR host IN ('127.0.0.1', '::1', 'localhost')
 		ORDER BY last_seen DESC
 		LIMIT ?
-	`, cutoff, limit)
+	`, cutoff, maxPerHost, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -206,7 +343,7 @@ func (d *DB) GetActivePeers(ctx context.Context, maxAge time.Duration, limit int
 		var p Peer
 		var lastSeen sql.NullString
 
-		if err := rows.Scan(&p.ID, &p.Address, &p.Status, &lastSeen); err != nil {
+		if err := rows.Scan(&p.ID, &p.Address, &p.NodeID, &p.Status, &lastSeen); err != nil {
 			return nil, err
 		}
 
@@ -387,4 +524,54 @@ func (d *DB) DeleteFile(ctx context.Context, fileID string) error {
 	}
 
 	return tx.Commit()
+}
+
+// GetSetting returns a stored setting, or ok=false if it is not set.
+func (d *DB) GetSetting(ctx context.Context, key string) (string, bool, error) {
+	var value string
+	err := d.sql.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, key).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return value, true, nil
+}
+
+// PutSetting stores a setting, replacing any existing value.
+func (d *DB) PutSetting(ctx context.Context, key, value string) error {
+	_, err := d.sql.ExecContext(ctx, `
+		INSERT INTO settings(key,value) VALUES(?,?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value
+	`, key, value)
+	return err
+}
+
+// nodeIDSetting is the settings key holding this node's identity.
+const nodeIDSetting = "node_id"
+
+// GetOrCreateNodeID returns this node's stable identifier, generating one on
+// first use.
+//
+// Identity has to survive restarts: peers remember it, and a node that
+// changed identity on every start would look like an endless supply of new
+// peers and could no longer recognise a connection back to itself.
+func (d *DB) GetOrCreateNodeID(ctx context.Context, gen func() (string, error)) (string, error) {
+	id, ok, err := d.GetSetting(ctx, nodeIDSetting)
+	if err != nil {
+		return "", fmt.Errorf("loading node id: %w", err)
+	}
+	if ok && id != "" {
+		return id, nil
+	}
+
+	id, err = gen()
+	if err != nil {
+		return "", err
+	}
+	if err := d.PutSetting(ctx, nodeIDSetting, id); err != nil {
+		return "", fmt.Errorf("storing node id: %w", err)
+	}
+	return id, nil
 }
