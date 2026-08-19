@@ -15,9 +15,12 @@ jobs:
         with:
           go-version: '1.24'
 
+      # gofmt recurses into directories, so the vendored dependencies have to
+      # be excluded by listing files: they are third-party code, formatted for
+      # whichever Go version produced them, and not ours to reformat.
       - name: Check formatting
         run: |
-          unformatted=$(gofmt -l .)
+          unformatted=$(gofmt -l $(find . -name '*.go' -not -path './vendor/*'))
           if [ -n "$unformatted" ]; then
             echo "These files are not gofmt'd:"
             echo "$unformatted"
