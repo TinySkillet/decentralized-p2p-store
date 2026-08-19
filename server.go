@@ -36,6 +36,14 @@ func (s *FileServer) Listen() error {
 		return err
 	}
 
+	if s.OwnsDatabase && s.DB != nil {
+		// Record who owns this storage, so commands opening the same database
+		// can tell that their copy of a file is really this node's copy.
+		if err := s.DB.PutSetting(context.Background(), dbpkg.ServingAddressSetting, s.Transport.Address()); err != nil {
+			log.Printf("[%s] Could not record the serving address: %v", s.Transport.Address(), err)
+		}
+	}
+
 	if len(s.BootstrapNodes) != 0 {
 		s.bootstrapNetwork()
 	}
@@ -44,7 +52,13 @@ func (s *FileServer) Listen() error {
 }
 
 // Serve processes incoming messages until Stop is called.
+//
+// Repair runs alongside it: a file replicated when it was stored stays
+// replicated only if something notices when its holders leave.
 func (s *FileServer) Serve() {
+	if s.RepairInterval > 0 {
+		go s.repairLoop()
+	}
 	s.loop()
 }
 
@@ -164,7 +178,7 @@ func (s *FileServer) handleStream(from string) (err error) {
 	fmt.Printf("[%s] Received %d bytes of %s from %s\n", s.Transport.Address(), size, short(msg.Digest), from)
 
 	if s.DB != nil {
-		if derr := s.recordFile(msg.Name, msg.Digest, size); derr != nil {
+		if derr := s.recordReplica(msg.Name, msg.Digest, size); derr != nil {
 			log.Printf("[%s] Failed to record %s: %v", s.Transport.Address(), short(msg.Digest), derr)
 		}
 
@@ -196,6 +210,69 @@ func (s *FileServer) recordFile(name, digest string, size int64) error {
 		Size:      size,
 		LocalPath: s.store.FullPathForKey(digest),
 	}, "default")
+}
+
+// recordReplica records a copy received from a peer.
+//
+// A replica is held on behalf of the network and must not take over a name
+// this node already uses for something else: otherwise any peer could store a
+// file called "notes" and silently repoint this node's own "notes" at it.
+func (s *FileServer) recordReplica(name, digest string, size int64) error {
+	if name == "" {
+		name = digest
+	}
+
+	stored, err := s.DB.InsertReplica(context.Background(), dbpkg.File{
+		ID:        nameKey(name),
+		Name:      name,
+		Hash:      digest,
+		Size:      size,
+		LocalPath: s.store.FullPathForKey(digest),
+	}, "default")
+	if err != nil {
+		return err
+	}
+
+	if stored != name {
+		fmt.Printf("[%s] '%s' already refers to other contents here, filing the copy under %s instead\n",
+			s.Transport.Address(), name, short(digest))
+	}
+	return nil
+}
+
+// storageOwnerID returns the identity of the node whose storage this one is
+// borrowing, or "" when this node holds its files in its own right.
+//
+// The identity persisted in a database belongs to the long-lived node that
+// owns it; a command opening the same database runs under a fresh identity.
+// Identity is compared rather than address because a node advertises the port
+// it was configured with, while its peers know it by the address the
+// connection came from.
+func (s *FileServer) storageOwnerID() string {
+	if s.OwnsDatabase || s.DB == nil {
+		return ""
+	}
+
+	// Only meaningful when a serving node has actually claimed the database.
+	if _, ok, err := s.DB.GetSetting(context.Background(), dbpkg.ServingAddressSetting); err != nil || !ok {
+		return ""
+	}
+
+	id, ok, err := s.DB.StoredNodeID(context.Background())
+	if err != nil || !ok {
+		return ""
+	}
+	return id
+}
+
+// isStorageOwner reports whether the peer at addr is the node whose storage
+// this one is borrowing.
+func (s *FileServer) isStorageOwner(addr, ownerID string) bool {
+	if ownerID == "" {
+		return false
+	}
+	p, ok := s.peer(addr)
+	return ok && p.ID() == ownerID
 }
 
 // short abbreviates a digest for log output.
@@ -1130,6 +1207,19 @@ type FileServerOpts struct {
 	// address. Zero means the package default.
 	MaxPeersPerHost int
 
+	// ReplicationFactor is how many copies of a file the network aims to
+	// hold, counting the node that stored it. Zero means the default.
+	ReplicationFactor int
+
+	// RepairInterval is how often under-replicated files are restored. Zero
+	// means the default; a negative value disables repair entirely.
+	RepairInterval time.Duration
+
+	// OwnsDatabase marks the long-lived node that the database and storage
+	// root belong to. Commands run against the same database with this unset,
+	// because their copy of a file is that node's copy, not a second one.
+	OwnsDatabase bool
+
 	EncryptionKey     []byte
 	StorageRoot       string
 	PathTransformFunc PathTransformFunc
@@ -1164,6 +1254,12 @@ type FileServer struct {
 func NewFileServer(opts FileServerOpts) *FileServer {
 	if opts.MaxPeersPerHost <= 0 {
 		opts.MaxPeersPerHost = dbpkg.DefaultMaxPeersPerHost
+	}
+	if opts.ReplicationFactor <= 0 {
+		opts.ReplicationFactor = DefaultReplicationFactor
+	}
+	if opts.RepairInterval == 0 {
+		opts.RepairInterval = DefaultRepairInterval
 	}
 	storeOpts := StoreOpts{
 		Root:              opts.StorageRoot,

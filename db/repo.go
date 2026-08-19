@@ -221,6 +221,61 @@ func (d *DB) FindFileByHash(ctx context.Context, hash string) (*File, error) {
 	return &f, nil
 }
 
+// InsertReplica records a copy received from a peer and returns the name it
+// was filed under.
+//
+// A replica must not take over a name this node already uses for different
+// contents. Checking and inserting happen in one transaction because the
+// local Store path writes the same row: a separate read and write let a local
+// file be committed in between and then silently overwritten.
+//
+// When the name is taken, the copy is filed under its digest instead, so it
+// is still held for the network and still repairable.
+func (d *DB) InsertReplica(ctx context.Context, f File, keyID string) (storedName string, err error) {
+	tx, err := d.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+
+	var existingHash string
+	err = tx.QueryRowContext(ctx, `SELECT hash FROM files WHERE name=? LIMIT 1`, f.Name).Scan(&existingHash)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// The name is free.
+	case err != nil:
+		return "", err
+	case existingHash != f.Hash:
+		// Taken by different contents; fall back to the digest as the name.
+		f.Name = f.Hash
+		f.ID = f.Hash
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO files(id,name,hash,size,local_path)
+		VALUES(?,?,?,?,?)
+		ON CONFLICT(id) DO UPDATE SET
+			name=excluded.name,
+			hash=excluded.hash,
+			size=excluded.size,
+			local_path=excluded.local_path,
+			created_at=CURRENT_TIMESTAMP
+	`, f.ID, f.Name, f.Hash, f.Size, f.LocalPath); err != nil {
+		return "", err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO file_keys(file_id,key_id) VALUES(?,?)
+	`, f.ID, keyID); err != nil {
+		return "", err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return f.Name, nil
+}
+
 // FindFileByName resolves a name to the content it refers to, or nil if this
 // node holds nothing under that name.
 func (d *DB) FindFileByName(ctx context.Context, name string) (*File, error) {
@@ -550,6 +605,18 @@ func (d *DB) PutSetting(ctx context.Context, key, value string) error {
 
 // nodeIDSetting is the settings key holding this node's identity.
 const nodeIDSetting = "node_id"
+
+// ServingAddressSetting names the address of the long-lived node that owns a
+// database. Commands open the same database to reuse its metadata and
+// encryption key, and need to know they are borrowing another node's storage
+// rather than holding an independent copy of it.
+const ServingAddressSetting = "serving_address"
+
+// StoredNodeID returns the identity persisted in this database, which belongs
+// to the long-lived node that owns it.
+func (d *DB) StoredNodeID(ctx context.Context) (string, bool, error) {
+	return d.GetSetting(ctx, nodeIDSetting)
+}
 
 // GetOrCreateNodeID returns this node's stable identifier, generating one on
 // first use.

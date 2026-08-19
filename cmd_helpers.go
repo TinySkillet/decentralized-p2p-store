@@ -54,7 +54,17 @@ func makeClientNode(listenAddr string, db *dbpkg.DB, nodes ...string) (*FileServ
 		return nil, err
 	}
 
-	return newServer(listenAddr, nodeID, db, storageRootFor(listenAddr, db), nodes...)
+	s, err := newServer(listenAddr, nodeID, db, storageRootFor(listenAddr, db), nodes...)
+	if err != nil {
+		return nil, err
+	}
+
+	// A command runs for seconds and then exits. Repair is the standing
+	// node's job, and a transient one starting a cycle it cannot finish would
+	// only push copies onto peers on its way out.
+	s.RepairInterval = -1
+
+	return s, nil
 }
 
 // storageRootFor keeps a node's files beside the database that indexes them,
