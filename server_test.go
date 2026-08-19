@@ -41,7 +41,14 @@ type testNode struct {
 
 func newTestNode(t *testing.T, bootstrap ...string) *testNode {
 	t.Helper()
-	return newTestNodeAt(t, freeAddr(t), bootstrap...)
+	return buildTestNode(t, freeAddr(t), nodeConfig{}, bootstrap...)
+}
+
+// nodeConfig holds settings that must be applied before the node starts.
+// Writing them afterwards races the goroutines Serve launches.
+type nodeConfig struct {
+	replicationFactor int
+	repairInterval    time.Duration
 }
 
 // portOf returns the port half of a host:port pair.
@@ -57,6 +64,11 @@ func portOf(t *testing.T, addr string) string {
 // newTestNodeAt starts a node on a specific listen address, so a test can
 // choose how the node is configured to advertise itself.
 func newTestNodeAt(t *testing.T, addr string, bootstrap ...string) *testNode {
+	t.Helper()
+	return buildTestNode(t, addr, nodeConfig{}, bootstrap...)
+}
+
+func buildTestNode(t *testing.T, addr string, cfg nodeConfig, bootstrap ...string) *testNode {
 	t.Helper()
 
 	d, err := dbpkg.Open(filepath.Join(t.TempDir(), "p2p.db"))
@@ -77,6 +89,12 @@ func newTestNodeAt(t *testing.T, addr string, bootstrap ...string) *testNode {
 		t.Fatalf("loadOrInitKey: %v", err)
 	}
 	s.EncryptionKey = key
+	if cfg.replicationFactor > 0 {
+		s.ReplicationFactor = cfg.replicationFactor
+	}
+	if cfg.repairInterval != 0 {
+		s.RepairInterval = cfg.repairInterval
+	}
 
 	if err := s.Listen(); err != nil {
 		t.Fatalf("Listen on %s: %v", addr, err)

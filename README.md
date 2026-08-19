@@ -9,6 +9,8 @@ SQLite-backed metadata, and optional `systemd` service support.
 - File replication to the peers a node is connected to
 - Content-addressed storage: files are identified by the SHA-256 of their
   contents, so identical bytes are stored once however many names refer to them
+- A replication target with automatic repair, so files that fall below it are
+  copied back up as peers come and go
 - AES-256-CTR encryption of files at rest
 - SQLite-backed metadata storage
 - CLI commands for serving, storing, fetching, listing, deleting, and inspecting peers
@@ -43,6 +45,20 @@ Because the second round names a digest rather than a file, the reply is
 self-verifying: a peer cannot substitute different contents for the ones that
 were requested.
 
+## Durability
+
+A file is replicated to every connected peer when it is stored, which is only
+as durable as whoever happened to be online at that moment. Each node also
+runs a repair cycle: for the files it holds, it asks who else has them and
+pushes copies to peers that do not, until the replication target is met.
+
+The target defaults to 3 and is set with `--replicas` on `serve`, or `replicas`
+in the config file. `p2p status` shows which files are below it. A target
+larger than the network can satisfy is reported rather than retried forever.
+
+Repair is deduplication-aware: several names sharing one blob cost one check
+and one transfer, not one per name.
+
 ## Storage layout
 
 A file's identity is the SHA-256 of its plaintext. That digest is sharded into
@@ -69,9 +85,6 @@ The project is a work in progress. What it does not yet do:
   requires knowing a bootstrap address, and the number of identities accepted
   from any one host is capped so a single machine cannot flood the peer table.
   Loopback is exempt, so several nodes can share a machine for local testing.
-- **Replication has no target factor and no repair.** A file goes to whichever
-  peers happen to be connected when it is stored; nothing re-replicates it if
-  those peers later leave.
 - **NAT is not handled.** A node behind NAT advertises a port that may not be
   reachable from outside its network.
 
@@ -125,6 +138,12 @@ Command formats:
   Lists file share records for files stored on other peers.
 - `peers [--db <path>]`
   Lists known peers and their last seen status.
+- `status [--db <path>] [--replicas <n>] [--bootstrap <host:port>]`
+  Reports how many copies of each local file the network holds, and which are
+  below the replication target.
+- `repair [--db <path>] [--replicas <n>] [--bootstrap <host:port>]`
+  Places copies of under-replicated files immediately, rather than waiting for
+  the next automatic cycle.
 - `cleanup [--db <path>]`
   Removes stale peer records from the database.
 - `demo`

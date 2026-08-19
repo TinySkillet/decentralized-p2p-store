@@ -27,6 +27,16 @@ const (
 	discoverySettleTimeout = 5 * time.Second
 )
 
+// withBootstrap adds addr to the bootstrap list if it is not already there.
+func withBootstrap(bootstrap []string, addr string) []string {
+	for _, b := range bootstrap {
+		if b == addr {
+			return bootstrap
+		}
+	}
+	return append(bootstrap, addr)
+}
+
 // openDB opens and migrates the node database.
 func openDB(path string) (*dbpkg.DB, error) {
 	d, err := dbpkg.Open(path)
@@ -45,10 +55,16 @@ func openDB(path string) (*dbpkg.DB, error) {
 //
 // Listen is synchronous, so a bind failure (a port already in use, most
 // often) is reported here rather than crashing a background goroutine.
-func startClientNode(listen string, d *dbpkg.DB, bootstrap []string) (*FileServer, func(), error) {
+func startClientNode(listen string, d *dbpkg.DB, bootstrap []string, replicas int) (*FileServer, func(), error) {
 	keyBytes, err := loadOrInitKey(d)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// A command run against a serving node's database can reach the network
+	// through that node without being told where it is.
+	if owner, ok, err := d.GetSetting(context.Background(), dbpkg.ServingAddressSetting); err == nil && ok && owner != "" {
+		bootstrap = withBootstrap(bootstrap, owner)
 	}
 
 	s, err := makeClientNode(listen, d, bootstrap...)
@@ -56,6 +72,10 @@ func startClientNode(listen string, d *dbpkg.DB, bootstrap []string) (*FileServe
 		return nil, nil, err
 	}
 	s.EncryptionKey = keyBytes
+	if replicas > 0 {
+		// Applied before Serve: the goroutines it starts read this.
+		s.ReplicationFactor = replicas
+	}
 
 	if err := s.Listen(); err != nil {
 		return nil, nil, fmt.Errorf("starting node on %s: %w", listen, err)
@@ -81,6 +101,7 @@ func setupCommands() *cobra.Command {
 		listen     string
 		bootstrap  []string
 		configPath string
+		replicas   int
 	)
 
 	root := &cobra.Command{
@@ -112,6 +133,9 @@ func setupCommands() *cobra.Command {
 				if !cmd.Flags().Changed("bootstrap") && len(cfg.Bootstrap) > 0 {
 					bootstrap = cfg.Bootstrap
 				}
+				if !cmd.Flags().Changed("replicas") && cfg.Replicas > 0 {
+					replicas = cfg.Replicas
+				}
 			}
 
 			d, err := openDB(dbPath)
@@ -129,6 +153,8 @@ func setupCommands() *cobra.Command {
 				return err
 			}
 			s.EncryptionKey = keyBytes
+			s.ReplicationFactor = replicas
+			s.OwnsDatabase = true
 
 			if err := s.Listen(); err != nil {
 				return err
@@ -153,6 +179,7 @@ func setupCommands() *cobra.Command {
 	serveCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address")
 	serveCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes")
 	serveCmd.Flags().StringVar(&configPath, "config", "", "config file path (e.g., ~/.p2p/config)")
+	serveCmd.Flags().IntVar(&replicas, "replicas", DefaultReplicationFactor, "how many copies of each file the network should hold")
 	root.AddCommand(serveCmd)
 
 	storeCmd := &cobra.Command{
@@ -173,7 +200,7 @@ func setupCommands() *cobra.Command {
 			}
 			defer d.Close()
 
-			s, stop, err := startClientNode(listen, d, bootstrap)
+			s, stop, err := startClientNode(listen, d, bootstrap, 0)
 			if err != nil {
 				return err
 			}
@@ -200,7 +227,7 @@ func setupCommands() *cobra.Command {
 			}
 			defer d.Close()
 
-			s, stop, err := startClientNode(listen, d, bootstrap)
+			s, stop, err := startClientNode(listen, d, bootstrap, 0)
 			if err != nil {
 				return err
 			}
@@ -245,7 +272,7 @@ func setupCommands() *cobra.Command {
 			}
 			defer d.Close()
 
-			s, stop, err := startClientNode(listen, d, bootstrap)
+			s, stop, err := startClientNode(listen, d, bootstrap, 0)
 			if err != nil {
 				return err
 			}
@@ -378,6 +405,89 @@ func setupCommands() *cobra.Command {
 		},
 	}
 	root.AddCommand(cleanupCmd)
+
+	statusCmd := &cobra.Command{
+		Use:   "status",
+		Short: "Report how well replicated the local files are",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			d, err := openDB(dbPath)
+			if err != nil {
+				return err
+			}
+			defer d.Close()
+
+			s, stop, err := startClientNode(listen, d, bootstrap, replicas)
+			if err != nil {
+				return err
+			}
+			defer stop()
+
+			health, err := s.ReplicationStatus()
+			if err != nil {
+				return err
+			}
+			if len(health) == 0 {
+				fmt.Println("No files stored locally.")
+				return nil
+			}
+
+			fmt.Printf("%-24s\t%-12s\t%-10s\t%s\n", "FILE", "COPIES", "SIZE", "STATE")
+			fmt.Println(strings.Repeat("-", 70))
+
+			atRisk := 0
+			for _, h := range health {
+				state := "ok"
+				if h.AtRisk() {
+					state = "AT RISK"
+					atRisk++
+				}
+				fmt.Printf("%-24s\t%d of %-8d\t%-10d\t%s\n", h.Name, h.Copies, h.Target, h.Size, state)
+			}
+
+			if atRisk > 0 {
+				fmt.Printf("\n%d file(s) below the replication target of %d.\n", atRisk, replicas)
+				fmt.Println("Run 'p2p repair' to place the missing copies, or start more nodes.")
+			}
+			return nil
+		},
+	}
+	statusCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address")
+	statusCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes")
+	statusCmd.Flags().IntVar(&replicas, "replicas", DefaultReplicationFactor, "replication target to measure against")
+	root.AddCommand(statusCmd)
+
+	repairCmd := &cobra.Command{
+		Use:   "repair",
+		Short: "Place missing copies of under-replicated files",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			d, err := openDB(dbPath)
+			if err != nil {
+				return err
+			}
+			defer d.Close()
+
+			s, stop, err := startClientNode(listen, d, bootstrap, replicas)
+			if err != nil {
+				return err
+			}
+			defer stop()
+
+			placed, err := s.RepairOnce()
+			if err != nil {
+				return err
+			}
+			if placed == 0 {
+				fmt.Println("Nothing to repair.")
+				return nil
+			}
+			fmt.Printf("Placed %d missing replica(s).\n", placed)
+			return nil
+		},
+	}
+	repairCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address")
+	repairCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes")
+	repairCmd.Flags().IntVar(&replicas, "replicas", DefaultReplicationFactor, "replication target to restore")
+	root.AddCommand(repairCmd)
 
 	demoCmd := &cobra.Command{
 		Use:   "demo",

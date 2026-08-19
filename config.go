@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -11,6 +12,7 @@ type Config struct {
 	Listen    string
 	DB        string
 	Bootstrap []string
+	Replicas  int
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -56,6 +58,10 @@ func LoadConfig(path string) (*Config, error) {
 			config.Listen = value
 		case "db":
 			config.DB = value
+		case "replicas":
+			if n, err := strconv.Atoi(value); err == nil && n > 0 {
+				config.Replicas = n
+			}
 		case "bootstrap":
 			nodes := strings.Split(value, ",")
 			for _, node := range nodes {
