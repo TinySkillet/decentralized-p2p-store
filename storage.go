@@ -3,13 +3,18 @@ package main
 import (
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const DEFAULT_ROOT_FOLDER = "p2pnetwork"
+
+// incomingPrefix marks a partial write that has not yet been moved into place.
+const incomingPrefix = ".incoming-"
 
 const (
 	// dirPerm and filePerm keep stored data readable only by the node's own
@@ -107,7 +112,7 @@ func (s *Store) writeContent(encryptionKey []byte, want string, r io.Reader) (di
 		return "", 0, err
 	}
 
-	tmp, err := os.CreateTemp(s.Root, ".incoming-*")
+	tmp, err := os.CreateTemp(s.Root, incomingPrefix+"*")
 	if err != nil {
 		return "", 0, err
 	}
@@ -293,8 +298,85 @@ func (s *Store) pruneEmptyDirs(dir string) {
 	}
 }
 
+// BlobInfo describes one set of contents held on disk.
+type BlobInfo struct {
+	Digest  string
+	ModTime time.Time
+}
+
+// Blobs lists the contents this store holds.
+//
+// Filenames are the content digest, so the listing needs no index: the disk
+// is enumerable on its own, which is what lets unreachable data be found.
+func (s *Store) Blobs() ([]BlobInfo, error) {
+	var out []BlobInfo
+
+	err := filepath.WalkDir(s.Root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// A directory removed by a concurrent prune is not an error.
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() || !isDigest(d.Name()) {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		out = append(out, BlobInfo{Digest: d.Name(), ModTime: info.ModTime()})
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	return out, nil
+}
+
+// RemoveStaleTemporaries deletes partial writes left behind by transfers that
+// were interrupted before their file could be moved into place.
+func (s *Store) RemoveStaleTemporaries(before time.Time) (int, error) {
+	entries, err := os.ReadDir(s.Root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+
+	removed := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), incomingPrefix) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(before) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(s.Root, e.Name())); err == nil {
+			removed++
+		}
+	}
+	return removed, nil
+}
+
 func (s *Store) Clear() error {
 	return os.RemoveAll(s.Root)
+}
+
+// ModTime returns when the contents under key were last written.
+func (s *Store) ModTime(key string) (time.Time, bool) {
+	info, err := os.Stat(s.FullPathForKey(key))
+	if err != nil {
+		return time.Time{}, false
+	}
+	return info.ModTime(), true
 }
 
 // Has reports whether the key is readable from this store. Any error from the

@@ -64,6 +64,12 @@ func (d *DB) Migrate(ctx context.Context) error {
 			status TEXT NOT NULL,
 			last_seen TIMESTAMP
 		);`,
+		`CREATE TABLE IF NOT EXISTS deletions (
+			name TEXT NOT NULL,
+			digest TEXT NOT NULL,
+			deleted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (name, digest)
+		);`,
 		`CREATE TABLE IF NOT EXISTS settings (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
@@ -81,6 +87,7 @@ func (d *DB) Migrate(ctx context.Context) error {
 		// finding the peers that hold a file when it is deleted.
 		`CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash);`,
 		`CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);`,
+		`CREATE INDEX IF NOT EXISTS idx_deletions_deleted_at ON deletions(deleted_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen);`,
 		`CREATE INDEX IF NOT EXISTS idx_shares_file_id ON shares(file_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_shares_file_direction ON shares(file_id, direction);`,

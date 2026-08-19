@@ -49,6 +49,7 @@ func newTestNode(t *testing.T, bootstrap ...string) *testNode {
 type nodeConfig struct {
 	replicationFactor int
 	repairInterval    time.Duration
+	sweepInterval     time.Duration
 }
 
 // portOf returns the port half of a host:port pair.
@@ -94,6 +95,9 @@ func buildTestNode(t *testing.T, addr string, cfg nodeConfig, bootstrap ...strin
 	}
 	if cfg.repairInterval != 0 {
 		s.RepairInterval = cfg.repairInterval
+	}
+	if cfg.sweepInterval != 0 {
+		s.SweepInterval = cfg.sweepInterval
 	}
 
 	if err := s.Listen(); err != nil {
@@ -385,12 +389,22 @@ func TestDeletePropagatesToPeers(t *testing.T) {
 		t.Fatalf("Delete: %v", err)
 	}
 
-	if origin.store.Has("doomed") {
-		t.Error("the origin still holds the file after deleting it")
+	if _, _, err := origin.Get("doomed"); err == nil {
+		t.Error("the origin still resolves the name after deleting it")
 	}
-	waitFor(t, "the replica to drop the file", 10*time.Second, func() bool {
-		return !replica.store.Has(hash)
+
+	// The deletion reaches the peer as a name removal; the bytes behind it are
+	// reclaimed by that peer's sweep.
+	waitFor(t, "the replica to drop the name", 10*time.Second, func() bool {
+		f, err := replica.db.FindFileByName(context.Background(), "doomed")
+		return err == nil && f == nil
 	})
+	if _, err := replica.SweepOrphans(0); err != nil {
+		t.Fatalf("SweepOrphans: %v", err)
+	}
+	if replica.store.Has(hash) {
+		t.Error("the replica still holds the contents after the deletion swept")
+	}
 
 	files, err := origin.db.ListFiles(context.Background())
 	if err != nil {

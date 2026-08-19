@@ -293,6 +293,26 @@ func (d *DB) FindFileByName(ctx context.Context, name string) (*File, error) {
 	return &f, nil
 }
 
+// ReferencedHashes returns every content hash that at least one name refers
+// to. Anything on disk outside this set is unreachable and can be reclaimed.
+func (d *DB) ReferencedHashes(ctx context.Context) (map[string]struct{}, error) {
+	rows, err := d.sql.QueryContext(ctx, `SELECT DISTINCT hash FROM files`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]struct{})
+	for rows.Next() {
+		var hash string
+		if err := rows.Scan(&hash); err != nil {
+			return nil, err
+		}
+		out[hash] = struct{}{}
+	}
+	return out, rows.Err()
+}
+
 // CountNamesForHash reports how many names refer to the given contents.
 //
 // Deduplication means one blob on disk can back several names, so the bytes
@@ -304,8 +324,16 @@ func (d *DB) CountNamesForHash(ctx context.Context, hash string) (int, error) {
 }
 
 // DeleteFileByName removes one name and reports whether the contents it
-// referred to are now unreferenced and safe to remove from disk.
-func (d *DB) DeleteFileByName(ctx context.Context, name string) (hash string, orphaned bool, err error) {
+// referred to are now unreferenced.
+//
+// When expectedHash is set the name is only removed if it currently refers to
+// those contents. A deletion travels by name, and two nodes may legitimately
+// use the same name for different files; without this guard, deleting your
+// "notes" would delete everyone else's.
+//
+// The removal is recorded as a tombstone in the same transaction, so a peer
+// that still holds the file cannot push it back afterwards.
+func (d *DB) DeleteFileByName(ctx context.Context, name, expectedHash string) (hash string, orphaned bool, err error) {
 	tx, err := d.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return "", false, err
@@ -321,6 +349,11 @@ func (d *DB) DeleteFileByName(ctx context.Context, name string) (hash string, or
 		return "", false, err
 	}
 
+	if expectedHash != "" && hash != expectedHash {
+		// This name refers to something else here; not ours to delete.
+		return "", false, nil
+	}
+
 	if _, err := tx.ExecContext(ctx, `DELETE FROM file_keys WHERE file_id=?`, id); err != nil {
 		return "", false, err
 	}
@@ -328,6 +361,14 @@ func (d *DB) DeleteFileByName(ctx context.Context, name string) (hash string, or
 		return "", false, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM files WHERE id=?`, id); err != nil {
+		return "", false, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO deletions(name,digest,deleted_at)
+		VALUES(?,?,CURRENT_TIMESTAMP)
+		ON CONFLICT(name,digest) DO UPDATE SET deleted_at=CURRENT_TIMESTAMP
+	`, name, hash); err != nil {
 		return "", false, err
 	}
 
@@ -341,6 +382,38 @@ func (d *DB) DeleteFileByName(ctx context.Context, name string) (hash string, or
 	}
 
 	return hash, remaining == 0, nil
+}
+
+// IsDeleted reports whether this name and content pair has been deleted here.
+//
+// Without this, a peer that was offline during a deletion still holds the file
+// and its repair cycle pushes it back to every node that removed it, undoing
+// the deletion across the network.
+func (d *DB) IsDeleted(ctx context.Context, name, digest string) (bool, error) {
+	var n int
+	err := d.sql.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM deletions WHERE name=? AND digest=?
+	`, name, digest).Scan(&n)
+	return n > 0, err
+}
+
+// ClearDeletion forgets a tombstone, so storing the same file again under the
+// same name works as the user expects.
+func (d *DB) ClearDeletion(ctx context.Context, name, digest string) error {
+	_, err := d.sql.ExecContext(ctx, `DELETE FROM deletions WHERE name=? AND digest=?`, name, digest)
+	return err
+}
+
+// PruneDeletions drops tombstones older than maxAge. They only need to outlive
+// the peers that might still be holding the deleted file.
+func (d *DB) PruneDeletions(ctx context.Context, maxAge time.Duration) (int, error) {
+	cutoff := formatTime(time.Now().Add(-maxAge))
+	result, err := d.sql.ExecContext(ctx, `DELETE FROM deletions WHERE deleted_at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, err := result.RowsAffected()
+	return int(n), err
 }
 
 // CountActivePeersForHost reports how many recently seen peers share an IP.
@@ -461,8 +534,14 @@ func (d *DB) PutKey(ctx context.Context, k Key) error {
 // first use.
 //
 // Only a genuine "no such row" may trigger generation. Treating any error as
-// absent (as an earlier version did) would mint a fresh key after a transient
-// database fault and leave every previously stored file undecryptable.
+// absent would mint a fresh key after a transient database fault and leave
+// every previously stored file undecryptable.
+//
+// Creation is a conditional insert followed by a read inside one transaction,
+// so concurrent callers all end up with whichever key was stored first. A
+// plain check-then-write let two processes sharing a database each mint a key
+// and overwrite the other's, which silently orphaned the files encrypted
+// under the loser.
 func (d *DB) GetOrCreateDefaultKey(ctx context.Context, gen func() ([]byte, error)) ([]byte, error) {
 	const id = "default"
 
@@ -480,15 +559,31 @@ func (d *DB) GetOrCreateDefaultKey(ctx context.Context, gen func() ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
-	if err := d.PutKey(ctx, Key{
-		ID:       id,
-		Label:    "default",
-		Algo:     "AES-CTR-256",
-		KeyBytes: keyBytes,
-	}); err != nil {
+
+	tx, err := d.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO keys(id,label,algo,key_bytes,created_at)
+		VALUES(?,?,?,?,CURRENT_TIMESTAMP)
+		ON CONFLICT(id) DO NOTHING
+	`, id, "default", "AES-CTR-256", keyBytes); err != nil {
 		return nil, fmt.Errorf("storing encryption key: %w", err)
 	}
-	return keyBytes, nil
+
+	// Read back whichever key won, rather than assuming it was ours.
+	var stored []byte
+	if err := tx.QueryRowContext(ctx, `SELECT key_bytes FROM keys WHERE id=?`, id).Scan(&stored); err != nil {
+		return nil, fmt.Errorf("reading back encryption key: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("storing encryption key: %w", err)
+	}
+
+	return stored, nil
 }
 
 // ShareInfo contains share information with file details.
@@ -624,6 +719,9 @@ func (d *DB) StoredNodeID(ctx context.Context) (string, bool, error) {
 // Identity has to survive restarts: peers remember it, and a node that
 // changed identity on every start would look like an endless supply of new
 // peers and could no longer recognise a connection back to itself.
+//
+// As with the encryption key, creation is a conditional insert and a read
+// back in one transaction, so concurrent callers agree on one identity.
 func (d *DB) GetOrCreateNodeID(ctx context.Context, gen func() (string, error)) (string, error) {
 	id, ok, err := d.GetSetting(ctx, nodeIDSetting)
 	if err != nil {
@@ -637,8 +735,36 @@ func (d *DB) GetOrCreateNodeID(ctx context.Context, gen func() (string, error)) 
 	if err != nil {
 		return "", err
 	}
-	if err := d.PutSetting(ctx, nodeIDSetting, id); err != nil {
+
+	stored, err := d.putSettingIfAbsent(ctx, nodeIDSetting, id)
+	if err != nil {
 		return "", fmt.Errorf("storing node id: %w", err)
 	}
-	return id, nil
+	return stored, nil
+}
+
+// putSettingIfAbsent stores value only if key is unset, and returns whatever
+// value is stored afterwards.
+func (d *DB) putSettingIfAbsent(ctx context.Context, key, value string) (string, error) {
+	tx, err := d.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO settings(key,value) VALUES(?,?)
+		ON CONFLICT(key) DO NOTHING
+	`, key, value); err != nil {
+		return "", err
+	}
+
+	var stored string
+	if err := tx.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, key).Scan(&stored); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return stored, nil
 }

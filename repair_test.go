@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"testing"
 	"time"
 
@@ -26,6 +27,7 @@ func newQuietNodeWith(t *testing.T, replicas int, bootstrap ...string) *testNode
 	return buildTestNode(t, freeAddr(t), nodeConfig{
 		replicationFactor: replicas,
 		repairInterval:    -1,
+		sweepInterval:     -1,
 	}, bootstrap...)
 }
 
@@ -362,5 +364,45 @@ func TestBorrowedStorageIsNotCountedTwice(t *testing.T) {
 	}
 	if !health[0].AtRisk() {
 		t.Error("a file held on a single machine was not reported at risk")
+	}
+}
+
+// TestSweepLoopReclaimsAutomatically checks the background sweep is actually
+// wired up, not just callable: unreachable data must go without anyone asking.
+func TestSweepLoopReclaimsAutomatically(t *testing.T) {
+	node := buildTestNode(t, freeAddr(t), nodeConfig{
+		repairInterval: -1,
+		sweepInterval:  50 * time.Millisecond,
+	})
+
+	v1 := randomBytes(t, 2048)
+	v2 := randomBytes(t, 2048)
+
+	if err := node.Store("notes", bytes.NewReader(v1)); err != nil {
+		t.Fatalf("Store v1: %v", err)
+	}
+	// Overwriting leaves the first version unreferenced.
+	if err := node.Store("notes", bytes.NewReader(v2)); err != nil {
+		t.Fatalf("Store v2: %v", err)
+	}
+
+	if !node.store.Has(contentKey(v1)) {
+		t.Fatal("the replaced contents are already gone; the test proves nothing")
+	}
+
+	// The grace period protects data too recent to judge, so backdate it to
+	// what an older file looks like rather than waiting.
+	old := time.Now().Add(-2 * DefaultOrphanGrace)
+	if err := os.Chtimes(node.store.FullPathForKey(contentKey(v1)), old, old); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	waitFor(t, "the sweep to reclaim the replaced contents", 10*time.Second, func() bool {
+		return !node.store.Has(contentKey(v1))
+	})
+
+	// The current version must be untouched.
+	if !node.store.Has(contentKey(v2)) {
+		t.Error("the sweep removed the contents the name refers to")
 	}
 }

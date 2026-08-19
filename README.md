@@ -50,7 +50,7 @@ were requested.
 A file is replicated to every connected peer when it is stored, which is only
 as durable as whoever happened to be online at that moment. Each node also
 runs a repair cycle: for the files it holds, it asks who else has them and
-pushes copies to peers that do not, until the replication target is met.
+offers copies to peers that do not, until the replication target is met.
 
 The target defaults to 3 and is set with `--replicas` on `serve`, or `replicas`
 in the config file. `p2p status` shows which files are below it. A target
@@ -58,6 +58,27 @@ larger than the network can satisfy is reported rather than retried forever.
 
 Repair is deduplication-aware: several names sharing one blob cost one check
 and one transfer, not one per name.
+
+## Deletion
+
+Deleting a file removes the name that refers to it. Because several names can
+share one set of contents, the bytes are reclaimed only once no name refers to
+them, by a sweep that treats the name mapping as the single source of truth.
+Deciding data is unreachable and removing it happen together there, so a name
+recorded at the same moment cannot be left pointing at deleted data.
+
+A deletion is recorded as a tombstone, which is what makes it stick. Peers that
+were offline when it was broadcast still hold the file, and their repair cycle
+would otherwise offer it back and undo the deletion everywhere. Instead the
+offer is refused and the straggler is told, so the deletion reaches it late
+rather than never.
+
+Deletions carry the content digest as well as the name. Two nodes may
+legitimately use the same name for different files, and a peer only acts when
+its own name refers to the same contents.
+
+What deletion does not promise: a peer that is unreachable keeps its copy until
+it next contacts a node that knows about the deletion.
 
 ## Storage layout
 

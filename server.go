@@ -59,6 +59,9 @@ func (s *FileServer) Serve() {
 	if s.RepairInterval > 0 {
 		go s.repairLoop()
 	}
+	if s.SweepInterval > 0 {
+		go s.sweepLoop()
+	}
 	s.loop()
 }
 
@@ -159,6 +162,28 @@ func (s *FileServer) handleStream(from string) (err error) {
 
 	body := io.LimitReader(peer, msg.Size)
 
+	// A peer that missed a deletion still holds the file and its repair cycle
+	// will offer it back. The tombstone is what stops the deletion being
+	// undone; the sender is told so it stops holding the file too.
+	if s.DB != nil {
+		deleted, derr := s.DB.IsDeleted(context.Background(), msg.Name, msg.Digest)
+		if derr != nil {
+			log.Printf("[%s] Could not check deletions for %s: %v", s.Transport.Address(), short(msg.Digest), derr)
+		} else if deleted {
+			// The body is already on its way, so it has to be read off the
+			// connection even though it is being discarded.
+			if _, cerr := io.Copy(io.Discard, body); cerr != nil {
+				return cerr
+			}
+			fmt.Printf("[%s] Refused '%s' (%s) from %s: it was deleted here\n",
+				s.Transport.Address(), msg.Name, short(msg.Digest), from)
+
+			s.notifyDeleted(from, msg.Name, msg.Digest)
+			s.failRequest(msg.RequestID, fmt.Errorf("%q was deleted", msg.Name))
+			return nil
+		}
+	}
+
 	// The contents are hashed as they are written and the file is only moved
 	// into place if it matches what the sender announced, so data that fails
 	// verification never becomes readable at all.
@@ -196,6 +221,19 @@ func (s *FileServer) handleStream(from string) (err error) {
 	s.completeRequest(msg.RequestID)
 
 	return nil
+}
+
+// notifyDeleted tells a peer that what it just offered has been deleted here,
+// so a deletion reaches nodes that were offline when it was broadcast.
+func (s *FileServer) notifyDeleted(addr, name, digest string) {
+	peer, ok := s.peer(addr)
+	if !ok {
+		return
+	}
+	msg := Message{Payload: MessageDeleteFile{Name: name, Digest: digest}}
+	if err := sendMessage(peer, &msg); err != nil {
+		log.Printf("[%s] Could not tell %s that %q was deleted: %v", s.Transport.Address(), addr, name, err)
+	}
 }
 
 // recordFile maps a name to the contents now stored under it.
@@ -476,18 +514,21 @@ func (s *FileServer) handleMessageFetchFile(from string, msg MessageFetchFile) e
 func (s *FileServer) handleMessageDeleteFile(from string, msg MessageDeleteFile) error {
 	fmt.Printf("[%s] Received delete request for '%s' from %s\n", s.Transport.Address(), msg.Name, from)
 
-	if err := s.forget(msg.Name); err != nil {
+	if err := s.forget(msg.Name, msg.Digest); err != nil {
 		return fmt.Errorf("[%s] %w", s.Transport.Address(), err)
 	}
 	return nil
 }
 
-// forget removes a name and, if nothing else refers to them, the contents
-// behind it.
+// forget removes a name.
 //
-// Deduplication means one blob can back several names, so the bytes outlive
-// any single name that pointed at them.
-func (s *FileServer) forget(name string) error {
+// The contents are not unlinked here. Deduplication means one blob can back
+// several names, and deciding it is unreferenced and then unlinking it are two
+// steps: a name recorded in between would be left pointing at data that had
+// just been deleted. Instead the name mapping is the single source of truth
+// and unreachable contents are reclaimed by the sweep, which makes that
+// decision and acts on it together.
+func (s *FileServer) forget(name, digest string) error {
 	if s.DB == nil {
 		// Without a database there is no name mapping, so the name can only
 		// be the contents themselves.
@@ -497,30 +538,34 @@ func (s *FileServer) forget(name string) error {
 		return nil
 	}
 
-	hash, orphaned, err := s.DB.DeleteFileByName(context.Background(), name)
+	hash, orphaned, err := s.DB.DeleteFileByName(context.Background(), name, digest)
 	if err != nil {
 		// Stop before touching the disk. Removing the bytes while the
 		// metadata still points at them is the inconsistency worth avoiding;
 		// leaving both in place is recoverable.
-		return fmt.Errorf("deleting %q from the database, leaving the file on disk: %w", name, err)
+		return fmt.Errorf("deleting %q from the database: %w", name, err)
 	}
 
 	if hash == "" {
-		fmt.Printf("[%s] Nothing stored under '%s', skipping deletion\n", s.Transport.Address(), name)
+		fmt.Printf("[%s] Nothing matching '%s' stored here, skipping deletion\n", s.Transport.Address(), name)
 		return nil
 	}
 
 	fmt.Printf("[%s] Removed name '%s' from the database\n", s.Transport.Address(), name)
 
-	if !orphaned {
+	if orphaned {
+		reclaimed, rerr := s.reclaim(hash, DefaultOrphanGrace)
+		switch {
+		case rerr != nil:
+			log.Printf("[%s] Could not reclaim %s: %v", s.Transport.Address(), short(hash), rerr)
+		case reclaimed:
+			fmt.Printf("[%s] Deleted contents %s from local storage\n", s.Transport.Address(), short(hash))
+		default:
+			fmt.Printf("[%s] Contents %s are now unreferenced and will be reclaimed shortly\n", s.Transport.Address(), short(hash))
+		}
+	} else {
 		fmt.Printf("[%s] Contents %s are still referenced by another name, keeping them\n", s.Transport.Address(), short(hash))
-		return nil
 	}
-
-	if err := s.store.Delete(hash); err != nil {
-		return fmt.Errorf("deleting contents %s: %w", short(hash), err)
-	}
-	fmt.Printf("[%s] Deleted contents %s from local storage\n", s.Transport.Address(), short(hash))
 	return nil
 }
 
@@ -744,6 +789,11 @@ func (s *FileServer) Store(name string, r io.Reader) error {
 	}
 
 	if s.DB != nil {
+		// Storing a file again is a deliberate act, so any tombstone from an
+		// earlier deletion is cleared rather than blocking it.
+		if err := s.DB.ClearDeletion(context.Background(), name, digest); err != nil {
+			log.Printf("[%s] Could not clear the deletion record for %q: %v", s.Transport.Address(), name, err)
+		}
 		if err := s.recordFile(name, digest, size); err != nil {
 			// The bytes are on disk but unrecorded, so surface it rather than
 			// reporting a store that later commands cannot see.
@@ -837,6 +887,16 @@ func (s *FileServer) replicate(digest string, msg *Message) ([]string, int64) {
 
 // Delete removes a name locally and asks every peer to do the same.
 func (s *FileServer) Delete(name string) error {
+	// The digest is needed before the name mapping goes, so peers can tell
+	// this deletion applies to their copy and not to a different file of the
+	// same name.
+	var digest string
+	if local, err := s.resolve(name); err != nil {
+		return err
+	} else if local != nil {
+		digest = local.digest
+	}
+
 	// Query the peers holding this file before the metadata that names them
 	// is removed.
 	var sharePeers []string
@@ -849,7 +909,7 @@ func (s *FileServer) Delete(name string) error {
 		}
 	}
 
-	if err := s.forget(name); err != nil {
+	if err := s.forget(name, digest); err != nil {
 		return fmt.Errorf("[%s] %w", s.Transport.Address(), err)
 	}
 
@@ -884,7 +944,7 @@ func (s *FileServer) Delete(name string) error {
 		return nil
 	}
 
-	msg := Message{Payload: MessageDeleteFile{Name: name}}
+	msg := Message{Payload: MessageDeleteFile{Name: name, Digest: digest}}
 	if err := s.broadcast(&msg); err != nil {
 		return err
 	}
@@ -1215,6 +1275,10 @@ type FileServerOpts struct {
 	// means the default; a negative value disables repair entirely.
 	RepairInterval time.Duration
 
+	// SweepInterval is how often unreachable data is reclaimed. Zero means
+	// the default; a negative value disables the sweep.
+	SweepInterval time.Duration
+
 	// OwnsDatabase marks the long-lived node that the database and storage
 	// root belong to. Commands run against the same database with this unset,
 	// because their copy of a file is that node's copy, not a second one.
@@ -1260,6 +1324,9 @@ func NewFileServer(opts FileServerOpts) *FileServer {
 	}
 	if opts.RepairInterval == 0 {
 		opts.RepairInterval = DefaultRepairInterval
+	}
+	if opts.SweepInterval == 0 {
+		opts.SweepInterval = DefaultSweepInterval
 	}
 	storeOpts := StoreOpts{
 		Root:              opts.StorageRoot,
@@ -1319,10 +1386,14 @@ type MessageFetchFile struct {
 	Digest    string
 }
 
-// MessageDeleteFile asks peers to forget a name. The contents behind it are
-// removed only once no name on that peer still refers to them.
+// MessageDeleteFile asks peers to forget a name.
+//
+// Digest names the contents being deleted. Two nodes may legitimately use the
+// same name for different files, so a peer only acts when its own name refers
+// to the same contents.
 type MessageDeleteFile struct {
-	Name string
+	Name   string
+	Digest string
 }
 
 type MessagePeerExchange struct {

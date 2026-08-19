@@ -355,9 +355,14 @@ func TestDeleteKeepsContentsSharedWithAnotherName(t *testing.T) {
 		t.Error("deleting one name corrupted the contents the other name refers to")
 	}
 
-	// Removing the last name must reclaim the space.
+	// Removing the last name leaves the contents unreferenced, and the sweep
+	// reclaims them. Deletion no longer unlinks inline: deciding the contents
+	// are unreferenced and acting on it have to happen together.
 	if err := node.Delete("keeper"); err != nil {
 		t.Fatalf("Delete keeper: %v", err)
+	}
+	if _, err := node.SweepOrphans(0); err != nil {
+		t.Fatalf("SweepOrphans: %v", err)
 	}
 	if n := countStoredFiles(t, node.store.Root); n != 0 {
 		t.Errorf("%d files left on disk after deleting every name, want 0", n)

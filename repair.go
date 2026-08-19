@@ -20,10 +20,32 @@ const (
 	// restores any that have fallen below the target.
 	DefaultRepairInterval = 5 * time.Minute
 
+	// DefaultSweepInterval is how often unreachable data is reclaimed. It runs
+	// on its own schedule because it is local work: a directory walk and one
+	// query, with no network traffic, so it can be far more frequent than the
+	// repair cycle it used to be attached to.
+	DefaultSweepInterval = time.Minute
+
 	// maxRepairsPerCycle bounds the work one cycle does, so a node holding
 	// thousands of files spreads the checking out instead of flooding its
 	// peers with availability queries in one burst.
 	maxRepairsPerCycle = 25
+
+	// DefaultTombstoneRetention is how long a deletion is remembered.
+	//
+	// A tombstone only has to outlive the peers that might still be holding
+	// the deleted file, so that their repair cycle cannot push it back.
+	DefaultTombstoneRetention = 30 * 24 * time.Hour
+
+	// DefaultOrphanGrace is how long unreferenced contents are left alone
+	// before being reclaimed.
+	//
+	// A file is written to disk a moment before the name referring to it is
+	// recorded. The grace period means a sweep landing in that gap sees the
+	// data as too recent to judge, rather than deleting something that was
+	// about to be referenced. It only has to cover a single database insert,
+	// so it is short.
+	DefaultOrphanGrace = 30 * time.Second
 )
 
 // FileHealth reports how well replicated one file is.
@@ -64,13 +86,35 @@ func (s *FileServer) repairLoop() {
 		if repaired, err := s.RepairOnce(); err != nil {
 			log.Printf("[%s] Repair cycle failed: %v", s.Transport.Address(), err)
 		} else if repaired > 0 {
-			fmt.Printf("[%s] Repair: restored %d missing replica(s)\n", s.Transport.Address(), repaired)
+			fmt.Printf("[%s] Repair: offered %d missing replica(s)\n", s.Transport.Address(), repaired)
+		}
+
+	}
+}
+
+// sweepLoop reclaims unreachable data on its own schedule.
+func (s *FileServer) sweepLoop() {
+	for {
+		select {
+		case <-time.After(s.SweepInterval):
+		case <-s.quitch:
+			return
+		}
+
+		if reclaimed, err := s.SweepOrphans(DefaultOrphanGrace); err != nil {
+			log.Printf("[%s] Sweep failed: %v", s.Transport.Address(), err)
+		} else if reclaimed > 0 {
+			fmt.Printf("[%s] Sweep: reclaimed %d unreferenced file(s)\n", s.Transport.Address(), reclaimed)
 		}
 	}
 }
 
 // RepairOnce checks the files this node holds and pushes copies of any that
-// are under-replicated. It returns how many replicas it created.
+// are under-replicated. It returns how many copies it sent.
+//
+// A copy sent is not necessarily a copy kept: a peer refuses contents it has
+// deleted, which is how a deletion reaches nodes that were offline when it was
+// broadcast. Callers should report this as copies offered, not placed.
 func (s *FileServer) RepairOnce() (int, error) {
 	if s.DB == nil {
 		return 0, nil
@@ -129,7 +173,7 @@ func (s *FileServer) repairFile(f dbpkg.File) (int, error) {
 	}
 
 	needed := health.Target - health.Copies
-	fmt.Printf("[%s] '%s' has %d of %d copies, placing %d more\n",
+	fmt.Printf("[%s] '%s' has %d of %d copies, offering %d more\n",
 		s.Transport.Address(), f.Name, health.Copies, health.Target, needed)
 
 	ownerID := s.storageOwnerID()
@@ -145,7 +189,7 @@ func (s *FileServer) repairFile(f dbpkg.File) (int, error) {
 			continue
 		}
 		if err := s.pushTo(addr, f); err != nil {
-			log.Printf("[%s] Could not place a copy of %s on %s: %v", s.Transport.Address(), short(f.Hash), addr, err)
+			log.Printf("[%s] Could not offer a copy of %s to %s: %v", s.Transport.Address(), short(f.Hash), addr, err)
 			continue
 		}
 		placed++
@@ -309,4 +353,95 @@ func (s *FileServer) ReplicationStatus() ([]FileHealth, error) {
 		out = append(out, health)
 	}
 	return out, nil
+}
+
+// SweepOrphans reclaims contents that no name refers to, and returns how many
+// were removed.
+//
+// The name mapping is the single source of truth for what is reachable, so
+// the decision and the deletion happen together here rather than being split
+// across a delete. That closes two gaps at once: contents replaced by storing
+// a new version under the same name, and contents whose last name was removed
+// while a new reference was being recorded.
+//
+// grace protects data written but not yet recorded; pass 0 to sweep
+// everything unreferenced regardless of age.
+func (s *FileServer) SweepOrphans(grace time.Duration) (int, error) {
+	if s.DB == nil {
+		return 0, nil
+	}
+
+	referenced, err := s.DB.ReferencedHashes(context.Background())
+	if err != nil {
+		return 0, err
+	}
+
+	blobs, err := s.store.Blobs()
+	if err != nil {
+		return 0, err
+	}
+
+	cutoff := time.Now().Add(-grace)
+
+	removed := 0
+	for _, b := range blobs {
+		if _, ok := referenced[b.Digest]; ok {
+			continue
+		}
+		if b.ModTime.After(cutoff) {
+			// Possibly mid-write; judge it on the next pass.
+			continue
+		}
+		if err := s.store.Delete(b.Digest); err != nil {
+			log.Printf("[%s] Could not reclaim %s: %v", s.Transport.Address(), short(b.Digest), err)
+			continue
+		}
+		removed++
+	}
+
+	if n, err := s.DB.PruneDeletions(context.Background(), DefaultTombstoneRetention); err != nil {
+		log.Printf("[%s] Could not prune deletion records: %v", s.Transport.Address(), err)
+	} else if n > 0 {
+		fmt.Printf("[%s] Pruned %d expired deletion record(s)\n", s.Transport.Address(), n)
+	}
+
+	if n, err := s.store.RemoveStaleTemporaries(cutoff); err != nil {
+		log.Printf("[%s] Could not clear partial writes: %v", s.Transport.Address(), err)
+	} else if n > 0 {
+		fmt.Printf("[%s] Cleared %d partial write(s)\n", s.Transport.Address(), n)
+	}
+
+	return removed, nil
+}
+
+// reclaim removes contents that no name refers to, and reports whether it did.
+//
+// Called when a deletion leaves data unreferenced, so space comes back without
+// waiting for the next sweep. The reference check and the unlink happen here
+// together, and data too recent to judge is left for the sweep: a file is
+// written a moment before the name referring to it is recorded, and deleting
+// inside that window would destroy something about to be referenced.
+func (s *FileServer) reclaim(digest string, grace time.Duration) (bool, error) {
+	if s.DB == nil || digest == "" {
+		return false, nil
+	}
+
+	referenced, err := s.DB.ReferencedHashes(context.Background())
+	if err != nil {
+		return false, err
+	}
+	if _, ok := referenced[digest]; ok {
+		return false, nil
+	}
+
+	if modTime, ok := s.store.ModTime(digest); !ok {
+		return false, nil
+	} else if modTime.After(time.Now().Add(-grace)) {
+		return false, nil
+	}
+
+	if err := s.store.Delete(digest); err != nil {
+		return false, err
+	}
+	return true, nil
 }
