@@ -110,6 +110,9 @@ func (d *DB) Migrate(ctx context.Context) error {
 		{"peers", "node_id", `ALTER TABLE peers ADD COLUMN node_id TEXT NOT NULL DEFAULT ''`},
 		{"peers", "host", `ALTER TABLE peers ADD COLUMN host TEXT NOT NULL DEFAULT ''`},
 		{"files", "digest", `ALTER TABLE files ADD COLUMN digest TEXT NOT NULL DEFAULT ''`},
+		{"files", "owner", `ALTER TABLE files ADD COLUMN owner TEXT NOT NULL DEFAULT ''`},
+		{"deletions", "owner", `ALTER TABLE deletions ADD COLUMN owner TEXT NOT NULL DEFAULT ''`},
+		{"deletions", "signature", `ALTER TABLE deletions ADD COLUMN signature BLOB`},
 	}
 	for _, a := range altered {
 		has, err := columnExists(ctx, tx, a.table, a.column)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/gob"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -203,7 +204,7 @@ func (s *FileServer) handleStream(from string) (err error) {
 	fmt.Printf("[%s] Received %d bytes of %s from %s\n", s.Transport.Address(), size, short(msg.Digest), from)
 
 	if s.DB != nil {
-		if derr := s.recordReplica(msg.Name, msg.Digest, size); derr != nil {
+		if derr := s.recordReplica(msg.Name, msg.Digest, size, msg.Owner); derr != nil {
 			log.Printf("[%s] Failed to record %s: %v", s.Transport.Address(), short(msg.Digest), derr)
 		}
 
@@ -225,19 +226,48 @@ func (s *FileServer) handleStream(from string) (err error) {
 
 // notifyDeleted tells a peer that what it just offered has been deleted here,
 // so a deletion reaches nodes that were offline when it was broadcast.
+//
+// The original authorisation is replayed with it. The receiving peer verifies
+// it against its own record of who owns the file, so this node relaying the
+// message does not need to be trusted.
 func (s *FileServer) notifyDeleted(addr, name, digest string) {
 	peer, ok := s.peer(addr)
 	if !ok {
 		return
 	}
-	msg := Message{Payload: MessageDeleteFile{Name: name, Digest: digest}}
+
+	owner, signature := s.deletionAuthorisation(name, digest)
+
+	msg := Message{Payload: MessageDeleteFile{
+		Name:      name,
+		Digest:    digest,
+		Owner:     owner,
+		Signature: signature,
+	}}
 	if err := sendMessage(peer, &msg); err != nil {
 		log.Printf("[%s] Could not tell %s that %q was deleted: %v", s.Transport.Address(), addr, name, err)
 	}
 }
 
-// recordFile maps a name to the contents now stored under it.
-func (s *FileServer) recordFile(name, digest string, size int64) error {
+// deletionAuthorisation returns the authorisation recorded when a file was
+// deleted here, so it can be replayed to a peer that still holds it.
+func (s *FileServer) deletionAuthorisation(name, digest string) (owner string, signature []byte) {
+	if s.DB == nil {
+		return "", nil
+	}
+	owner, signature, ok, err := s.DB.GetDeletion(context.Background(), name, digest)
+	if err != nil {
+		log.Printf("[%s] Could not read the deletion record for %q: %v", s.Transport.Address(), name, err)
+		return "", nil
+	}
+	if !ok {
+		return "", nil
+	}
+	return owner, signature
+}
+
+// recordFile maps a name to the contents now stored under it, owned by owner.
+func (s *FileServer) recordFile(name, digest string, size int64, owner string) error {
 	if name == "" {
 		name = digest
 	}
@@ -247,6 +277,7 @@ func (s *FileServer) recordFile(name, digest string, size int64) error {
 		Hash:      digest,
 		Size:      size,
 		LocalPath: s.store.FullPathForKey(digest),
+		Owner:     owner,
 	}, "default")
 }
 
@@ -255,7 +286,7 @@ func (s *FileServer) recordFile(name, digest string, size int64) error {
 // A replica is held on behalf of the network and must not take over a name
 // this node already uses for something else: otherwise any peer could store a
 // file called "notes" and silently repoint this node's own "notes" at it.
-func (s *FileServer) recordReplica(name, digest string, size int64) error {
+func (s *FileServer) recordReplica(name, digest string, size int64, owner string) error {
 	if name == "" {
 		name = digest
 	}
@@ -266,6 +297,7 @@ func (s *FileServer) recordReplica(name, digest string, size int64) error {
 		Hash:      digest,
 		Size:      size,
 		LocalPath: s.store.FullPathForKey(digest),
+		Owner:     owner,
 	}, "default")
 	if err != nil {
 		return err
@@ -286,6 +318,12 @@ func (s *FileServer) recordReplica(name, digest string, size int64) error {
 // Identity is compared rather than address because a node advertises the port
 // it was configured with, while its peers know it by the address the
 // connection came from.
+// NodeID returns this node's network identifier.
+func (s *FileServer) NodeID() string { return s.Identity.NodeID() }
+
+// OwnerID returns the identity that owns the files in this node's database.
+func (s *FileServer) OwnerID() string { return s.OwnerIdentity.NodeID() }
+
 func (s *FileServer) storageOwnerID() string {
 	if s.OwnsDatabase || s.DB == nil {
 		return ""
@@ -514,9 +552,52 @@ func (s *FileServer) handleMessageFetchFile(from string, msg MessageFetchFile) e
 func (s *FileServer) handleMessageDeleteFile(from string, msg MessageDeleteFile) error {
 	fmt.Printf("[%s] Received delete request for '%s' from %s\n", s.Transport.Address(), msg.Name, from)
 
-	if err := s.forget(msg.Name, msg.Digest); err != nil {
+	if err := s.authorizeDelete(msg); err != nil {
+		return fmt.Errorf("[%s] Refusing to delete '%s' for %s: %w", s.Transport.Address(), msg.Name, from, err)
+	}
+
+	if err := s.forget(msg.Name, msg.Digest, msg.Owner, msg.Signature); err != nil {
 		return fmt.Errorf("[%s] %w", s.Transport.Address(), err)
 	}
+	return nil
+}
+
+// authorizeDelete checks that a deletion request came from the node entitled
+// to make it.
+//
+// The file records who stored it, and only that identity can authorise its
+// removal. Files stored before ownership was recorded have no owner, and are
+// accepted unsigned so that upgrading a network does not strand data nobody
+// can delete.
+func (s *FileServer) authorizeDelete(msg MessageDeleteFile) error {
+	if s.DB == nil {
+		return nil
+	}
+
+	f, err := s.DB.FindFileByName(context.Background(), msg.Name)
+	if err != nil {
+		return fmt.Errorf("looking up the file: %w", err)
+	}
+	if f == nil {
+		// Nothing here to delete, so nothing to authorise.
+		return nil
+	}
+	if msg.Digest != "" && f.Hash != msg.Digest {
+		// A different file of the same name; forget() will decline it.
+		return nil
+	}
+
+	if f.Owner == "" {
+		// Stored before ownership was recorded.
+		return nil
+	}
+	if msg.Owner != f.Owner {
+		return fmt.Errorf("it is owned by %s, not %s", short(f.Owner), short(msg.Owner))
+	}
+	if !verifyByNode(msg.Owner, deleteTranscript(msg.Name, f.Hash), msg.Signature) {
+		return fmt.Errorf("the authorisation does not verify against %s", short(msg.Owner))
+	}
+
 	return nil
 }
 
@@ -528,7 +609,7 @@ func (s *FileServer) handleMessageDeleteFile(from string, msg MessageDeleteFile)
 // just been deleted. Instead the name mapping is the single source of truth
 // and unreachable contents are reclaimed by the sweep, which makes that
 // decision and acts on it together.
-func (s *FileServer) forget(name, digest string) error {
+func (s *FileServer) forget(name, digest, owner string, signature []byte) error {
 	if s.DB == nil {
 		// Without a database there is no name mapping, so the name can only
 		// be the contents themselves.
@@ -538,7 +619,7 @@ func (s *FileServer) forget(name, digest string) error {
 		return nil
 	}
 
-	hash, orphaned, err := s.DB.DeleteFileByName(context.Background(), name, digest)
+	hash, orphaned, err := s.DB.DeleteFileByName(context.Background(), name, digest, owner, signature)
 	if err != nil {
 		// Stop before touching the disk. Removing the bytes while the
 		// metadata still points at them is the inconsistency worth avoiding;
@@ -794,7 +875,7 @@ func (s *FileServer) Store(name string, r io.Reader) error {
 		if err := s.DB.ClearDeletion(context.Background(), name, digest); err != nil {
 			log.Printf("[%s] Could not clear the deletion record for %q: %v", s.Transport.Address(), name, err)
 		}
-		if err := s.recordFile(name, digest, size); err != nil {
+		if err := s.recordFile(name, digest, size, s.OwnerID()); err != nil {
 			// The bytes are on disk but unrecorded, so surface it rather than
 			// reporting a store that later commands cannot see.
 			return fmt.Errorf("recording file %q: %w", name, err)
@@ -806,6 +887,7 @@ func (s *FileServer) Store(name string, r io.Reader) error {
 			Name:   name,
 			Digest: digest,
 			Size:   size,
+			Owner:  s.OwnerID(),
 		},
 	}
 
@@ -890,11 +972,29 @@ func (s *FileServer) Delete(name string) error {
 	// The digest is needed before the name mapping goes, so peers can tell
 	// this deletion applies to their copy and not to a different file of the
 	// same name.
-	var digest string
+	var digest, owner string
+	var signature []byte
 	if local, err := s.resolve(name); err != nil {
 		return err
 	} else if local != nil {
 		digest = local.digest
+
+		// Peers verify the authorisation against the file's recorded owner, so
+		// it has to be produced here while the record still exists.
+		if s.DB != nil {
+			f, err := s.DB.FindFileByName(context.Background(), name)
+			if err != nil {
+				return err
+			}
+			if f != nil {
+				owner = f.Owner
+			}
+		}
+		if owner == s.OwnerID() {
+			signature = s.OwnerIdentity.Sign(deleteTranscript(name, digest))
+		} else if owner != "" {
+			return fmt.Errorf("'%s' is owned by %s, so this node cannot authorise deleting it", name, short(owner))
+		}
 	}
 
 	// Query the peers holding this file before the metadata that names them
@@ -909,7 +1009,7 @@ func (s *FileServer) Delete(name string) error {
 		}
 	}
 
-	if err := s.forget(name, digest); err != nil {
+	if err := s.forget(name, digest, owner, signature); err != nil {
 		return fmt.Errorf("[%s] %w", s.Transport.Address(), err)
 	}
 
@@ -944,7 +1044,12 @@ func (s *FileServer) Delete(name string) error {
 		return nil
 	}
 
-	msg := Message{Payload: MessageDeleteFile{Name: name, Digest: digest}}
+	msg := Message{Payload: MessageDeleteFile{
+		Name:      name,
+		Digest:    digest,
+		Owner:     owner,
+		Signature: signature,
+	}}
 	if err := s.broadcast(&msg); err != nil {
 		return err
 	}
@@ -1086,13 +1191,25 @@ func (s *FileServer) announceTo(peerAddr string) {
 // Handshake is the first thing exchanged on a new connection.
 type Handshake struct {
 	Version uint32
-	NodeID  string
+
+	// PublicKey names the node. Peers verify its signatures against this, so
+	// a claim to be a particular node can be checked rather than trusted.
+	PublicKey []byte
 
 	// ListenPort is the port this node accepts connections on. Only the port
 	// is sent: the receiver already knows which address the connection came
 	// from and pairs the two, so a node configured with a bare ":3000" is
 	// still reachable by peers on other machines.
 	ListenPort string
+
+	// Challenge is a fresh random value the peer must sign, which is what
+	// makes a captured handshake useless on another connection.
+	Challenge []byte
+}
+
+// HandshakeProof answers a peer's challenge.
+type HandshakeProof struct {
+	Signature []byte
 }
 
 // portSource reports the port this node accepts connections on. It is read at
@@ -1118,53 +1235,87 @@ func localListenPort(src portSource) string {
 
 // GetHandshakeFunc builds the handshake run on every new connection.
 //
-// It settles three things before any file traffic is allowed: that both sides
-// speak the same protocol version, that the peer is not this node reached by
-// a roundabout route, and what address other nodes should use to reach it.
-func GetHandshakeFunc(nodeID string, src portSource) p2p.HandshakeFunc {
+// It settles four things before any file traffic is allowed: that both sides
+// speak the same protocol version, that the peer holds the private key for the
+// identity it claims, that it is not this node reached by a roundabout route,
+// and what address other nodes should use to reach it.
+//
+// The proof of identity matters because everything downstream leans on it. A
+// node id used to be an unverified assertion, so a peer could claim to be any
+// node it liked; deciding what a peer is allowed to do would have been
+// meaningless on top of that.
+func GetHandshakeFunc(identity Identity, src portSource) p2p.HandshakeFunc {
 	return func(p any) error {
 		peer, ok := p.(*p2p.TCPPeer)
 		if !ok {
 			return fmt.Errorf("invalid peer type for TCP handshake")
 		}
+		if !identity.Valid() {
+			return fmt.Errorf("this node has no identity key")
+		}
 
-		hs := Handshake{
+		// One encoder and decoder for the whole exchange: a second decoder on
+		// the same stream could discard bytes the first had buffered.
+		enc := gob.NewEncoder(peer)
+		dec := gob.NewDecoder(peer)
+
+		challenge, err := newChallenge()
+		if err != nil {
+			return err
+		}
+
+		// 1. Announce who we are and what we want signed.
+		if err := enc.Encode(Handshake{
 			Version:    p2p.ProtocolVersion,
-			NodeID:     nodeID,
+			PublicKey:  identity.PublicKey(),
 			ListenPort: localListenPort(src),
-		}
-
-		// 1. Send our handshake
-		buf := new(bytes.Buffer)
-		if err := gob.NewEncoder(buf).Encode(hs); err != nil {
+			Challenge:  challenge,
+		}); err != nil {
 			return err
 		}
 
-		if err := peer.Send(buf.Bytes()); err != nil {
+		var remote Handshake
+		if err := dec.Decode(&remote); err != nil {
 			return err
 		}
 
-		// 2. Receive their handshake
-		var remoteHS Handshake
-		if err := gob.NewDecoder(peer).Decode(&remoteHS); err != nil {
-			return err
-		}
-
-		if remoteHS.Version != p2p.ProtocolVersion {
+		if remote.Version != p2p.ProtocolVersion {
 			return fmt.Errorf("protocol version mismatch: peer speaks %d, this node speaks %d",
-				remoteHS.Version, p2p.ProtocolVersion)
+				remote.Version, p2p.ProtocolVersion)
 		}
-		if remoteHS.NodeID == "" {
-			return fmt.Errorf("peer did not identify itself")
+
+		remoteID := hex.EncodeToString(remote.PublicKey)
+		if _, err := publicKeyForNode(remoteID); err != nil {
+			return fmt.Errorf("peer did not present a usable identity: %w", err)
 		}
-		if remoteHS.NodeID == nodeID {
+		if remoteID == identity.NodeID() {
 			// Gossip hands out addresses, and one of them is eventually our
 			// own. Identity is what tells the difference reliably; comparing
 			// addresses cannot, because a node has several.
 			return fmt.Errorf("refusing to connect to self")
 		}
-		if remoteHS.ListenPort == "" {
-			return fmt.Errorf("peer %s did not advertise a listen port", remoteHS.NodeID)
+		if len(remote.Challenge) != challengeSize {
+			return fmt.Errorf("peer %s sent a %d byte challenge, want %d", remoteID, len(remote.Challenge), challengeSize)
+		}
+		if remote.ListenPort == "" {
+			return fmt.Errorf("peer %s did not advertise a listen port", remoteID)
+		}
+
+		// 2. Prove we hold the key for the identity we claimed, and check
+		// that they can do the same.
+		if err := enc.Encode(HandshakeProof{
+			Signature: identity.Sign(handshakeTranscript(identity.PublicKey(), remote.PublicKey, remote.Challenge)),
+		}); err != nil {
+			return err
+		}
+
+		var remoteProof HandshakeProof
+		if err := dec.Decode(&remoteProof); err != nil {
+			return err
+		}
+
+		if !verifyByNode(remoteID, handshakeTranscript(remote.PublicKey, identity.PublicKey(), challenge), remoteProof.Signature) {
+			return fmt.Errorf("peer %s could not prove it holds that identity", remoteID)
 		}
 
 		// Pair the port the peer advertises with the address the connection
@@ -1172,13 +1323,13 @@ func GetHandshakeFunc(nodeID string, src portSource) p2p.HandshakeFunc {
 		// otherwise hand out an address that resolves to the wrong host.
 		host := peer.ObservedHost()
 		if host == "" {
-			return fmt.Errorf("could not determine the address peer %s connected from", remoteHS.NodeID)
+			return fmt.Errorf("could not determine the address peer %s connected from", remoteID)
 		}
 
-		peer.NodeID = remoteHS.NodeID
-		peer.FullAddr = net.JoinHostPort(host, remoteHS.ListenPort)
+		peer.NodeID = remoteID
+		peer.FullAddr = net.JoinHostPort(host, remote.ListenPort)
 
-		fmt.Printf("[%s] Handshake successful with %s at %s\n", src.Address(), remoteHS.NodeID, peer.FullAddr)
+		fmt.Printf("[%s] Handshake successful with %s at %s\n", src.Address(), short(remoteID), peer.FullAddr)
 
 		return nil
 	}
@@ -1258,10 +1409,23 @@ func init() {
 	gob.Register(MessagePeerExchange{})
 	gob.Register(PeerInfo{})
 	gob.Register(Handshake{})
+	gob.Register(HandshakeProof{})
 }
 
 type FileServerOpts struct {
-	NodeID string
+	// Identity is the signing key that names this node on the network, used
+	// for the handshake.
+	Identity Identity
+
+	// OwnerIdentity signs ownership of stored files.
+	//
+	// It is the identity persisted in the database, which is not always this
+	// process's network identity: a one-shot command joins the network under a
+	// throwaway key so that the node it borrows the database from does not
+	// refuse the connection as one to itself. Files must still be owned by the
+	// database's own identity, or a command would store files that nobody,
+	// itself included, could ever delete.
+	OwnerIdentity Identity
 
 	// MaxPeersPerHost caps how many identities may be accepted from one
 	// address. Zero means the package default.
@@ -1316,6 +1480,9 @@ type FileServer struct {
 }
 
 func NewFileServer(opts FileServerOpts) *FileServer {
+	if !opts.OwnerIdentity.Valid() {
+		opts.OwnerIdentity = opts.Identity
+	}
 	if opts.MaxPeersPerHost <= 0 {
 		opts.MaxPeersPerHost = dbpkg.DefaultMaxPeersPerHost
 	}
@@ -1357,6 +1524,10 @@ type MessageStoreFile struct {
 	Name      string
 	Digest    string
 	Size      int64
+
+	// Owner is the node that stored the file. It travels with every copy so
+	// that a peer holding a replica knows who is entitled to delete it.
+	Owner string
 }
 
 // MessageGetFile asks every peer whether it holds anything under Name.
@@ -1391,9 +1562,14 @@ type MessageFetchFile struct {
 // Digest names the contents being deleted. Two nodes may legitimately use the
 // same name for different files, so a peer only acts when its own name refers
 // to the same contents.
+//
+// Signature is the owner's authorisation, over the name and digest together.
+// Without it, reaching a peer would be enough to destroy anything it holds.
 type MessageDeleteFile struct {
-	Name   string
-	Digest string
+	Name      string
+	Digest    string
+	Owner     string
+	Signature []byte
 }
 
 type MessagePeerExchange struct {

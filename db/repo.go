@@ -33,6 +33,11 @@ type File struct {
 
 	Size      int64
 	LocalPath string
+
+	// Owner is the node id that stored the file. A deletion has to be signed
+	// by this identity, so that reaching a peer is not by itself permission
+	// to destroy what it holds.
+	Owner     string
 	CreatedAt time.Time
 }
 
@@ -163,15 +168,16 @@ func (d *DB) InsertFileWithKey(ctx context.Context, f File, keyID string) error 
 	defer tx.Rollback()
 
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO files(id,name,hash,size,local_path)
-		VALUES(?,?,?,?,?)
+		INSERT INTO files(id,name,hash,size,local_path,owner)
+		VALUES(?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name,
 			hash=excluded.hash,
 			size=excluded.size,
 			local_path=excluded.local_path,
+			owner=excluded.owner,
 			created_at=CURRENT_TIMESTAMP
-	`, f.ID, f.Name, f.Hash, f.Size, f.LocalPath); err != nil {
+	`, f.ID, f.Name, f.Hash, f.Size, f.LocalPath, f.Owner); err != nil {
 		return err
 	}
 
@@ -187,7 +193,7 @@ func (d *DB) InsertFileWithKey(ctx context.Context, f File, keyID string) error 
 
 func (d *DB) ListFiles(ctx context.Context) ([]File, error) {
 	rows, err := d.sql.QueryContext(ctx, `
-		SELECT id,name,hash,size,local_path,created_at FROM files ORDER BY created_at DESC
+		SELECT id,name,hash,size,local_path,owner,created_at FROM files ORDER BY created_at DESC
 	`)
 	if err != nil {
 		return nil, err
@@ -196,7 +202,7 @@ func (d *DB) ListFiles(ctx context.Context) ([]File, error) {
 	var out []File
 	for rows.Next() {
 		var f File
-		if err := rows.Scan(&f.ID, &f.Name, &f.Hash, &f.Size, &f.LocalPath, &f.CreatedAt); err != nil {
+		if err := rows.Scan(&f.ID, &f.Name, &f.Hash, &f.Size, &f.LocalPath, &f.Owner, &f.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, f)
@@ -208,11 +214,11 @@ func (d *DB) ListFiles(ctx context.Context) ([]File, error) {
 // none. It replaces scanning the entire file list on every incoming request.
 func (d *DB) FindFileByHash(ctx context.Context, hash string) (*File, error) {
 	row := d.sql.QueryRowContext(ctx, `
-		SELECT id,name,hash,size,local_path,created_at FROM files WHERE hash=? LIMIT 1
+		SELECT id,name,hash,size,local_path,owner,created_at FROM files WHERE hash=? LIMIT 1
 	`, hash)
 
 	var f File
-	if err := row.Scan(&f.ID, &f.Name, &f.Hash, &f.Size, &f.LocalPath, &f.CreatedAt); err != nil {
+	if err := row.Scan(&f.ID, &f.Name, &f.Hash, &f.Size, &f.LocalPath, &f.Owner, &f.CreatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -252,15 +258,16 @@ func (d *DB) InsertReplica(ctx context.Context, f File, keyID string) (storedNam
 	}
 
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO files(id,name,hash,size,local_path)
-		VALUES(?,?,?,?,?)
+		INSERT INTO files(id,name,hash,size,local_path,owner)
+		VALUES(?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name,
 			hash=excluded.hash,
 			size=excluded.size,
 			local_path=excluded.local_path,
+			owner=excluded.owner,
 			created_at=CURRENT_TIMESTAMP
-	`, f.ID, f.Name, f.Hash, f.Size, f.LocalPath); err != nil {
+	`, f.ID, f.Name, f.Hash, f.Size, f.LocalPath, f.Owner); err != nil {
 		return "", err
 	}
 
@@ -280,11 +287,11 @@ func (d *DB) InsertReplica(ctx context.Context, f File, keyID string) (storedNam
 // node holds nothing under that name.
 func (d *DB) FindFileByName(ctx context.Context, name string) (*File, error) {
 	row := d.sql.QueryRowContext(ctx, `
-		SELECT id,name,hash,size,local_path,created_at FROM files WHERE name=? LIMIT 1
+		SELECT id,name,hash,size,local_path,owner,created_at FROM files WHERE name=? LIMIT 1
 	`, name)
 
 	var f File
-	if err := row.Scan(&f.ID, &f.Name, &f.Hash, &f.Size, &f.LocalPath, &f.CreatedAt); err != nil {
+	if err := row.Scan(&f.ID, &f.Name, &f.Hash, &f.Size, &f.LocalPath, &f.Owner, &f.CreatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -333,7 +340,7 @@ func (d *DB) CountNamesForHash(ctx context.Context, hash string) (int, error) {
 //
 // The removal is recorded as a tombstone in the same transaction, so a peer
 // that still holds the file cannot push it back afterwards.
-func (d *DB) DeleteFileByName(ctx context.Context, name, expectedHash string) (hash string, orphaned bool, err error) {
+func (d *DB) DeleteFileByName(ctx context.Context, name, expectedHash, owner string, signature []byte) (hash string, orphaned bool, err error) {
 	tx, err := d.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return "", false, err
@@ -364,11 +371,17 @@ func (d *DB) DeleteFileByName(ctx context.Context, name, expectedHash string) (h
 		return "", false, err
 	}
 
+	// The authorisation is kept with the tombstone so it can be replayed to a
+	// peer that still holds the file, which is how a deletion reaches nodes
+	// that were unreachable when it was broadcast.
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO deletions(name,digest,deleted_at)
-		VALUES(?,?,CURRENT_TIMESTAMP)
-		ON CONFLICT(name,digest) DO UPDATE SET deleted_at=CURRENT_TIMESTAMP
-	`, name, hash); err != nil {
+		INSERT INTO deletions(name,digest,owner,signature,deleted_at)
+		VALUES(?,?,?,?,CURRENT_TIMESTAMP)
+		ON CONFLICT(name,digest) DO UPDATE SET
+			owner=excluded.owner,
+			signature=excluded.signature,
+			deleted_at=CURRENT_TIMESTAMP
+	`, name, hash, owner, signature); err != nil {
 		return "", false, err
 	}
 
@@ -395,6 +408,22 @@ func (d *DB) IsDeleted(ctx context.Context, name, digest string) (bool, error) {
 		SELECT COUNT(*) FROM deletions WHERE name=? AND digest=?
 	`, name, digest).Scan(&n)
 	return n > 0, err
+}
+
+// GetDeletion returns the authorisation recorded with a tombstone.
+func (d *DB) GetDeletion(ctx context.Context, name, digest string) (owner string, signature []byte, ok bool, err error) {
+	row := d.sql.QueryRowContext(ctx, `
+		SELECT owner, signature FROM deletions WHERE name=? AND digest=?
+	`, name, digest)
+
+	var sig []byte
+	if err := row.Scan(&owner, &sig); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil, false, nil
+		}
+		return "", nil, false, err
+	}
+	return owner, sig, true, nil
 }
 
 // ClearDeletion forgets a tombstone, so storing the same file again under the
@@ -560,6 +589,20 @@ func (d *DB) GetOrCreateDefaultKey(ctx context.Context, gen func() ([]byte, erro
 		return nil, err
 	}
 
+	stored, err := d.putKeyIfAbsent(ctx, id, "default", "AES-CTR-256", keyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("storing encryption key: %w", err)
+	}
+	return stored, nil
+}
+
+// putKeyIfAbsent stores key material only if the id is unused, and returns
+// whatever is stored afterwards.
+//
+// The conditional insert and the read back happen in one transaction so
+// concurrent callers agree on one value. A plain check-then-write let two
+// processes sharing a database each store their own and overwrite the other's.
+func (d *DB) putKeyIfAbsent(ctx context.Context, id, label, algo string, keyBytes []byte) ([]byte, error) {
 	tx, err := d.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -570,19 +613,49 @@ func (d *DB) GetOrCreateDefaultKey(ctx context.Context, gen func() ([]byte, erro
 		INSERT INTO keys(id,label,algo,key_bytes,created_at)
 		VALUES(?,?,?,?,CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO NOTHING
-	`, id, "default", "AES-CTR-256", keyBytes); err != nil {
-		return nil, fmt.Errorf("storing encryption key: %w", err)
+	`, id, label, algo, keyBytes); err != nil {
+		return nil, err
 	}
 
-	// Read back whichever key won, rather than assuming it was ours.
 	var stored []byte
 	if err := tx.QueryRowContext(ctx, `SELECT key_bytes FROM keys WHERE id=?`, id).Scan(&stored); err != nil {
-		return nil, fmt.Errorf("reading back encryption key: %w", err)
+		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("storing encryption key: %w", err)
+		return nil, err
+	}
+	return stored, nil
+}
+
+// identityKeyID names the row holding this node's signing key.
+const identityKeyID = "node_identity"
+
+// GetOrCreateIdentityKey returns the private key naming this node, generating
+// one on first use.
+//
+// The key is the node's identity: peers verify signatures against the matching
+// public key, so it has to survive restarts and be the same for every process
+// sharing this database.
+func (d *DB) GetOrCreateIdentityKey(ctx context.Context, gen func() ([]byte, error)) ([]byte, error) {
+	k, err := d.GetKey(ctx, identityKeyID)
+	switch {
+	case err == nil:
+		return k.KeyBytes, nil
+	case errors.Is(err, sql.ErrNoRows):
+		// fall through and create one
+	default:
+		return nil, fmt.Errorf("loading identity key: %w", err)
 	}
 
+	keyBytes, err := gen()
+	if err != nil {
+		return nil, err
+	}
+
+	stored, err := d.putKeyIfAbsent(ctx, identityKeyID, "node identity", "Ed25519", keyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("storing identity key: %w", err)
+	}
 	return stored, nil
 }
 
@@ -698,8 +771,11 @@ func (d *DB) PutSetting(ctx context.Context, key, value string) error {
 	return err
 }
 
-// nodeIDSetting is the settings key holding this node's identity.
-const nodeIDSetting = "node_id"
+// NodeIDSetting is the settings key holding this node's identity.
+const NodeIDSetting = "node_id"
+
+// nodeIDSetting is retained for internal use.
+const nodeIDSetting = NodeIDSetting
 
 // ServingAddressSetting names the address of the long-lived node that owns a
 // database. Commands open the same database to reuse its metadata and

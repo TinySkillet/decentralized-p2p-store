@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/gob"
 	"fmt"
 	"io"
@@ -17,9 +18,15 @@ import (
 	"github.com/TinySkillet/DecentralizedP2PStorage/p2p"
 )
 
-// dialRaw opens a connection and speaks the handshake by hand, so a test can
-// present a handshake a well-behaved node never would.
-func dialRaw(t *testing.T, addr string, hs Handshake) net.Conn {
+// rawPeer speaks the handshake by hand, so a test can present a handshake a
+// well-behaved node never would.
+type rawPeer struct {
+	conn net.Conn
+	enc  *gob.Encoder
+	dec  *gob.Decoder
+}
+
+func dialRaw(t *testing.T, addr string) *rawPeer {
 	t.Helper()
 
 	conn, err := net.Dial("tcp", addr)
@@ -28,10 +35,49 @@ func dialRaw(t *testing.T, addr string, hs Handshake) net.Conn {
 	}
 	t.Cleanup(func() { conn.Close() })
 
-	if err := gob.NewEncoder(conn).Encode(hs); err != nil {
+	return &rawPeer{conn: conn, enc: gob.NewEncoder(conn), dec: gob.NewDecoder(conn)}
+}
+
+// hello sends the opening handshake message.
+func (r *rawPeer) hello(t *testing.T, hs Handshake) {
+	t.Helper()
+	if err := r.enc.Encode(hs); err != nil {
 		t.Fatalf("sending handshake: %v", err)
 	}
-	return conn
+}
+
+// readHello reads the node's opening handshake message.
+func (r *rawPeer) readHello(t *testing.T) Handshake {
+	t.Helper()
+	r.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var hs Handshake
+	if err := r.dec.Decode(&hs); err != nil {
+		t.Fatalf("reading handshake: %v", err)
+	}
+	return hs
+}
+
+// proof answers the node's challenge.
+func (r *rawPeer) proof(t *testing.T, sig []byte) {
+	t.Helper()
+	if err := r.enc.Encode(HandshakeProof{Signature: sig}); err != nil {
+		t.Logf("sending proof: %v", err)
+	}
+}
+
+// validHello is a well-formed opening message from a freshly made identity.
+func validHello(t *testing.T, id Identity, port string) Handshake {
+	t.Helper()
+	challenge, err := newChallenge()
+	if err != nil {
+		t.Fatalf("newChallenge: %v", err)
+	}
+	return Handshake{
+		Version:    p2p.ProtocolVersion,
+		PublicKey:  id.PublicKey(),
+		ListenPort: port,
+		Challenge:  challenge,
+	}
 }
 
 // assertNoPeers gives the node a moment to accept the connection, then checks
@@ -51,37 +97,89 @@ func assertNoPeers(t *testing.T, node *testNode, why string) {
 func TestHandshakeRejectsProtocolVersionMismatch(t *testing.T) {
 	node := newTestNode(t)
 
+	other, err := newIdentity()
+	if err != nil {
+		t.Fatalf("newIdentity: %v", err)
+	}
+
 	// A future version of the wire format must be refused outright. Accepting
 	// it would mean two nodes misreading each other's frames, which shows up
 	// much later as corrupt data instead of a refused connection.
-	dialRaw(t, node.addr, Handshake{
-		Version:    p2p.ProtocolVersion + 1,
-		NodeID:     "some-other-node",
-		ListenPort: "1234",
-	})
+	hs := validHello(t, other, "1234")
+	hs.Version = p2p.ProtocolVersion + 1
+	dialRaw(t, node.addr).hello(t, hs)
 
 	assertNoPeers(t, node, "the peer announced a different protocol version")
+}
+
+// TestHandshakeRejectsUnprovenIdentity is the point of the challenge: a node
+// id used to be an unverified assertion, so a peer could claim to be any node
+// it liked. Deciding what a peer is allowed to do is meaningless on top of an
+// identity anyone can wear.
+func TestHandshakeRejectsUnprovenIdentity(t *testing.T) {
+	node := newTestNode(t)
+
+	// A real identity's public key, presented by someone who does not hold
+	// the matching private key.
+	victim, err := newIdentity()
+	if err != nil {
+		t.Fatalf("newIdentity: %v", err)
+	}
+
+	raw := dialRaw(t, node.addr)
+	raw.hello(t, validHello(t, victim, "1234"))
+	raw.readHello(t)
+	raw.proof(t, make([]byte, ed25519.SignatureSize)) // a signature of zeroes
+
+	assertNoPeers(t, node, "the peer could not prove it holds that identity")
+}
+
+// TestHandshakeAcceptsProvenIdentity is the positive case, so the rejection
+// tests above are not passing because the handshake refuses everything.
+func TestHandshakeAcceptsProvenIdentity(t *testing.T) {
+	node := newTestNode(t)
+
+	caller, err := newIdentity()
+	if err != nil {
+		t.Fatalf("newIdentity: %v", err)
+	}
+
+	raw := dialRaw(t, node.addr)
+	hello := validHello(t, caller, portOf(t, node.addr))
+	raw.hello(t, hello)
+
+	theirs := raw.readHello(t)
+	raw.proof(t, caller.Sign(handshakeTranscript(caller.PublicKey(), theirs.PublicKey, theirs.Challenge)))
+
+	waitFor(t, "the node to accept a proven identity", 5*time.Second, func() bool {
+		return node.peerCount() > 0
+	})
 }
 
 func TestHandshakeRejectsUnidentifiedPeer(t *testing.T) {
 	node := newTestNode(t)
 
-	dialRaw(t, node.addr, Handshake{
+	// No public key at all, so there is nothing to verify against.
+	dialRaw(t, node.addr).hello(t, Handshake{
 		Version:    p2p.ProtocolVersion,
 		ListenPort: "1234",
+		Challenge:  make([]byte, challengeSize),
 	})
 
-	assertNoPeers(t, node, "the peer sent no node id")
+	assertNoPeers(t, node, "the peer presented no identity")
 }
 
 func TestHandshakeRejectsPeerWithoutListenPort(t *testing.T) {
 	node := newTestNode(t)
 
+	other, err := newIdentity()
+	if err != nil {
+		t.Fatalf("newIdentity: %v", err)
+	}
+
 	// Without a port there is no way to record an address others can reach.
-	dialRaw(t, node.addr, Handshake{
-		Version: p2p.ProtocolVersion,
-		NodeID:  "some-other-node",
-	})
+	hs := validHello(t, other, "")
+	dialRaw(t, node.addr).hello(t, hs)
 
 	assertNoPeers(t, node, "the peer advertised no listen port")
 }
@@ -156,7 +254,7 @@ func TestNodeIDSurvivesRestart(t *testing.T) {
 		if err != nil {
 			t.Fatalf("makeServerWithDB: %v", err)
 		}
-		ids = append(ids, s.NodeID)
+		ids = append(ids, s.NodeID())
 		d.Close()
 	}
 
@@ -174,7 +272,7 @@ func TestNodeIDsAreDistinctPerNode(t *testing.T) {
 	first := newTestNode(t)
 	second := newTestNode(t)
 
-	if first.NodeID == second.NodeID {
+	if first.NodeID() == second.NodeID() {
 		t.Fatal("two nodes were given the same identity")
 	}
 }

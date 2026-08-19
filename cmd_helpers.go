@@ -19,26 +19,55 @@ func getStorageRoot(listenAddr string) string {
 }
 
 func makeServer(listenAddr string, nodes ...string) (*FileServer, error) {
-	nodeID, err := newNodeID()
+	identity, err := newIdentity()
 	if err != nil {
 		return nil, err
 	}
-	return newServer(listenAddr, nodeID, nil, getStorageRoot(listenAddr), nodes...)
+	return newServer(listenAddr, identity, identity, nil, getStorageRoot(listenAddr), nodes...)
 }
 
 // makeServerWithDB builds a long-lived node whose identity is persisted in db.
 func makeServerWithDB(listenAddr string, db *dbpkg.DB, nodes ...string) (*FileServer, error) {
-	nodeID, err := newNodeID()
-	if db != nil {
-		// Identity has to outlive the process: peers remember it, and it is
-		// what lets this node recognise a connection back to itself.
-		nodeID, err = db.GetOrCreateNodeID(context.Background(), newNodeID)
-	}
+	identity, err := loadOrInitIdentity(db)
 	if err != nil {
 		return nil, err
 	}
 
-	return newServer(listenAddr, nodeID, db, storageRootFor(listenAddr, db), nodes...)
+	return newServer(listenAddr, identity, identity, db, storageRootFor(listenAddr, db), nodes...)
+}
+
+// loadOrInitIdentity returns the node's signing identity, persisted in db so
+// that it survives restarts and is shared by every process using it.
+func loadOrInitIdentity(db *dbpkg.DB) (Identity, error) {
+	if db == nil {
+		return newIdentity()
+	}
+
+	keyBytes, err := db.GetOrCreateIdentityKey(context.Background(), func() ([]byte, error) {
+		id, err := newIdentity()
+		if err != nil {
+			return nil, err
+		}
+		return id.PrivateKey(), nil
+	})
+	if err != nil {
+		return Identity{}, err
+	}
+
+	identity, err := identityFromKey(keyBytes)
+	if err != nil {
+		return Identity{}, err
+	}
+
+	// Peers and the storage-owner check both look the node up by id, so the
+	// recorded value has to follow the key rather than a value from an older
+	// build. Every process derives the same id from the same key, so writing
+	// it unconditionally is idempotent.
+	if err := db.PutSetting(context.Background(), dbpkg.NodeIDSetting, identity.NodeID()); err != nil {
+		return Identity{}, err
+	}
+
+	return identity, nil
 }
 
 // makeClientNode builds the short-lived node a one-shot command runs on.
@@ -49,12 +78,20 @@ func makeServerWithDB(listenAddr string, db *dbpkg.DB, nodes ...string) (*FileSe
 // sharing an identity would make the node it connects to refuse the
 // connection as one to itself.
 func makeClientNode(listenAddr string, db *dbpkg.DB, nodes ...string) (*FileServer, error) {
-	nodeID, err := newNodeID()
+	identity, err := newIdentity()
 	if err != nil {
 		return nil, err
 	}
 
-	s, err := newServer(listenAddr, nodeID, db, storageRootFor(listenAddr, db), nodes...)
+	// Files belong to the database, not to this process. Without the
+	// database's own identity a command would store files owned by a key that
+	// disappears when it exits, leaving them undeletable by anyone.
+	owner, err := loadOrInitIdentity(db)
+	if err != nil {
+		return nil, err
+	}
+
+	s, err := newServer(listenAddr, identity, owner, db, storageRootFor(listenAddr, db), nodes...)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +113,7 @@ func storageRootFor(listenAddr string, db *dbpkg.DB) string {
 	return filepath.Join(filepath.Dir(db.Path()), "files")
 }
 
-func newServer(listenAddr, nodeID string, db *dbpkg.DB, storageRoot string, nodes ...string) (*FileServer, error) {
+func newServer(listenAddr string, identity, owner Identity, db *dbpkg.DB, storageRoot string, nodes ...string) (*FileServer, error) {
 	// A per-process key is only a placeholder; commands with a database
 	// replace it with the node's persisted key.
 	key, err := newEncryptionKey()
@@ -91,10 +128,11 @@ func newServer(listenAddr, nodeID string, db *dbpkg.DB, storageRoot string, node
 
 	// Set after construction: the handshake reads the port the transport
 	// actually bound, which is only known once it exists.
-	tcpTransport.HandshakeFunc = GetHandshakeFunc(nodeID, tcpTransport)
+	tcpTransport.HandshakeFunc = GetHandshakeFunc(identity, tcpTransport)
 
 	s := NewFileServer(FileServerOpts{
-		NodeID:            nodeID,
+		Identity:          identity,
+		OwnerIdentity:     owner,
 		EncryptionKey:     key,
 		PathTransformFunc: CASPathTransformFunc,
 		StorageRoot:       storageRoot,
