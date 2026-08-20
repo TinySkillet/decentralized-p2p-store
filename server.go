@@ -598,6 +598,26 @@ func (s *FileServer) authorizeDelete(msg MessageDeleteFile) error {
 		return fmt.Errorf("the authorisation does not verify against %s", short(msg.Owner))
 	}
 
+	// The authorisation is genuine, and still may not apply.
+	//
+	// As the file's owner we would hold a tombstone if we wanted it gone, so
+	// holding the file without one means it was deliberately stored again. An
+	// authorisation stays valid for ever, and a peer that kept the old
+	// tombstone replays it when it refuses the new copy — which would destroy
+	// the copy we had just chosen to make.
+	//
+	// A genuine deletion here never reaches this path: Delete records the
+	// tombstone locally before it broadcasts.
+	if f.Owner == s.OwnerID() {
+		deleted, err := s.DB.IsDeleted(context.Background(), msg.Name, f.Hash)
+		if err != nil {
+			return fmt.Errorf("checking our own deletion record: %w", err)
+		}
+		if !deleted {
+			return fmt.Errorf("we own %q and hold no deletion record for it, so it was stored again deliberately", msg.Name)
+		}
+	}
+
 	return nil
 }
 

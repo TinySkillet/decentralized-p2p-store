@@ -240,3 +240,66 @@ func TestDeleteOnlyAffectsMatchingContents(t *testing.T) {
 		t.Error("the peer's file contents changed")
 	}
 }
+
+// TestRestoringADeletedFileSurvivesAPeerTombstone is a regression test for a
+// data-loss bug.
+//
+// A peer that still holds a tombstone refuses a re-replication and replays the
+// original delete authorisation back at the sender. That authorisation is
+// permanently valid, so the owner — which had deliberately stored the file
+// again — honoured it and destroyed the copy it had just made. The store
+// reported success.
+func TestRestoringADeletedFileSurvivesAPeerTombstone(t *testing.T) {
+	owner := newQuietNodeWith(t, 2)
+	peer := newQuietNodeWith(t, 2, owner.addr)
+
+	waitForPeerCount(t, owner, 1)
+	waitForPeerCount(t, peer, 1)
+
+	payload := randomBytes(t, 2048)
+	digest := contentKey(payload)
+
+	if err := owner.Store("revived", bytes.NewReader(payload)); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	waitFor(t, "the peer to receive it", 10*time.Second, func() bool {
+		return peer.store.Has(digest)
+	})
+
+	if err := owner.Delete("revived"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	waitFor(t, "the peer to record the deletion", 10*time.Second, func() bool {
+		deleted, err := peer.db.IsDeleted(context.Background(), "revived", digest)
+		return err == nil && deleted
+	})
+
+	// The owner deliberately stores it again. The peer's tombstone must not be
+	// able to undo that.
+	if err := owner.Store("revived", bytes.NewReader(payload)); err != nil {
+		t.Fatalf("second Store: %v", err)
+	}
+
+	// Give any refusal time to come back and be acted on.
+	time.Sleep(500 * time.Millisecond)
+
+	f, err := owner.db.FindFileByName(context.Background(), "revived")
+	if err != nil {
+		t.Fatalf("FindFileByName: %v", err)
+	}
+	if f == nil {
+		t.Fatal("the re-stored file was deleted again by a peer replaying an old authorisation")
+	}
+
+	_, r, err := owner.Get("revived")
+	if err != nil {
+		t.Fatalf("Get after re-storing: %v", err)
+	}
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Error("the re-stored file does not read back")
+	}
+}
