@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"sort"
 	"time"
 
 	dbpkg "github.com/TinySkillet/DecentralizedP2PStorage/db"
@@ -58,7 +59,7 @@ type FileHealth struct {
 	Copies int
 	Target int
 
-	// Holders are the peers that answered yes, excluding this node.
+	// Holders are the node ids of peers that answered yes, excluding this node.
 	Holders []string
 }
 
@@ -128,16 +129,42 @@ func (s *FileServer) RepairOnce() (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	if len(files) == 0 {
+		return 0, nil
+	}
+
+	// A cycle is bounded, so it must resume where the last one stopped.
+	// Restarting from the same end every time means a node holding more blobs
+	// than one cycle checks never reaches the rest at all.
+	//
+	// Sorted by id rather than taken in the order the database returned them:
+	// that order is created_at descending, and SQLite's CURRENT_TIMESTAMP has
+	// one-second resolution, so files stored in the same second compare equal
+	// and their relative order is unspecified. A cursor needs a total order.
+	sort.Slice(files, func(i, j int) bool { return files[i].ID < files[j].ID })
+
+	cursor := s.repairCursor()
+	start := sort.Search(len(files), func(i int) bool { return files[i].ID > cursor })
+	if start == len(files) {
+		// Past the end, or the file the cursor named is gone: wrap around.
+		start = 0
+	}
 
 	// One blob can carry several names; checking it once per cycle is enough.
 	seen := make(map[string]bool, len(files))
 
 	repaired := 0
 	checked := 0
-	for _, f := range files {
+	examined := cursor
+
+	for i := range files {
 		if checked >= maxRepairsPerCycle {
 			break
 		}
+
+		f := files[(start+i)%len(files)]
+		examined = f.ID
+
 		if seen[f.Hash] || !s.store.Has(f.Hash) {
 			continue
 		}
@@ -153,12 +180,43 @@ func (s *FileServer) RepairOnce() (int, error) {
 
 		select {
 		case <-s.quitch:
+			s.setRepairCursor(examined)
 			return repaired, nil
 		default:
 		}
 	}
 
+	s.setRepairCursor(examined)
+
 	return repaired, nil
+}
+
+// repairCursor returns the id of the last file the previous cycle examined.
+func (s *FileServer) repairCursor() string {
+	if s.DB == nil {
+		return ""
+	}
+	cursor, ok, err := s.DB.GetSetting(context.Background(), dbpkg.RepairCursorSetting)
+	if err != nil {
+		log.Printf("[%s] Could not read the repair cursor: %v", s.Transport.Address(), err)
+		return ""
+	}
+	if !ok {
+		return ""
+	}
+	return cursor
+}
+
+// setRepairCursor records how far this cycle got. It is persisted rather than
+// held in memory so that a node restarting often still works through every
+// file instead of forever re-checking the same first few.
+func (s *FileServer) setRepairCursor(id string) {
+	if s.DB == nil || id == "" {
+		return
+	}
+	if err := s.DB.PutSetting(context.Background(), dbpkg.RepairCursorSetting, id); err != nil {
+		log.Printf("[%s] Could not record the repair cursor: %v", s.Transport.Address(), err)
+	}
 }
 
 // repairFile brings one file back up to the replication target, and reports
@@ -179,17 +237,17 @@ func (s *FileServer) repairFile(f dbpkg.File) (int, error) {
 	ownerID := s.storageOwnerID()
 
 	placed := 0
-	for _, addr := range lacking {
+	for _, nodeID := range lacking {
 		if placed >= needed {
 			break
 		}
-		if s.isStorageOwner(addr, ownerID) {
+		if s.isStorageOwner(nodeID, ownerID) {
 			// Pushing to the node whose storage this one is borrowing would
 			// write the file back where it already is.
 			continue
 		}
-		if err := s.pushTo(addr, f); err != nil {
-			log.Printf("[%s] Could not offer a copy of %s to %s: %v", s.Transport.Address(), short(f.Hash), addr, err)
+		if err := s.pushTo(nodeID, f); err != nil {
+			log.Printf("[%s] Could not offer a copy of %s to %s: %v", s.Transport.Address(), short(f.Hash), short(nodeID), err)
 			continue
 		}
 		placed++
@@ -239,8 +297,8 @@ func (s *FileServer) checkFile(f dbpkg.File) (FileHealth, []string, error) {
 
 	query := Message{Payload: MessageGetFile{RequestID: requestID, Name: f.Name}}
 	asked := 0
-	for _, addr := range addrs {
-		if err := sendMessage(peers[addr], &query); err != nil {
+	for _, nodeID := range addrs {
+		if err := sendMessage(peers[nodeID], &query); err != nil {
 			continue
 		}
 		asked++
@@ -289,10 +347,10 @@ func (s *FileServer) collectOffers(req *fileRequest, asked int) []peerOffer {
 }
 
 // pushTo sends one peer a copy of a file it does not have.
-func (s *FileServer) pushTo(addr string, f dbpkg.File) error {
-	peer, ok := s.peer(addr)
+func (s *FileServer) pushTo(nodeID string, f dbpkg.File) error {
+	peer, ok := s.peer(nodeID)
 	if !ok {
-		return fmt.Errorf("peer %s is no longer connected", addr)
+		return fmt.Errorf("peer %s is no longer connected", short(nodeID))
 	}
 
 	_, body, err := s.store.ReadDecrypt(s.EncryptionKey, f.Hash)
@@ -316,14 +374,14 @@ func (s *FileServer) pushTo(addr string, f dbpkg.File) error {
 	}
 
 	if s.DB != nil {
-		shareID := contentKey([]byte(f.Hash + addr + "outgoing"))
+		shareID := contentKey([]byte(f.Hash + nodeID + "outgoing"))
 		if err := s.DB.InsertShare(context.Background(), dbpkg.Share{
 			ID:        shareID,
 			FileID:    f.ID,
-			PeerID:    addr,
+			PeerID:    nodeID,
 			Direction: "outgoing",
 		}); err != nil {
-			log.Printf("[%s] Failed to record outgoing share to %s: %v", s.Transport.Address(), addr, err)
+			log.Printf("[%s] Failed to record outgoing share to %s: %v", s.Transport.Address(), short(nodeID), err)
 		}
 	}
 

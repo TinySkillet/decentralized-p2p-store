@@ -771,6 +771,11 @@ func (d *DB) PutSetting(ctx context.Context, key, value string) error {
 	return err
 }
 
+// RepairCursorSetting remembers how far the last repair cycle got, so cycles
+// round-robin through the files instead of restarting from the same end every
+// time and never reaching the rest.
+const RepairCursorSetting = "repair_cursor"
+
 // NodeIDSetting is the settings key holding this node's identity.
 const NodeIDSetting = "node_id"
 
