@@ -502,3 +502,64 @@ func TestTrustAcceptsAFullIdentityForAnUnseenPeer(t *testing.T) {
 		t.Fatal("a peer approved by full identity is not trusted")
 	}
 }
+
+// A refused push must not be counted as a copy.
+//
+// The sender cannot infer the refusal: a refused push drains the body and
+// closes the stream cleanly, deliberately, so the write succeeds either way.
+// Left uncorrected the sender reports a replica that was thrown away — a file
+// at risk reading as safe, which is the failure this project keeps finding.
+//
+// Fails against a receiver that refuses silently.
+func TestARefusedPushIsNotCountedAsACopy(t *testing.T) {
+	sender := enforcingNode(t)
+	receiver := enforcingNode(t, sender.addr)
+	waitForPeerCount(t, sender, 1)
+	waitForPeerCount(t, receiver, 1)
+
+	// One-way: the sender will send, the receiver will refuse.
+	if err := sender.Trust(receiver.NodeID(), "receiver"); err != nil {
+		t.Fatalf("Trust: %v", err)
+	}
+
+	if err := sender.Store("optimistic.txt", bytes.NewReader([]byte("counted too soon"))); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// The receiver really does not have it.
+	waitFor(t, "the push to be refused", 15*time.Second, func() bool {
+		files, err := receiver.FileViews(ctx)
+		return err == nil && len(files) == 0
+	})
+
+	// So the sender must not claim it does.
+	waitFor(t, "the sender to stop counting the refused copy", 15*time.Second, func() bool {
+		snaps, err := sender.ReplicationSnapshot(ctx)
+		return err == nil && len(snaps) == 1 && snaps[0].Copies == 1
+	})
+
+	snaps, err := sender.ReplicationSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("ReplicationSnapshot: %v", err)
+	}
+	if len(snaps[0].Holders) != 0 {
+		t.Fatalf("the refusing peer is still listed as a holder: %v", snaps[0].Holders)
+	}
+	if !snaps[0].AtRisk() {
+		t.Fatalf("a file with one copy of a target of %d was not reported at risk", snaps[0].Target)
+	}
+
+	// And the share record was withdrawn, so it does not claim a transfer that
+	// was undone.
+	shares, err := sender.ShareViews(ctx)
+	if err != nil {
+		t.Fatalf("ShareViews: %v", err)
+	}
+	for _, sh := range shares {
+		if sh.PeerID == receiver.NodeID() && sh.Direction == "outgoing" {
+			t.Fatalf("a share record survives for a refused push: %+v", sh)
+		}
+	}
+}

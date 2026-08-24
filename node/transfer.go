@@ -104,6 +104,10 @@ func (s *FileServer) handleStream(from string) (err error) {
 			Size: msg.Size, Node: from,
 			Err: "the sending peer is not trusted",
 		})
+
+		// The sender cannot infer this: its write succeeded. Told explicitly,
+		// so it does not count a copy that was thrown away.
+		s.notifyStoreRefused(from, msg.Name, msg.Digest, "the receiving peer does not trust this node")
 		return nil
 	}
 
@@ -174,6 +178,48 @@ func (s *FileServer) handleStream(from string) (err error) {
 
 	s.completeRequest(msg.RequestID)
 
+	return nil
+}
+
+// notifyStoreRefused tells a sender its push was not kept.
+func (s *FileServer) notifyStoreRefused(nodeID, name, digest, reason string) {
+	peer, ok := s.peer(nodeID)
+	if !ok {
+		return
+	}
+
+	msg := Message{Payload: MessageStoreRefused{Name: name, Digest: digest, Reason: reason}}
+	if err := sendMessage(peer, &msg); err != nil {
+		log.Printf("[%s] Could not tell %s that %q was refused: %v",
+			s.Transport.Address(), storage.Short(nodeID), name, err)
+	}
+}
+
+// handleMessageStoreRefused corrects this node's own records after a peer
+// declined a copy it was sent.
+//
+// Both the replica count and the share record were written optimistically when
+// the transfer completed, and both are now wrong. Correcting the count is the
+// important half: a file that reads as replicated when it is not is worse than
+// one that reads as at risk.
+func (s *FileServer) handleMessageStoreRefused(from string, msg MessageStoreRefused) error {
+	fmt.Printf("[%s] %s refused '%s' (%s): %s\n",
+		s.Transport.Address(), storage.Short(from), msg.Name, storage.Short(msg.Digest), msg.Reason)
+
+	s.health.markRefused(msg.Digest, from)
+
+	if s.DB != nil {
+		shareID := storage.ContentKey([]byte(msg.Digest + from + "outgoing"))
+		if err := s.DB.DeleteShare(context.Background(), shareID); err != nil {
+			log.Printf("[%s] Could not withdraw the share record for %q: %v",
+				s.Transport.Address(), msg.Name, err)
+		}
+	}
+
+	s.publish(Event{
+		Kind: EventPushRefused, Name: msg.Name, Digest: msg.Digest,
+		Node: from, Err: msg.Reason,
+	})
 	return nil
 }
 
@@ -566,9 +612,11 @@ func (s *FileServer) Store(name string, r io.Reader) error {
 	fmt.Printf("[%s] Stored '%s' as %s (%d bytes), sent %d bytes to %d peer(s)\n",
 		s.Transport.Address(), name, storage.Short(digest), size, written, len(replicated))
 
-	// Storing is itself a measurement: the peers that accepted a copy are
-	// known holders, so record it rather than waiting for a repair cycle.
-	s.recordHealth(FileHealth{
+	// Storing is itself an observation, but only an optimistic one: a peer
+	// that refuses the copy still completes the transfer, so this count is
+	// filtered by any refusal the cache already knows about, and corrected by
+	// any that arrives later.
+	s.recordOptimisticHealth(FileHealth{
 		Name: name, Digest: digest, Size: size,
 		Copies: 1 + len(replicated), Target: s.ReplicationFactor,
 		Holders: replicated,

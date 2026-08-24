@@ -364,12 +364,13 @@ func (s *FileServer) checkFile(f dbpkg.File, target int) (FileHealth, []string, 
 	return health, lacking, nil
 }
 
-// recordHealth caches a measurement just taken.
+// recordHealth caches a measurement obtained by asking every peer. It
+// supersedes any optimistic count and any remembered refusal.
 func (s *FileServer) recordHealth(h FileHealth) {
 	if s.health == nil {
 		return
 	}
-	s.health.record(h.Digest, measurement{
+	s.health.recordMeasured(h.Digest, measurement{
 		copies:    h.Copies,
 		target:    h.Target,
 		holders:   append([]string(nil), h.Holders...),

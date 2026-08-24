@@ -59,6 +59,7 @@ func init() {
 	gob.Register(MessageFileOffer{})
 	gob.Register(MessageFetchFile{})
 	gob.Register(MessageDeleteFile{})
+	gob.Register(MessageStoreRefused{})
 	gob.Register(MessagePeerExchange{})
 	gob.Register(PeerInfo{})
 	gob.Register(Handshake{})
@@ -126,6 +127,23 @@ type MessageDeleteFile struct {
 	Digest    string
 	Owner     string
 	Signature []byte
+}
+
+// MessageStoreRefused tells a sender that a file it pushed was not kept.
+//
+// Without it the sender cannot tell acceptance from refusal: a refused push
+// still drains the body and closes the stream cleanly — deliberately, because
+// anything else wedges the connection — so the write succeeds either way. The
+// sender would then count a copy that does not exist, and a file at risk would
+// read as safe. That is the failure this whole project keeps finding, so the
+// receiver says so explicitly.
+type MessageStoreRefused struct {
+	Name   string
+	Digest string
+
+	// Reason is for the sender's log and event feed. It is not acted on: the
+	// refusal itself is what matters.
+	Reason string
 }
 
 type MessagePeerExchange struct {

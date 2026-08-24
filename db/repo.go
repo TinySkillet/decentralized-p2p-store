@@ -577,6 +577,13 @@ func (d *DB) ListKnownPeers(ctx context.Context) ([]Peer, error) {
 	return out, rows.Err()
 }
 
+// DeleteShare removes one share record, used when a transfer that appeared to
+// succeed turns out to have been refused.
+func (d *DB) DeleteShare(ctx context.Context, id string) error {
+	_, err := d.sql.ExecContext(ctx, `DELETE FROM shares WHERE id=?`, id)
+	return err
+}
+
 // TrustModeSetting names the setting that decides whether trust is enforced.
 const TrustModeSetting = "trust_mode"
 

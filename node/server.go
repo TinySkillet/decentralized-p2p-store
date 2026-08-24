@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -87,6 +88,8 @@ func (s *FileServer) handleMessage(from string, msg *Message) error {
 		return s.handleMessageFetchFile(from, v)
 	case MessageDeleteFile:
 		return s.handleMessageDeleteFile(from, v)
+	case MessageStoreRefused:
+		return s.handleMessageStoreRefused(from, v)
 	case MessagePeerExchange:
 		return s.handleMessagePeerExchange(from, v)
 	}
@@ -518,6 +521,11 @@ type FileServer struct {
 	// trust is the in-memory view of which peers are approved, read on every
 	// enforced operation.
 	trust *trustSet
+
+	// httpServer and web are set when the local UI is enabled, which is off by
+	// default.
+	httpServer *http.Server
+	web        *webUI
 
 	// transferLock guards the transfer maps below. They are written by the
 	// caller's goroutine (Get) and by the server loop, so they cannot be
