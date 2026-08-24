@@ -170,6 +170,9 @@ func setupCommands() *cobra.Command {
 		bootstrap  []string
 		configPath string
 		replicas   int
+
+		httpAddr    string
+		httpExposed bool
 	)
 
 	root := &cobra.Command{
@@ -204,6 +207,12 @@ func setupCommands() *cobra.Command {
 				if !cmd.Flags().Changed("replicas") && cfg.Replicas > 0 {
 					replicas = cfg.Replicas
 				}
+				if !cmd.Flags().Changed("http") && cfg.HTTP != "" {
+					httpAddr = cfg.HTTP
+				}
+				if !cmd.Flags().Changed("http-exposed") && cfg.HTTPExposed {
+					httpExposed = true
+				}
 			}
 
 			d, err := openDB(dbPath)
@@ -234,6 +243,15 @@ func setupCommands() *cobra.Command {
 				return err
 			}
 
+			// Off unless asked for: the UI can administer trust, so it is a
+			// deliberate choice rather than something upgrading gives you.
+			if httpAddr != "" {
+				if err := s.ListenHTTP(httpAddr, httpExposed, filepath.Dir(dbPath)); err != nil {
+					return err
+				}
+				defer s.StopHTTP()
+			}
+
 			// Shut down cleanly on Ctrl-C so the database is closed and
 			// in-flight writes are not cut off mid-file.
 			sigs := make(chan os.Signal, 1)
@@ -254,6 +272,8 @@ func setupCommands() *cobra.Command {
 	serveCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes")
 	serveCmd.Flags().StringVar(&configPath, "config", "", "config file path (e.g., ~/.p2p/config)")
 	serveCmd.Flags().IntVar(&replicas, "replicas", node.DefaultReplicationFactor, "how many copies of each file the network should hold")
+	serveCmd.Flags().StringVar(&httpAddr, "http", "", "serve the local web UI on this address (e.g. 127.0.0.1:7654); off by default")
+	serveCmd.Flags().BoolVar(&httpExposed, "http-exposed", false, "allow binding the web UI off loopback, protected by a token file")
 	root.AddCommand(serveCmd)
 
 	storeCmd := &cobra.Command{

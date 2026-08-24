@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>p2p storage</title>
+<!-- The token travels as markup so the CSP can forbid inline script. No
+     cookie is set anywhere: a cross-site request has no credential to borrow. -->
+<meta name="p2p-token" content="{{token}}">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header>
+  <h1>p2p storage</h1>
+  <div id="node-summary" class="summary">connecting…</div>
+</header>
+
+<main>
+  <section id="approval-section" class="panel accent" hidden>
+    <h2>Waiting for approval <span id="pending-count" class="badge"></span></h2>
+    <p class="note">These peers are on the network and visible, but may not send
+      you files or ask you to delete anything until you approve them.</p>
+    <ul id="pending-peers" class="peers"></ul>
+  </section>
+
+  <section class="panel">
+    <h2>Connected</h2>
+    <p class="note">Live connections. Nothing here comes from the database.</p>
+    <ul id="online-peers" class="peers"></ul>
+  </section>
+
+  <section class="panel">
+    <h2>Known, not connected</h2>
+    <p class="note">Remembered from the database. They may or may not still exist.</p>
+    <ul id="offline-peers" class="peers"></ul>
+  </section>
+
+  <section class="panel">
+    <h2>Files</h2>
+    <form id="upload-form">
+      <label class="upload">
+        <input type="file" id="upload-input" multiple>
+        <span>Add files</span>
+      </label>
+      <span id="upload-status" class="note"></span>
+    </form>
+    <ul id="files" class="files"></ul>
+  </section>
+
+  <section class="panel">
+    <h2>Activity</h2>
+    <ul id="activity" class="activity"></ul>
+  </section>
+</main>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -13,6 +13,16 @@ type Config struct {
 	DB        string
 	Bootstrap []string
 	Replicas  int
+
+	// HTTP is the address for the local web UI. Empty means off, which is the
+	// default: the UI can administer trust, so a node does not acquire it by
+	// being upgraded.
+	HTTP string
+
+	// HTTPExposed permits binding the UI to something other than loopback.
+	// Separate from HTTP so that exposing it is always a deliberate second
+	// decision.
+	HTTPExposed bool
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -58,6 +68,10 @@ func LoadConfig(path string) (*Config, error) {
 			config.Listen = value
 		case "db":
 			config.DB = value
+		case "http":
+			config.HTTP = value
+		case "http_exposed":
+			config.HTTPExposed = value == "true" || value == "yes" || value == "1"
 		case "replicas":
 			if n, err := strconv.Atoi(value); err == nil && n > 0 {
 				config.Replicas = n
