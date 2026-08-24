@@ -527,6 +527,56 @@ func (d *DB) getActivePeers(ctx context.Context, maxAge time.Duration, limit, ma
 	return out, rows.Err()
 }
 
+// ListKnownPeers returns every peer this node has ever recorded, newest first.
+//
+// Deliberately unlike GetActivePeers: no recency cutoff and no per-host cap.
+// That cap is an anti-Sybil measure for deciding who to gossip about, and it
+// hides the 4th and later identity on a host. A view built for a person must
+// show what is really there — hiding a peer is exactly how you fail to notice
+// a host running more identities than it should.
+//
+// The status column is returned as recorded and must not be read as liveness:
+// it is written only on connect and disconnect, so a node that crashed reads
+// "connected" for ever. Liveness comes from the live peer set.
+func (d *DB) ListKnownPeers(ctx context.Context) ([]Peer, error) {
+	rows, err := d.sql.QueryContext(ctx, `
+		SELECT id, address, addrs, status, last_seen
+		FROM peers
+		ORDER BY last_seen DESC NULLS LAST, id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Peer
+	for rows.Next() {
+		var p Peer
+		var lastSeen sql.NullString
+		var addrs string
+
+		if err := rows.Scan(&p.NodeID, &p.Address, &addrs, &p.Status, &lastSeen); err != nil {
+			return nil, err
+		}
+		p.Addrs = splitAddrs(addrs)
+
+		if lastSeen.Valid {
+			parsed, err := parseTime(lastSeen.String)
+			if err != nil {
+				// Report the peer without a timestamp rather than dropping it.
+				// An unreadable date is no reason to hide a peer from a view
+				// whose whole job is to show every peer.
+				log.Printf("peer %s has an unreadable last_seen: %v", p.NodeID, err)
+			} else {
+				p.LastSeen = &parsed
+			}
+		}
+
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // CleanupStalePeers removes peer records not seen within maxAge.
 func (d *DB) CleanupStalePeers(ctx context.Context, maxAge time.Duration) (int, error) {
 	cutoff := formatTime(time.Now().Add(-maxAge))
