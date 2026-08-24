@@ -456,6 +456,11 @@ type FileServerOpts struct {
 	// the default; a negative value disables the sweep.
 	SweepInterval time.Duration
 
+	// WatchHeartbeat is how often an idle watch sends a keepalive. Zero means
+	// the package default. Per node rather than package-wide so a test can
+	// shorten it without racing another node's watch.
+	WatchHeartbeat time.Duration
+
 	// OwnsDatabase marks the long-lived node that the database and storage
 	// root belong to. Commands run against the same database with this unset,
 	// because their copy of a file is that node's copy, not a second one.

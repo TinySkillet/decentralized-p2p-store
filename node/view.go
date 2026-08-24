@@ -206,6 +206,42 @@ func (s *FileServer) FileViews(ctx context.Context) ([]FileView, error) {
 	return out, nil
 }
 
+// ShareView is one recorded transfer to or from a peer.
+type ShareView struct {
+	Name      string
+	PeerID    string
+	Direction string
+	Size      int64
+	CreatedAt time.Time
+}
+
+// Short is the abbreviated peer id, for display.
+func (s ShareView) Short() string { return storage.Short(s.PeerID) }
+
+// ShareViews reports the transfers this node has recorded.
+func (s *FileServer) ShareViews(ctx context.Context) ([]ShareView, error) {
+	if s.DB == nil {
+		return nil, nil
+	}
+
+	shares, err := s.DB.ListShares(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing shares: %w", err)
+	}
+
+	out := make([]ShareView, 0, len(shares))
+	for _, sh := range shares {
+		out = append(out, ShareView{
+			Name:      sh.FileName,
+			PeerID:    sh.PeerID,
+			Direction: sh.Direction,
+			Size:      sh.FileSize,
+			CreatedAt: sh.CreatedAt,
+		})
+	}
+	return out, nil
+}
+
 // timeOrZero dereferences a possibly-nil timestamp.
 func timeOrZero(t *time.Time) time.Time {
 	if t == nil {

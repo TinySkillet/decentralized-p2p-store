@@ -77,6 +77,34 @@ func onNode(dbPath, listen string, bootstrap []string, replicas int, work func(n
 	return work(nodeTarget{local: s})
 }
 
+// describeEvent renders the fields an event actually carries, since which
+// ones are meaningful depends on its kind.
+func describeEvent(e node.Event) string {
+	var parts []string
+	if e.Name != "" {
+		parts = append(parts, e.Name)
+	}
+	if e.Digest != "" {
+		parts = append(parts, storage.Short(e.Digest))
+	}
+	if e.Node != "" {
+		parts = append(parts, storage.Short(e.Node))
+	}
+	if e.Peer != "" {
+		parts = append(parts, e.Peer)
+	}
+	if e.Size > 0 {
+		parts = append(parts, fmt.Sprintf("%d bytes", e.Size))
+	}
+	if e.Count > 0 {
+		parts = append(parts, fmt.Sprintf("x%d", e.Count))
+	}
+	if e.Err != "" {
+		parts = append(parts, e.Err)
+	}
+	return strings.Join(parts, "  ")
+}
+
 // openDB opens and migrates the node database.
 func openDB(path string) (*dbpkg.DB, error) {
 	d, err := dbpkg.Open(path)
@@ -324,31 +352,42 @@ func setupCommands() *cobra.Command {
 		Use:   "list",
 		Short: "List known files",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			d, err := openDB(dbPath)
+			// Routed through the running node rather than opening the
+			// database directly: the node owns it, and its cached
+			// replication measurements come along for free.
+			var files []node.ReplicaSnapshot
+			err := onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+				var err error
+				if t.running != nil {
+					files, err = t.running.Files()
+				} else {
+					files, err = t.local.ReplicationSnapshot(context.Background())
+				}
+				return err
+			})
 			if err != nil {
 				return err
 			}
-			defer d.Close()
-
-			ff, err := d.ListFiles(context.Background())
-			if err != nil {
-				return err
-			}
-			if len(ff) == 0 {
+			if len(files) == 0 {
 				fmt.Println("No files found.")
 				return nil
 			}
-			fmt.Printf("%-20s\t%-10s\t%s\n", "FILE", "SIZE", "CREATED")
-			fmt.Println(strings.Repeat("-", 60))
-			for _, f := range ff {
-				fmt.Printf("%-20s\t%-10d\t%s\n",
-					f.Name,
-					f.Size,
-					f.CreatedAt.Format("2006-01-02 15:04:05"))
+			fmt.Printf("%-24s\t%-10s\t%-12s\t%s\n", "FILE", "SIZE", "COPIES", "CHECKED")
+			fmt.Println(strings.Repeat("-", 72))
+			for _, f := range files {
+				copies := "not checked"
+				checked := "never"
+				if f.Measured() {
+					copies = fmt.Sprintf("%d of %d", f.Copies, f.Target)
+					checked = f.Age().Round(time.Second).String() + " ago"
+				}
+				fmt.Printf("%-24s\t%-10d\t%-12s\t%s\n", f.Name, f.Size, copies, checked)
 			}
 			return nil
 		},
 	}
+	filesListCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
+	filesListCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
 	filesCmd.AddCommand(filesListCmd)
 	root.AddCommand(filesCmd)
 
@@ -356,13 +395,16 @@ func setupCommands() *cobra.Command {
 		Use:   "shares",
 		Short: "List file shares (files stored in other peers)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			d, err := openDB(dbPath)
-			if err != nil {
+			var shares []node.ShareView
+			err := onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+				var err error
+				if t.running != nil {
+					shares, err = t.running.Shares()
+				} else {
+					shares, err = t.local.ShareViews(context.Background())
+				}
 				return err
-			}
-			defer d.Close()
-
-			shares, err := d.ListShares(context.Background())
+			})
 			if err != nil {
 				return err
 			}
@@ -375,52 +417,105 @@ func setupCommands() *cobra.Command {
 			// itself is what the record holds.
 			fmt.Printf("%-20s\t%-14s\t%-10s\t%-10s\t%s\n", "FILE", "PEER", "DIRECTION", "SIZE", "CREATED")
 			fmt.Println(strings.Repeat("-", 85))
-			for _, s := range shares {
+			for _, sh := range shares {
 				fmt.Printf("%-20s\t%-14s\t%-10s\t%-10d\t%s\n",
-					s.FileName,
-					storage.Short(s.PeerID),
-					s.Direction,
-					s.FileSize,
-					s.CreatedAt.Format("2006-01-02 15:04:05"))
+					sh.Name, sh.Short(), sh.Direction, sh.Size,
+					sh.CreatedAt.Format("2006-01-02 15:04:05"))
 			}
 			return nil
 		},
 	}
+	sharesCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
+	sharesCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
 	root.AddCommand(sharesCmd)
 
 	peersCmd := &cobra.Command{
 		Use:   "peers",
 		Short: "List connected and known peers",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			d, err := openDB(dbPath)
+			// Asked of the running node, not the database. The peers table
+			// records "connected" on connect and never corrects it if the
+			// node dies, and GetActivePeers hides the 4th and later identity
+			// on a host. Both are wrong for a list a person reads.
+			var peers []node.PeerView
+			err := onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+				var err error
+				if t.running != nil {
+					peers, err = t.running.Peers()
+				} else {
+					peers, err = t.local.PeerViews(context.Background())
+				}
+				return err
+			})
 			if err != nil {
 				return err
 			}
-			defer d.Close()
-
-			peers, err := d.GetActivePeers(context.Background(), 24*time.Hour, 100)
-			if err != nil {
-				return err
-			}
-
 			if len(peers) == 0 {
 				fmt.Println("No peers found.")
 				return nil
 			}
 
-			fmt.Printf("%-30s\t%-15s\t%s\n", "ADDRESS", "STATUS", "LAST SEEN")
-			fmt.Println(strings.Repeat("-", 70))
+			fmt.Printf("%-14s\t%-24s\t%-9s\t%s\n", "PEER", "ADDRESS", "STATE", "LAST SEEN")
+			fmt.Println(strings.Repeat("-", 74))
 			for _, p := range peers {
+				state := "offline"
+				if p.Online {
+					state = "online"
+				}
 				lastSeen := "never"
 				if p.LastSeen != nil {
 					lastSeen = p.LastSeen.Format("2006-01-02 15:04:05")
 				}
-				fmt.Printf("%-30s\t%-15s\t%s\n", p.Address, p.Status, lastSeen)
+				fmt.Printf("%-14s\t%-24s\t%-9s\t%s\n", p.Short(), p.Address, state, lastSeen)
 			}
 			return nil
 		},
 	}
+	peersCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
+	peersCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
 	root.AddCommand(peersCmd)
+
+	watchCmd := &cobra.Command{
+		Use:   "watch",
+		Short: "Follow what the running node is doing",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Only a running node has anything to report, so this does not
+			// fall back to starting one: a temporary node would emit its own
+			// startup and then exit, which tells the user nothing.
+			client, ok := node.DialControl(dbPath)
+			if !ok {
+				return fmt.Errorf("no node is running against %s; start one with 'p2p serve'", dbPath)
+			}
+
+			events, stop, err := client.Watch()
+			if err != nil {
+				return err
+			}
+			defer stop()
+
+			// Ctrl-C ends the watch rather than killing the command mid-line.
+			interrupted := make(chan os.Signal, 1)
+			signal.Notify(interrupted, os.Interrupt)
+			defer signal.Stop(interrupted)
+
+			fmt.Println("Watching. Press Ctrl-C to stop.")
+			for {
+				select {
+				case e, ok := <-events:
+					if !ok {
+						fmt.Println("The node stopped.")
+						return nil
+					}
+					fmt.Printf("%s  %-14s %s\n",
+						e.At.Format("15:04:05"), e.Kind, describeEvent(e))
+				case <-interrupted:
+					fmt.Println()
+					return nil
+				}
+			}
+		},
+	}
+	root.AddCommand(watchCmd)
 
 	cleanupCmd := &cobra.Command{
 		Use:   "cleanup",

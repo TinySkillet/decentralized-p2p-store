@@ -2,6 +2,7 @@ package node
 
 import (
 	"bufio"
+	"context"
 	"encoding/gob"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/TinySkillet/DecentralizedP2PStorage/storage"
@@ -84,7 +86,32 @@ const (
 	opStore  = "store"
 	opGet    = "get"
 	opDelete = "delete"
+
+	// Read-model operations. These answer from memory and the database and
+	// never touch the network, so they are safe to poll.
+	opNode   = "node"
+	opPeers  = "peers"
+	opFiles  = "files"
+	opShares = "shares"
+
+	// opRecheck measures one file now, bounded by a single offer round.
+	opRecheck = "recheck"
+
+	// opWatch streams events until the caller disconnects.
+	opWatch = "watch"
 )
+
+// defaultWatchHeartbeat is how often a watch with nothing to report sends an
+// empty event.
+//
+// Without it a node that goes quiet is indistinguishable from one that died,
+// and neither side notices a connection that has gone away: the server only
+// learns the client is gone when a write fails.
+const defaultWatchHeartbeat = 15 * time.Second
+
+// watchBuffer is how many events a watcher may fall behind by before it starts
+// missing them.
+const watchBuffer = 256
 
 // controlRequest asks a running node to do something.
 //
@@ -112,6 +139,17 @@ type controlResponse struct {
 	// Size is the number of payload bytes that follow this message, used when
 	// fetching a file.
 	Size int64
+
+	// Read-model answers. Only the field matching the request is set.
+	Node     NodeView
+	Peers    []PeerView
+	Files    []ReplicaSnapshot
+	Shares   []ShareView
+	Snapshot ReplicaSnapshot
+
+	// Streaming marks a response followed by a stream of gob-encoded events
+	// rather than a byte payload of known length.
+	Streaming bool
 }
 
 // ListenControl starts accepting commands on the socket beside the database.
@@ -200,6 +238,19 @@ func (s *FileServer) handleControl(conn net.Conn) {
 	}
 	if closer, ok := payload.(io.Closer); ok {
 		defer closer.Close()
+
+		if resp.Streaming {
+			// A watch client sends nothing once the stream is open, so a read
+			// that returns means it has gone away. Without this the server
+			// only finds out when a write fails, and an idle stream does not
+			// write until the next heartbeat: the goroutine and its
+			// subscription would linger until then.
+			go func() {
+				var b [1]byte
+				_, _ = br.Read(b[:])
+				closer.Close()
+			}()
+		}
 	}
 	if _, err := io.Copy(conn, payload); err != nil {
 		log.Printf("[%s] Could not send the payload for %q: %v", s.Transport.Address(), req.Op, err)
@@ -250,9 +301,138 @@ func (s *FileServer) runControl(req controlRequest, body io.Reader) (controlResp
 		}
 		return controlResponse{}, nil
 
+	case opNode:
+		view, err := s.NodeView(context.Background())
+		if err != nil {
+			return controlResponse{Error: err.Error()}, nil
+		}
+		return controlResponse{Node: view}, nil
+
+	case opPeers:
+		peers, err := s.PeerViews(context.Background())
+		if err != nil {
+			return controlResponse{Error: err.Error()}, nil
+		}
+		return controlResponse{Peers: peers}, nil
+
+	case opFiles:
+		files, err := s.ReplicationSnapshot(context.Background())
+		if err != nil {
+			return controlResponse{Error: err.Error()}, nil
+		}
+		return controlResponse{Files: files}, nil
+
+	case opShares:
+		shares, err := s.ShareViews(context.Background())
+		if err != nil {
+			return controlResponse{Error: err.Error()}, nil
+		}
+		return controlResponse{Shares: shares}, nil
+
+	case opRecheck:
+		snap, err := s.Recheck(context.Background(), req.Name)
+		if err != nil {
+			return controlResponse{Error: err.Error()}, nil
+		}
+		return controlResponse{Snapshot: snap}, nil
+
+	case opWatch:
+		return controlResponse{Streaming: true}, s.watchPayload()
+
 	default:
 		return controlResponse{Error: fmt.Sprintf("unknown operation %q", req.Op)}, nil
 	}
+}
+
+// watchPayload returns a reader that yields gob-encoded events until the
+// caller goes away or the node stops.
+//
+// This is why watch needs no change to the framing: it is still one request
+// and one response, and the stream is simply that response's payload. The
+// server writes into a pipe and handleControl copies the pipe to the socket,
+// exactly as it does for a file.
+//
+// handleControl closes the read end when the copy finishes, which is what
+// unblocks the writer below if the client disappears mid-event.
+// heartbeat is the interval this node sends keepalives at.
+func (s *FileServer) heartbeat() time.Duration {
+	if s.WatchHeartbeat > 0 {
+		return s.WatchHeartbeat
+	}
+	return defaultWatchHeartbeat
+}
+
+func (s *FileServer) watchPayload() io.Reader {
+	pr, pw := io.Pipe()
+	stream := &watchStream{PipeReader: pr, done: make(chan struct{})}
+
+	events, cancel := s.Subscribe(watchBuffer)
+
+	go func() {
+		defer cancel()
+
+		enc := gob.NewEncoder(pw)
+		ticker := time.NewTicker(s.heartbeat())
+
+		defer ticker.Stop()
+
+		for {
+			var e Event
+			select {
+			case ev, ok := <-events:
+				if !ok {
+					pw.Close()
+					return
+				}
+				e = ev
+
+			case <-ticker.C:
+				// An empty kind is the heartbeat: it proves the connection is
+				// alive without claiming anything happened.
+				e = Event{At: time.Now()}
+
+			case <-s.quitch:
+				// Stop() closes the listener but not connections already
+				// established, so a watch has to watch for the shutdown
+				// itself or it would outlive the node.
+				pw.Close()
+				return
+
+			case <-stream.done:
+				// handleControl finished copying, which means the client is
+				// gone. Without this the goroutine and its subscription sit
+				// here until the next heartbeat happens to fail on a write.
+				pw.Close()
+				return
+			}
+
+			if err := enc.Encode(e); err != nil {
+				// The client is gone. Closing with the error stops the copy
+				// on the other side of the pipe too.
+				pw.CloseWithError(err)
+				return
+			}
+		}
+	}()
+
+	return stream
+}
+
+// watchStream is the payload of a watch, with a close that the writer can see.
+//
+// handleControl closes the payload when its copy ends, which is how the server
+// learns a client has gone away. A plain pipe reader only reports that on the
+// next write, so an idle stream would hold its goroutine and its subscription
+// until the following heartbeat.
+type watchStream struct {
+	*io.PipeReader
+	done chan struct{}
+	once sync.Once
+}
+
+func (w *watchStream) Close() error {
+	w.once.Do(func() { close(w.done) })
+	return w.PipeReader.Close()
 }
 
 // Client talks to a running node.
@@ -350,6 +530,124 @@ func (c *Client) Delete(name string) error {
 		call.Close()
 	}
 	return err
+}
+
+// Node reports the running node's own state.
+func (c *Client) Node() (NodeView, error) {
+	resp, call, err := c.do(controlRequest{Op: opNode}, nil)
+	if call != nil {
+		call.Close()
+	}
+	if err != nil {
+		return NodeView{}, err
+	}
+	return resp.Node, nil
+}
+
+// Peers reports every peer the running node knows, live ones marked online.
+func (c *Client) Peers() ([]PeerView, error) {
+	resp, call, err := c.do(controlRequest{Op: opPeers}, nil)
+	if call != nil {
+		call.Close()
+	}
+	if err != nil {
+		return nil, err
+	}
+	return resp.Peers, nil
+}
+
+// Files reports the stored files with their cached replication measurements.
+func (c *Client) Files() ([]ReplicaSnapshot, error) {
+	resp, call, err := c.do(controlRequest{Op: opFiles}, nil)
+	if call != nil {
+		call.Close()
+	}
+	if err != nil {
+		return nil, err
+	}
+	return resp.Files, nil
+}
+
+// Shares reports the transfers the running node has recorded.
+func (c *Client) Shares() ([]ShareView, error) {
+	resp, call, err := c.do(controlRequest{Op: opShares}, nil)
+	if call != nil {
+		call.Close()
+	}
+	if err != nil {
+		return nil, err
+	}
+	return resp.Shares, nil
+}
+
+// Recheck measures one file now and returns the fresh result.
+func (c *Client) Recheck(name string) (ReplicaSnapshot, error) {
+	resp, call, err := c.do(controlRequest{Op: opRecheck, Name: name}, nil)
+	if call != nil {
+		call.Close()
+	}
+	if err != nil {
+		return ReplicaSnapshot{}, err
+	}
+	return resp.Snapshot, nil
+}
+
+// Watch streams events from the running node until stop is called or the node
+// shuts down. The channel is closed when the stream ends.
+//
+// Heartbeats arrive as events with an empty Kind and are not forwarded; they
+// exist so a dead connection is noticed rather than waited on for ever.
+func (c *Client) Watch() (<-chan Event, func(), error) {
+	resp, call, err := c.do(controlRequest{Op: opWatch}, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !resp.Streaming {
+		call.Close()
+		return nil, nil, fmt.Errorf("the node did not open an event stream")
+	}
+
+	out := make(chan Event, watchBuffer)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(out)
+
+		// Decoding from the same buffered reader the response was read from:
+		// a fresh reader would lose whatever that decoder had already pulled
+		// in ahead of the stream.
+		dec := gob.NewDecoder(call.body)
+		for {
+			var e Event
+			if err := dec.Decode(&e); err != nil {
+				return
+			}
+			if e.Kind == "" {
+				// The heartbeat proves the connection is alive and reports
+				// nothing, so it is not forwarded.
+				continue
+			}
+
+			// Never send without also watching done: a caller that stops
+			// reading must not strand this goroutine for the life of the
+			// process, and closing the connection cannot interrupt a blocked
+			// channel send.
+			select {
+			case out <- e:
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			close(done)
+			call.Close()
+		})
+	}
+	return out, stop, nil
 }
 
 // get writes the fetched file to w.

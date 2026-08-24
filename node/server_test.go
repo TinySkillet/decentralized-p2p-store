@@ -52,6 +52,7 @@ type nodeConfig struct {
 	replicationFactor int
 	repairInterval    time.Duration
 	sweepInterval     time.Duration
+	watchHeartbeat    time.Duration
 }
 
 // portOf returns the port half of a host:port pair.
@@ -107,6 +108,9 @@ func buildTestNodeWithDB(t *testing.T, dbPath, addr string, cfg nodeConfig, boot
 	}
 	if cfg.sweepInterval != 0 {
 		s.SweepInterval = cfg.sweepInterval
+	}
+	if cfg.watchHeartbeat != 0 {
+		s.WatchHeartbeat = cfg.watchHeartbeat
 	}
 
 	if err := s.Listen(); err != nil {
