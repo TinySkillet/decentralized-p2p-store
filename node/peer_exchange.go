@@ -1,10 +1,12 @@
-package main
+package node
 
 import (
 	"context"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/TinySkillet/DecentralizedP2PStorage/storage"
 )
 
 func (s *FileServer) handleMessagePeerExchange(from string, msg MessagePeerExchange) error {
@@ -91,11 +93,11 @@ func (s *FileServer) sendPeerExchange(nodeID string) error {
 		}
 	}
 
-	fmt.Printf("[%s] Sending %d peer(s) to %s\n", s.Transport.Address(), len(peerInfos), short(nodeID))
+	fmt.Printf("[%s] Sending %d peer(s) to %s\n", s.Transport.Address(), len(peerInfos), storage.Short(nodeID))
 
 	peer, ok := s.peer(nodeID)
 	if !ok {
-		return fmt.Errorf("peer %s not found in connected peers", short(nodeID))
+		return fmt.Errorf("peer %s not found in connected peers", storage.Short(nodeID))
 	}
 
 	msg := Message{

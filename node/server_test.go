@@ -1,4 +1,4 @@
-package main
+package node
 
 import (
 	"bytes"
@@ -16,6 +16,8 @@ import (
 
 	dbpkg "github.com/TinySkillet/DecentralizedP2PStorage/db"
 	"github.com/TinySkillet/DecentralizedP2PStorage/p2p"
+
+	"github.com/TinySkillet/DecentralizedP2PStorage/storage"
 )
 
 // freeAddr reserves a loopback port and releases it, so the node started next
@@ -87,14 +89,14 @@ func buildTestNodeWithDB(t *testing.T, dbPath, addr string, cfg nodeConfig, boot
 		t.Fatalf("Migrate: %v", err)
 	}
 
-	s, err := makeServerWithDB(addr, d, bootstrap...)
+	s, err := NewServer(addr, d, bootstrap...)
 	if err != nil {
-		t.Fatalf("makeServerWithDB: %v", err)
+		t.Fatalf("NewServer: %v", err)
 	}
 
-	key, err := loadOrInitKey(d)
+	key, err := LoadOrInitKey(d)
 	if err != nil {
-		t.Fatalf("loadOrInitKey: %v", err)
+		t.Fatalf("LoadOrInitKey: %v", err)
 	}
 	s.EncryptionKey = key
 	if cfg.replicationFactor > 0 {
@@ -209,7 +211,7 @@ func TestStoreReplicatesToPeer(t *testing.T) {
 	}
 
 	// Replicas are stored under the digest of their contents.
-	hash := contentKey(payload)
+	hash := storage.ContentKey(payload)
 	waitFor(t, "the replica to receive the file", 10*time.Second, func() bool {
 		return replica.store.Has(hash)
 	})
@@ -304,7 +306,7 @@ func TestGetWithMultipleRespondersSucceeds(t *testing.T) {
 		t.Fatalf("Store: %v", err)
 	}
 
-	hash := contentKey(payload)
+	hash := storage.ContentKey(payload)
 	waitFor(t, "both replicas to receive the file", 10*time.Second, func() bool {
 		return replicaA.store.Has(hash) && replicaB.store.Has(hash)
 	})
@@ -387,7 +389,7 @@ func TestDeletePropagatesToPeers(t *testing.T) {
 		t.Fatalf("Store: %v", err)
 	}
 
-	hash := contentKey(payload)
+	hash := storage.ContentKey(payload)
 	waitFor(t, "the replica to receive the file", 10*time.Second, func() bool {
 		return replica.store.Has(hash)
 	})
@@ -548,7 +550,7 @@ func TestConcurrentStoresFromOneNode(t *testing.T) {
 
 	waitFor(t, "every file to reach the replica", 20*time.Second, func() bool {
 		for i := range files {
-			if !replica.store.Has(contentKey(payloads[i])) {
+			if !replica.store.Has(storage.ContentKey(payloads[i])) {
 				return false
 			}
 		}
@@ -625,7 +627,7 @@ func (p *countingPeer) writeCount() int {
 func TestSendMessageWritesOneFrame(t *testing.T) {
 	peer := &countingPeer{}
 
-	msg := Message{Payload: MessageStoreFile{Name: "abc", Digest: contentKey([]byte("abc")), Size: 1234}}
+	msg := Message{Payload: MessageStoreFile{Name: "abc", Digest: storage.ContentKey([]byte("abc")), Size: 1234}}
 	if err := sendMessage(peer, &msg); err != nil {
 		t.Fatalf("sendMessage: %v", err)
 	}
@@ -685,7 +687,7 @@ func TestHandleStreamRejectsTruncatedTransfer(t *testing.T) {
 	node.transferLock.Lock()
 	node.pendingFileTransfers["truncating-peer"] = MessageStoreFile{
 		Name:   "short",
-		Digest: contentKey(full),
+		Digest: storage.ContentKey(full),
 		Size:   int64(len(full)),
 	}
 	node.transferLock.Unlock()
@@ -694,7 +696,7 @@ func TestHandleStreamRejectsTruncatedTransfer(t *testing.T) {
 	if err == nil {
 		t.Fatal("a truncated transfer was accepted")
 	}
-	if node.store.Has(contentKey(full)) || node.store.Has(contentKey(delivered)) {
+	if node.store.Has(storage.ContentKey(full)) || node.store.Has(storage.ContentKey(delivered)) {
 		t.Error("the truncated file was left in the store")
 	}
 }
@@ -756,7 +758,7 @@ func TestPeerRecognisedAfterRestartOnANewAddress(t *testing.T) {
 		t.Fatal("both incarnations bound the same address; the test proves nothing")
 	}
 	if second.NodeID() != identity {
-		t.Fatalf("identity changed across restart: %s then %s", short(identity), short(second.NodeID()))
+		t.Fatalf("identity changed across restart: %s then %s", storage.Short(identity), storage.Short(second.NodeID()))
 	}
 
 	// The observer must hold exactly one peer, under the identity it already
@@ -766,6 +768,6 @@ func TestPeerRecognisedAfterRestartOnANewAddress(t *testing.T) {
 		t.Fatalf("observer holds %d peers, want 1: the restart looked like a new node", len(ids))
 	}
 	if ids[0] != identity {
-		t.Errorf("peer recorded as %s, want the identity it kept %s", short(ids[0]), short(identity))
+		t.Errorf("peer recorded as %s, want the identity it kept %s", storage.Short(ids[0]), storage.Short(identity))
 	}
 }

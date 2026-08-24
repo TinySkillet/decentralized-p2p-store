@@ -1,5 +1,5 @@
 // Moving files between nodes: the fetch exchange and the transfers it drives.
-package main
+package node
 
 import (
 	"context"
@@ -11,6 +11,8 @@ import (
 
 	dbpkg "github.com/TinySkillet/DecentralizedP2PStorage/db"
 	"github.com/TinySkillet/DecentralizedP2PStorage/p2p"
+
+	"github.com/TinySkillet/DecentralizedP2PStorage/storage"
 )
 
 // downloadTimeout bounds how long Get waits for a peer to answer.
@@ -49,7 +51,7 @@ func (s *FileServer) Listen() error {
 }
 
 func (s *FileServer) handleMessageStoreFile(from string, msg MessageStoreFile) error {
-	fmt.Printf("[%s] Received StoreFile message from %s for %s. Expecting stream...\n", s.Transport.Address(), from, short(msg.Digest))
+	fmt.Printf("[%s] Received StoreFile message from %s for %s. Expecting stream...\n", s.Transport.Address(), from, storage.Short(msg.Digest))
 
 	s.transferLock.Lock()
 	s.pendingFileTransfers[from] = msg
@@ -88,7 +90,7 @@ func (s *FileServer) handleStream(from string) (err error) {
 	if s.DB != nil {
 		deleted, derr := s.DB.IsDeleted(context.Background(), msg.Name, msg.Digest)
 		if derr != nil {
-			log.Printf("[%s] Could not check deletions for %s: %v", s.Transport.Address(), short(msg.Digest), derr)
+			log.Printf("[%s] Could not check deletions for %s: %v", s.Transport.Address(), storage.Short(msg.Digest), derr)
 		} else if deleted {
 			// The body is already on its way, so it has to be read off the
 			// connection even though it is being discarded.
@@ -96,7 +98,7 @@ func (s *FileServer) handleStream(from string) (err error) {
 				return cerr
 			}
 			fmt.Printf("[%s] Refused '%s' (%s) from %s: it was deleted here\n",
-				s.Transport.Address(), msg.Name, short(msg.Digest), from)
+				s.Transport.Address(), msg.Name, storage.Short(msg.Digest), from)
 
 			s.notifyDeleted(from, msg.Name, msg.Digest)
 			s.failRequest(msg.RequestID, fmt.Errorf("%q was deleted", msg.Name))
@@ -120,21 +122,21 @@ func (s *FileServer) handleStream(from string) (err error) {
 		return err
 	}
 
-	fmt.Printf("[%s] Received %d bytes of %s from %s\n", s.Transport.Address(), size, short(msg.Digest), from)
+	fmt.Printf("[%s] Received %d bytes of %s from %s\n", s.Transport.Address(), size, storage.Short(msg.Digest), from)
 
 	if s.DB != nil {
 		if derr := s.recordReplica(msg.Name, msg.Digest, size, msg.Owner); derr != nil {
-			log.Printf("[%s] Failed to record %s: %v", s.Transport.Address(), short(msg.Digest), derr)
+			log.Printf("[%s] Failed to record %s: %v", s.Transport.Address(), storage.Short(msg.Digest), derr)
 		}
 
-		shareID := contentKey([]byte(msg.Digest + from + "incoming"))
+		shareID := storage.ContentKey([]byte(msg.Digest + from + "incoming"))
 		if derr := s.DB.InsertShare(context.Background(), dbpkg.Share{
 			ID:        shareID,
 			FileID:    nameKey(msg.Name),
 			PeerID:    from,
 			Direction: "incoming",
 		}); derr != nil {
-			log.Printf("[%s] Failed to record incoming share for %s: %v", s.Transport.Address(), short(msg.Digest), derr)
+			log.Printf("[%s] Failed to record incoming share for %s: %v", s.Transport.Address(), storage.Short(msg.Digest), derr)
 		}
 	}
 
@@ -182,7 +184,7 @@ func (s *FileServer) recordReplica(name, digest string, size int64, owner string
 
 	if stored != name {
 		fmt.Printf("[%s] '%s' already refers to other contents here, filing the copy under %s instead\n",
-			s.Transport.Address(), name, short(digest))
+			s.Transport.Address(), name, storage.Short(digest))
 	}
 	return nil
 }
@@ -324,13 +326,13 @@ func (s *FileServer) resolve(name string) (*localContent, error) {
 		}
 	}
 
-	if isDigest(name) && s.store.Has(name) {
+	if storage.IsDigest(name) && s.store.Has(name) {
 		size, r, err := s.store.Read(name)
 		if err != nil {
 			return nil, err
 		}
 		r.Close()
-		return &localContent{digest: name, size: size - ivSize}, nil
+		return &localContent{digest: name, size: size - storage.IVSize}, nil
 	}
 
 	return nil, nil
@@ -338,15 +340,15 @@ func (s *FileServer) resolve(name string) (*localContent, error) {
 
 // handleMessageFetchFile streams contents to the one peer that asked for them.
 func (s *FileServer) handleMessageFetchFile(from string, msg MessageFetchFile) error {
-	fmt.Printf("[%s] Received request to serve %s\n", s.Transport.Address(), short(msg.Digest))
+	fmt.Printf("[%s] Received request to serve %s\n", s.Transport.Address(), storage.Short(msg.Digest))
 
 	if !s.store.Has(msg.Digest) {
-		return fmt.Errorf("[%s] Do not have %s", s.Transport.Address(), short(msg.Digest))
+		return fmt.Errorf("[%s] Do not have %s", s.Transport.Address(), storage.Short(msg.Digest))
 	}
 
 	plaintextSize, fileReader, err := s.store.ReadDecrypt(s.EncryptionKey, msg.Digest)
 	if err != nil {
-		return fmt.Errorf("[%s] Failed to read %s: %w", s.Transport.Address(), short(msg.Digest), err)
+		return fmt.Errorf("[%s] Failed to read %s: %w", s.Transport.Address(), storage.Short(msg.Digest), err)
 	}
 	if rc, ok := fileReader.(io.Closer); ok {
 		defer rc.Close()
@@ -417,7 +419,7 @@ func (s *FileServer) Get(name string) (int64, io.Reader, error) {
 	asked := 0
 	for _, nodeID := range addrs {
 		if err := sendMessage(peers[nodeID], &query); err != nil {
-			fmt.Printf("[%s] Error asking peer %s: %v\n", s.Transport.Address(), short(nodeID), err)
+			fmt.Printf("[%s] Error asking peer %s: %v\n", s.Transport.Address(), storage.Short(nodeID), err)
 			continue
 		}
 		asked++
@@ -437,7 +439,7 @@ func (s *FileServer) Get(name string) (int64, io.Reader, error) {
 	}
 
 	digest := holder.offer.Digest
-	fmt.Printf("[%s] Fetching '%s' (%s) from %s\n", s.Transport.Address(), name, short(digest), holder.from)
+	fmt.Printf("[%s] Fetching '%s' (%s) from %s\n", s.Transport.Address(), name, storage.Short(digest), holder.from)
 
 	fetch := Message{Payload: MessageFetchFile{RequestID: requestID, Name: name, Digest: digest}}
 	if err := sendMessage(peer, &fetch); err != nil {
@@ -517,20 +519,20 @@ func (s *FileServer) Store(name string, r io.Reader) error {
 
 	if s.DB != nil {
 		for _, nodeID := range replicated {
-			shareID := contentKey([]byte(digest + nodeID + "outgoing"))
+			shareID := storage.ContentKey([]byte(digest + nodeID + "outgoing"))
 			if err := s.DB.InsertShare(context.Background(), dbpkg.Share{
 				ID:        shareID,
 				FileID:    nameKey(name),
 				PeerID:    nodeID,
 				Direction: "outgoing",
 			}); err != nil {
-				log.Printf("[%s] Failed to record outgoing share to %s: %v", s.Transport.Address(), short(nodeID), err)
+				log.Printf("[%s] Failed to record outgoing share to %s: %v", s.Transport.Address(), storage.Short(nodeID), err)
 			}
 		}
 	}
 
 	fmt.Printf("[%s] Stored '%s' as %s (%d bytes), sent %d bytes to %d peer(s)\n",
-		s.Transport.Address(), name, short(digest), size, written, len(replicated))
+		s.Transport.Address(), name, storage.Short(digest), size, written, len(replicated))
 
 	return nil
 }
@@ -559,18 +561,18 @@ func (s *FileServer) replicate(digest string, msg *Message) ([]string, int64) {
 
 			_, body, err := s.store.ReadDecrypt(s.EncryptionKey, digest)
 			if err != nil {
-				fmt.Printf("[%s] Could not read %s to send to %s: %v\n", s.Transport.Address(), short(digest), short(nodeID), err)
+				fmt.Printf("[%s] Could not read %s to send to %s: %v\n", s.Transport.Address(), storage.Short(digest), storage.Short(nodeID), err)
 				return
 			}
 			if rc, ok := body.(io.Closer); ok {
 				defer rc.Close()
 			}
 
-			fmt.Printf("[%s] Sending message to peer %s\n", s.Transport.Address(), short(nodeID))
+			fmt.Printf("[%s] Sending message to peer %s\n", s.Transport.Address(), storage.Short(nodeID))
 
 			n, err := sendFile(peer, msg, body)
 			if err != nil {
-				fmt.Printf("[%s] Error sending %s to peer %s: %v\n", s.Transport.Address(), short(digest), short(nodeID), err)
+				fmt.Printf("[%s] Error sending %s to peer %s: %v\n", s.Transport.Address(), storage.Short(digest), storage.Short(nodeID), err)
 				return
 			}
 			results <- result{addr: nodeID, written: n}

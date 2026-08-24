@@ -1,5 +1,5 @@
 // The handshake that opens every connection, and the identity it proves.
-package main
+package node
 
 import (
 	"encoding/gob"
@@ -8,6 +8,8 @@ import (
 	"net"
 
 	"github.com/TinySkillet/DecentralizedP2PStorage/p2p"
+
+	"github.com/TinySkillet/DecentralizedP2PStorage/storage"
 )
 
 // Handshake is the first thing exchanged on a new connection.
@@ -55,7 +57,7 @@ func localListenPort(src portSource) string {
 	return ""
 }
 
-// GetHandshakeFunc builds the handshake run on every new connection.
+// getHandshakeFunc builds the handshake run on every new connection.
 //
 // It settles four things before any file traffic is allowed: that both sides
 // speak the same protocol version, that the peer holds the private key for the
@@ -66,7 +68,7 @@ func localListenPort(src portSource) string {
 // node id used to be an unverified assertion, so a peer could claim to be any
 // node it liked; deciding what a peer is allowed to do would have been
 // meaningless on top of that.
-func GetHandshakeFunc(identity Identity, src portSource) p2p.HandshakeFunc {
+func getHandshakeFunc(identity Identity, src portSource) p2p.HandshakeFunc {
 	return func(p any) error {
 		peer, ok := p.(*p2p.TCPPeer)
 		if !ok {
@@ -151,7 +153,7 @@ func GetHandshakeFunc(identity Identity, src portSource) p2p.HandshakeFunc {
 		peer.NodeID = remoteID
 		peer.FullAddr = net.JoinHostPort(host, remote.ListenPort)
 
-		fmt.Printf("[%s] Handshake successful with %s at %s\n", src.Address(), short(remoteID), peer.FullAddr)
+		fmt.Printf("[%s] Handshake successful with %s at %s\n", src.Address(), storage.Short(remoteID), peer.FullAddr)
 
 		return nil
 	}

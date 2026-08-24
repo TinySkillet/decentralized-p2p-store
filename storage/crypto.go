@@ -1,4 +1,10 @@
-package main
+// Package storage holds content-addressed file storage and the encryption
+// applied to it at rest.
+//
+// A file is identified by the SHA-256 of its own contents, so identical bytes
+// are stored once however many names refer to them, and a transfer can be
+// verified against what was asked for.
+package storage
 
 import (
 	"crypto/aes"
@@ -12,29 +18,20 @@ import (
 	"io"
 )
 
-// ivSize is the length of the initialisation vector prefixed to every
+// IVSize is the length of the initialisation vector prefixed to every
 // encrypted file on disk. It equals the AES block size.
-const ivSize = aes.BlockSize
+const IVSize = aes.BlockSize
 
-// newEncryptionKey returns a fresh 256 bit AES key.
+// NewEncryptionKey returns a fresh 256 bit AES key.
 //
 // An error from the system RNG must not be ignored: silently falling back to
 // the zero value would produce an all-zero key and encrypt every file with it.
-func newEncryptionKey() ([]byte, error) {
+func NewEncryptionKey() ([]byte, error) {
 	keyBuf := make([]byte, 32)
 	if _, err := io.ReadFull(rand.Reader, keyBuf); err != nil {
 		return nil, fmt.Errorf("generating encryption key: %w", err)
 	}
 	return keyBuf, nil
-}
-
-// nameKey derives a stable row identifier for a file name.
-//
-// This is an internal identifier, not a content address: the contents are
-// identified by their own SHA-256 digest. SHA-256 is used here too so the
-// codebase has a single hash function rather than a weaker second one.
-func nameKey(name string) string {
-	return contentKey([]byte(name))
 }
 
 // copyDecrypt reads an IV-prefixed ciphertext from src and writes the
@@ -103,31 +100,12 @@ func copyStream(stream cipher.Stream, written int, src io.Reader, dest io.Writer
 	return nw, nil
 }
 
-// digestSize is the hex-encoded length of a SHA-256 digest.
-const digestSize = sha256.Size * 2
+// DigestSize is the hex-encoded length of a SHA-256 digest.
+const DigestSize = sha256.Size * 2
 
-// newNodeID returns a fresh random node identifier.
-func newNodeID() (string, error) {
-	buf := make([]byte, 16)
-	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
-		return "", fmt.Errorf("generating node id: %w", err)
-	}
-	return hex.EncodeToString(buf), nil
-}
-
-// newRequestID returns an identifier that correlates a reply with the request
-// that caused it.
-func newRequestID() (string, error) {
-	buf := make([]byte, 12)
-	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
-		return "", fmt.Errorf("generating request id: %w", err)
-	}
-	return hex.EncodeToString(buf), nil
-}
-
-// contentKey returns the hex SHA-256 of b, the identifier a file is stored
+// ContentKey returns the hex SHA-256 of b, the identifier a file is stored
 // and requested under.
-func contentKey(b []byte) string {
+func ContentKey(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
@@ -149,4 +127,13 @@ func (d *digester) tee(r io.Reader) io.Reader {
 // sum returns the hex-encoded digest of everything seen so far.
 func (d *digester) sum() string {
 	return hex.EncodeToString(d.hash.Sum(nil))
+}
+
+// Short abbreviates a digest for log output and for tables, where a full
+// 64 character hash would be unreadable.
+func Short(digest string) string {
+	if len(digest) > 12 {
+		return digest[:12]
+	}
+	return digest
 }

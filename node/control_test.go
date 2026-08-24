@@ -1,4 +1,4 @@
-package main
+package node
 
 import (
 	"bytes"
@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/TinySkillet/DecentralizedP2PStorage/storage"
 )
 
 // withControl gives a node a control socket in a short-lived directory.
@@ -32,13 +34,13 @@ func TestControlSocketRoundTrip(t *testing.T) {
 	waitForPeerCount(t, replica, 1)
 
 	path := withControl(t, owner)
-	client := &controlClient{path: path}
+	client := &Client{path: path}
 
 	payload := randomBytes(t, 4096)
 
 	// Store through the socket: the running node does the work, so the file
 	// belongs to it rather than to a short-lived command.
-	if err := client.store("through-socket", int64(len(payload)), bytes.NewReader(payload)); err != nil {
+	if err := client.Store("through-socket", int64(len(payload)), bytes.NewReader(payload)); err != nil {
 		t.Fatalf("store: %v", err)
 	}
 
@@ -50,12 +52,12 @@ func TestControlSocketRoundTrip(t *testing.T) {
 		t.Fatal("the file was not recorded")
 	}
 	if f.Owner != owner.OwnerID() {
-		t.Errorf("Owner = %q, want the serving node %q", short(f.Owner), short(owner.OwnerID()))
+		t.Errorf("Owner = %q, want the serving node %q", storage.Short(f.Owner), storage.Short(owner.OwnerID()))
 	}
 
 	// Fetch it back.
 	var got bytes.Buffer
-	if err := client.get("through-socket", &got); err != nil {
+	if err := client.Get("through-socket", &got); err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	if !bytes.Equal(got.Bytes(), payload) {
@@ -63,7 +65,7 @@ func TestControlSocketRoundTrip(t *testing.T) {
 	}
 
 	// Status must count the two real copies, not three.
-	health, err := client.status(2)
+	health, err := client.Status(2)
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
@@ -78,7 +80,7 @@ func TestControlSocketRoundTrip(t *testing.T) {
 	}
 
 	// And delete it, which the node can authorise because it owns it.
-	if err := client.delete("through-socket"); err != nil {
+	if err := client.Delete("through-socket"); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if f, err := owner.db.FindFileByName(context.Background(), "through-socket"); err != nil {
@@ -93,14 +95,14 @@ func TestControlSocketRoundTrip(t *testing.T) {
 // the body would deadlock.
 func TestControlStoreHandlesLargePayload(t *testing.T) {
 	node := newQuietNode(t)
-	client := &controlClient{path: withControl(t, node)}
+	client := &Client{path: withControl(t, node)}
 
 	// Comfortably larger than any buffer in the path.
 	payload := randomBytes(t, 512*1024)
 
 	done := make(chan error, 1)
 	go func() {
-		done <- client.store("big", int64(len(payload)), bytes.NewReader(payload))
+		done <- client.Store("big", int64(len(payload)), bytes.NewReader(payload))
 	}()
 
 	select {
@@ -113,7 +115,7 @@ func TestControlStoreHandlesLargePayload(t *testing.T) {
 	}
 
 	var got bytes.Buffer
-	if err := client.get("big", &got); err != nil {
+	if err := client.Get("big", &got); err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	if !bytes.Equal(got.Bytes(), payload) {
@@ -123,11 +125,11 @@ func TestControlStoreHandlesLargePayload(t *testing.T) {
 
 func TestControlReportsErrorsBack(t *testing.T) {
 	node := newQuietNode(t)
-	client := &controlClient{path: withControl(t, node)}
+	client := &Client{path: withControl(t, node)}
 
 	// Nothing stored and no peers, so this cannot succeed.
 	var out bytes.Buffer
-	err := client.get("nothing-here", &out)
+	err := client.Get("nothing-here", &out)
 	if err == nil {
 		t.Fatal("fetching an unknown file reported success")
 	}
@@ -135,7 +137,7 @@ func TestControlReportsErrorsBack(t *testing.T) {
 		t.Errorf("error = %v, want the node's own explanation", err)
 	}
 
-	if _, _, err := (&controlClient{path: client.path}).do(controlRequest{Op: "nonsense"}, nil); err == nil {
+	if _, _, err := (&Client{path: client.path}).do(controlRequest{Op: "nonsense"}, nil); err == nil {
 		t.Error("an unknown operation was accepted")
 	}
 }
@@ -154,7 +156,7 @@ func TestControlRefusesASecondNode(t *testing.T) {
 	}
 
 	// The original must still work.
-	if _, err := (&controlClient{path: path}).status(1); err != nil {
+	if _, err := (&Client{path: path}).Status(1); err != nil {
 		t.Errorf("the original node stopped answering: %v", err)
 	}
 }
@@ -187,7 +189,7 @@ func TestControlReplacesAStaleSocket(t *testing.T) {
 	}
 	t.Cleanup(func() { os.Remove(path) })
 
-	if _, err := (&controlClient{path: path}).status(1); err != nil {
+	if _, err := (&Client{path: path}).Status(1); err != nil {
 		t.Errorf("the node is not answering on the reclaimed socket: %v", err)
 	}
 }
@@ -220,7 +222,7 @@ func TestControlSocketPathFallsBackWhenTooLong(t *testing.T) {
 
 func TestDialControlReportsNoNode(t *testing.T) {
 	// No node is serving this database.
-	if _, ok := dialControl(filepath.Join(t.TempDir(), "p2p.db")); ok {
-		t.Error("dialControl claimed a node was running when none was")
+	if _, ok := DialControl(filepath.Join(t.TempDir(), "p2p.db")); ok {
+		t.Error("DialControl claimed a node was running when none was")
 	}
 }

@@ -1,4 +1,4 @@
-package main
+package node
 
 import (
 	"bytes"
@@ -10,6 +10,8 @@ import (
 	"time"
 
 	dbpkg "github.com/TinySkillet/DecentralizedP2PStorage/db"
+
+	"github.com/TinySkillet/DecentralizedP2PStorage/storage"
 )
 
 // newQuietNode is a node with the background repair loop disabled, so a test
@@ -44,7 +46,7 @@ func TestReplicationStatusCountsCopies(t *testing.T) {
 		t.Fatalf("Store: %v", err)
 	}
 	waitFor(t, "the replica to receive the file", 10*time.Second, func() bool {
-		return replica.store.Has(contentKey(payload))
+		return replica.store.Has(storage.ContentKey(payload))
 	})
 
 	health, err := origin.ReplicationStatus()
@@ -79,7 +81,7 @@ func TestRepairRestoresMissingReplica(t *testing.T) {
 	origin := newQuietNodeWith(t, 2)
 
 	payload := randomBytes(t, 8192)
-	digest := contentKey(payload)
+	digest := storage.ContentKey(payload)
 
 	// Stored with nobody else around, so it starts with a single copy.
 	if err := origin.Store("lonely", bytes.NewReader(payload)); err != nil {
@@ -136,7 +138,7 @@ func TestRepairIsIdempotent(t *testing.T) {
 		t.Fatalf("first RepairOnce: %v", err)
 	}
 	waitFor(t, "the repaired copy to land", 10*time.Second, func() bool {
-		return helper.store.Has(contentKey(payload))
+		return helper.store.Has(storage.ContentKey(payload))
 	})
 
 	// Once the target is met, a second cycle must place nothing.
@@ -278,7 +280,7 @@ func TestReplicaDoesNotHijackLocalName(t *testing.T) {
 	}
 
 	waitFor(t, "the incoming copy to be processed", 10*time.Second, func() bool {
-		return victim.store.Has(contentKey(theirs))
+		return victim.store.Has(storage.ContentKey(theirs))
 	})
 
 	// The local name must still resolve to the local contents.
@@ -301,7 +303,7 @@ func TestReplicaDoesNotHijackLocalName(t *testing.T) {
 	}
 	var foundReplica bool
 	for _, f := range files {
-		if f.Hash == contentKey(theirs) {
+		if f.Hash == storage.ContentKey(theirs) {
 			foundReplica = true
 			if f.Name == "notes" {
 				t.Error("the replica claimed the local name")
@@ -335,9 +337,9 @@ func TestBorrowedStorageIsNotCountedTwice(t *testing.T) {
 	}
 
 	// A command node against the same database and storage root.
-	client, err := makeClientNode(freeAddr(t), owner.db, owner.addr)
+	client, err := NewClient(freeAddr(t), owner.db, owner.addr)
 	if err != nil {
-		t.Fatalf("makeClientNode: %v", err)
+		t.Fatalf("NewClient: %v", err)
 	}
 	client.EncryptionKey = owner.EncryptionKey
 	client.ReplicationFactor = 2
@@ -387,23 +389,23 @@ func TestSweepLoopReclaimsAutomatically(t *testing.T) {
 		t.Fatalf("Store v2: %v", err)
 	}
 
-	if !node.store.Has(contentKey(v1)) {
+	if !node.store.Has(storage.ContentKey(v1)) {
 		t.Fatal("the replaced contents are already gone; the test proves nothing")
 	}
 
 	// The grace period protects data too recent to judge, so backdate it to
 	// what an older file looks like rather than waiting.
 	old := time.Now().Add(-2 * DefaultOrphanGrace)
-	if err := os.Chtimes(node.store.FullPathForKey(contentKey(v1)), old, old); err != nil {
+	if err := os.Chtimes(node.store.FullPathForKey(storage.ContentKey(v1)), old, old); err != nil {
 		t.Fatalf("Chtimes: %v", err)
 	}
 
 	waitFor(t, "the sweep to reclaim the replaced contents", 10*time.Second, func() bool {
-		return !node.store.Has(contentKey(v1))
+		return !node.store.Has(storage.ContentKey(v1))
 	})
 
 	// The current version must be untouched.
-	if !node.store.Has(contentKey(v2)) {
+	if !node.store.Has(storage.ContentKey(v2)) {
 		t.Error("the sweep removed the contents the name refers to")
 	}
 }
@@ -421,7 +423,7 @@ func TestRepairEventuallyChecksEveryFile(t *testing.T) {
 	digests := make([]string, blobs)
 	for i := range blobs {
 		payload := randomBytes(t, 256)
-		digests[i] = contentKey(payload)
+		digests[i] = storage.ContentKey(payload)
 		if err := origin.Store(fmt.Sprintf("file-%02d", i), bytes.NewReader(payload)); err != nil {
 			t.Fatalf("Store %d: %v", i, err)
 		}

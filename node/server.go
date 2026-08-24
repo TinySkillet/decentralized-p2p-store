@@ -1,4 +1,4 @@
-package main
+package node
 
 import (
 	"bytes"
@@ -12,6 +12,8 @@ import (
 
 	dbpkg "github.com/TinySkillet/DecentralizedP2PStorage/db"
 	"github.com/TinySkillet/DecentralizedP2PStorage/p2p"
+
+	"github.com/TinySkillet/DecentralizedP2PStorage/storage"
 )
 
 // Serve processes incoming messages until Stop is called.
@@ -170,14 +172,6 @@ func (s *FileServer) isStorageOwner(nodeID, ownerID string) bool {
 	return ownerID != "" && nodeID == ownerID
 }
 
-// short abbreviates a digest for log output.
-func short(digest string) string {
-	if len(digest) > 12 {
-		return digest[:12]
-	}
-	return digest
-}
-
 func (s *FileServer) handleMessageDeleteFile(from string, msg MessageDeleteFile) error {
 	fmt.Printf("[%s] Received delete request for '%s' from %s\n", s.Transport.Address(), msg.Name, from)
 
@@ -221,10 +215,10 @@ func (s *FileServer) authorizeDelete(msg MessageDeleteFile) error {
 		return nil
 	}
 	if msg.Owner != f.Owner {
-		return fmt.Errorf("it is owned by %s, not %s", short(f.Owner), short(msg.Owner))
+		return fmt.Errorf("it is owned by %s, not %s", storage.Short(f.Owner), storage.Short(msg.Owner))
 	}
 	if !verifyByNode(msg.Owner, deleteTranscript(msg.Name, f.Hash), msg.Signature) {
-		return fmt.Errorf("the authorisation does not verify against %s", short(msg.Owner))
+		return fmt.Errorf("the authorisation does not verify against %s", storage.Short(msg.Owner))
 	}
 
 	// The authorisation is genuine, and still may not apply.
@@ -287,14 +281,14 @@ func (s *FileServer) forget(name, digest, owner string, signature []byte) error 
 		reclaimed, rerr := s.reclaim(hash, DefaultOrphanGrace)
 		switch {
 		case rerr != nil:
-			log.Printf("[%s] Could not reclaim %s: %v", s.Transport.Address(), short(hash), rerr)
+			log.Printf("[%s] Could not reclaim %s: %v", s.Transport.Address(), storage.Short(hash), rerr)
 		case reclaimed:
-			fmt.Printf("[%s] Deleted contents %s from local storage\n", s.Transport.Address(), short(hash))
+			fmt.Printf("[%s] Deleted contents %s from local storage\n", s.Transport.Address(), storage.Short(hash))
 		default:
-			fmt.Printf("[%s] Contents %s are now unreferenced and will be reclaimed shortly\n", s.Transport.Address(), short(hash))
+			fmt.Printf("[%s] Contents %s are now unreferenced and will be reclaimed shortly\n", s.Transport.Address(), storage.Short(hash))
 		}
 	} else {
-		fmt.Printf("[%s] Contents %s are still referenced by another name, keeping them\n", s.Transport.Address(), short(hash))
+		fmt.Printf("[%s] Contents %s are still referenced by another name, keeping them\n", s.Transport.Address(), storage.Short(hash))
 	}
 	return nil
 }
@@ -325,7 +319,7 @@ func (s *FileServer) Delete(name string) error {
 		if owner == s.OwnerID() {
 			signature = s.OwnerIdentity.Sign(deleteTranscript(name, digest))
 		} else if owner != "" {
-			return fmt.Errorf("'%s' is owned by %s, so this node cannot authorise deleting it", name, short(owner))
+			return fmt.Errorf("'%s' is owned by %s, so this node cannot authorise deleting it", name, storage.Short(owner))
 		}
 	}
 
@@ -383,7 +377,7 @@ func (s *FileServer) Delete(name string) error {
 
 		// Dial returns once the socket is up, but the handshake that
 		// registers the peer completes asynchronously.
-		s.waitForPeers(2 * time.Second)
+		s.WaitForPeers(2 * time.Second)
 	}
 
 	peerCount := s.peerCount()
@@ -466,7 +460,7 @@ type FileServerOpts struct {
 
 	EncryptionKey     []byte
 	StorageRoot       string
-	PathTransformFunc PathTransformFunc
+	PathTransformFunc storage.PathTransformFunc
 	Transport         p2p.Transport
 	BootstrapNodes    []string
 	DB                *dbpkg.DB
@@ -478,7 +472,7 @@ type FileServer struct {
 	peersLock sync.Mutex
 	peers     map[string]p2p.Peer
 
-	store    *Store
+	store    *storage.Store
 	quitch   chan struct{}
 	stopOnce sync.Once
 
@@ -515,13 +509,13 @@ func NewFileServer(opts FileServerOpts) *FileServer {
 	if opts.SweepInterval == 0 {
 		opts.SweepInterval = DefaultSweepInterval
 	}
-	storeOpts := StoreOpts{
+	storeOpts := storage.StoreOpts{
 		Root:              opts.StorageRoot,
 		PathTransformFunc: opts.PathTransformFunc,
 	}
 	return &FileServer{
 		FileServerOpts:       opts,
-		store:                NewStore(storeOpts),
+		store:                storage.NewStore(storeOpts),
 		quitch:               make(chan struct{}),
 		peers:                make(map[string]p2p.Peer),
 		pendingFileTransfers: make(map[string]MessageStoreFile),

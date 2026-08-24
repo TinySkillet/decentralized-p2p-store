@@ -1,4 +1,4 @@
-package main
+package node
 
 import (
 	"bufio"
@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/TinySkillet/DecentralizedP2PStorage/storage"
 )
 
 // controlSocketName is the socket a running node accepts commands on. It sits
@@ -49,7 +51,7 @@ func ControlSocketPath(dbPath string) string {
 		return beside
 	}
 
-	return filepath.Join(controlRuntimeDir(), "p2p-"+contentKey([]byte(abs))[:16]+".sock")
+	return filepath.Join(controlRuntimeDir(), "p2p-"+storage.ContentKey([]byte(abs))[:16]+".sock")
 }
 
 // controlRuntimeDir returns a private directory for sockets that cannot live
@@ -253,19 +255,19 @@ func (s *FileServer) runControl(req controlRequest, body io.Reader) (controlResp
 	}
 }
 
-// controlClient talks to a running node.
-type controlClient struct{ path string }
+// Client talks to a running node.
+type Client struct{ path string }
 
-// dialControl returns a client for the node serving this database, or false if
+// DialControl returns a client for the node serving this database, or false if
 // no node is running.
-func dialControl(dbPath string) (*controlClient, bool) {
+func DialControl(dbPath string) (*Client, bool) {
 	path := ControlSocketPath(dbPath)
 	conn, err := net.DialTimeout("unix", path, controlDialTimeout)
 	if err != nil {
 		return nil, false
 	}
 	conn.Close()
-	return &controlClient{path: path}, true
+	return &Client{path: path}, true
 }
 
 // controlCall is an open request, held so a caller expecting a payload can
@@ -278,7 +280,7 @@ type controlCall struct {
 func (c *controlCall) Close() error { return c.conn.Close() }
 
 // do sends one request and reads the response.
-func (c *controlClient) do(req controlRequest, payload io.Reader) (controlResponse, *controlCall, error) {
+func (c *Client) do(req controlRequest, payload io.Reader) (controlResponse, *controlCall, error) {
 	conn, err := net.DialTimeout("unix", c.path, controlDialTimeout)
 	if err != nil {
 		return controlResponse{}, nil, err
@@ -312,7 +314,7 @@ func (c *controlClient) do(req controlRequest, payload io.Reader) (controlRespon
 	return resp, &controlCall{conn: conn, body: br}, nil
 }
 
-func (c *controlClient) status(replicas int) ([]FileHealth, error) {
+func (c *Client) Status(replicas int) ([]FileHealth, error) {
 	resp, call, err := c.do(controlRequest{Op: opStatus, Replicas: replicas}, nil)
 	if call != nil {
 		call.Close()
@@ -323,7 +325,7 @@ func (c *controlClient) status(replicas int) ([]FileHealth, error) {
 	return resp.Health, nil
 }
 
-func (c *controlClient) repair(replicas int) (int, error) {
+func (c *Client) Repair(replicas int) (int, error) {
 	resp, call, err := c.do(controlRequest{Op: opRepair, Replicas: replicas}, nil)
 	if call != nil {
 		call.Close()
@@ -334,7 +336,7 @@ func (c *controlClient) repair(replicas int) (int, error) {
 	return resp.Offered, nil
 }
 
-func (c *controlClient) store(name string, size int64, body io.Reader) error {
+func (c *Client) Store(name string, size int64, body io.Reader) error {
 	_, call, err := c.do(controlRequest{Op: opStore, Name: name, Size: size}, body)
 	if call != nil {
 		call.Close()
@@ -342,7 +344,7 @@ func (c *controlClient) store(name string, size int64, body io.Reader) error {
 	return err
 }
 
-func (c *controlClient) delete(name string) error {
+func (c *Client) Delete(name string) error {
 	_, call, err := c.do(controlRequest{Op: opDelete, Name: name}, nil)
 	if call != nil {
 		call.Close()
@@ -351,7 +353,7 @@ func (c *controlClient) delete(name string) error {
 }
 
 // get writes the fetched file to w.
-func (c *controlClient) get(name string, w io.Writer) error {
+func (c *Client) Get(name string, w io.Writer) error {
 	resp, call, err := c.do(controlRequest{Op: opGet, Name: name}, nil)
 	if err != nil {
 		return err

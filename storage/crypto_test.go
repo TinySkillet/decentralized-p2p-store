@@ -1,4 +1,4 @@
-package main
+package storage
 
 import (
 	"bytes"
@@ -10,7 +10,7 @@ import (
 
 func mustKey(t *testing.T) []byte {
 	t.Helper()
-	key, err := newEncryptionKey()
+	key, err := NewEncryptionKey()
 	if err != nil {
 		t.Fatalf("newEncryptionKey: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestCopyEncryptDecryptRoundTrip(t *testing.T) {
 		// The encrypted stream is the IV followed by the ciphertext, and the
 		// reported count must match what actually landed in the buffer. The
 		// server relies on this to derive the plaintext size.
-		if want := size + ivSize; n != want {
+		if want := size + IVSize; n != want {
 			t.Errorf("size %d: copyEncrypt returned %d, want %d", size, n, want)
 		}
 		if ciphertext.Len() != n {
@@ -98,7 +98,7 @@ func TestCopyEncryptUsesFreshIV(t *testing.T) {
 	}
 
 	// Reusing an IV under CTR leaks the XOR of the two plaintexts.
-	if bytes.Equal(first.Bytes()[:ivSize], second.Bytes()[:ivSize]) {
+	if bytes.Equal(first.Bytes()[:IVSize], second.Bytes()[:IVSize]) {
 		t.Fatal("IV reused across encryptions")
 	}
 	if bytes.Equal(first.Bytes(), second.Bytes()) {
@@ -164,7 +164,7 @@ func TestCopyDecryptTruncatedIV(t *testing.T) {
 	// Fewer bytes than an IV must be a reported error, not a silent
 	// decryption under a partially-zeroed IV.
 	var out bytes.Buffer
-	_, err := copyDecrypt(mustKey(t), bytes.NewReader(make([]byte, ivSize-1)), &out)
+	_, err := copyDecrypt(mustKey(t), bytes.NewReader(make([]byte, IVSize-1)), &out)
 	if err == nil {
 		t.Fatal("expected an error for a truncated IV, got nil")
 	}
@@ -180,37 +180,25 @@ func TestCopyEncryptRejectsBadKeyLength(t *testing.T) {
 	}
 }
 
-func TestNameKeyIsStable(t *testing.T) {
-	if nameKey("hello") != nameKey("hello") {
-		t.Fatal("nameKey is not deterministic")
-	}
-	if nameKey("hello") == nameKey("world") {
-		t.Fatal("distinct names collided")
-	}
-	if len(nameKey("hello")) != digestSize {
-		t.Fatalf("nameKey length = %d, want %d hex chars", len(nameKey("hello")), digestSize)
-	}
-}
-
 func TestContentKeyIdentifiesContents(t *testing.T) {
 	payload := []byte("the same bytes")
 
 	// The whole point of content addressing: identity follows the bytes, not
 	// the name they happen to be stored under.
-	if contentKey(payload) != contentKey([]byte("the same bytes")) {
+	if ContentKey(payload) != ContentKey([]byte("the same bytes")) {
 		t.Fatal("identical contents produced different keys")
 	}
-	if contentKey(payload) == contentKey([]byte("different bytes")) {
+	if ContentKey(payload) == ContentKey([]byte("different bytes")) {
 		t.Fatal("different contents produced the same key")
 	}
-	if len(contentKey(payload)) != digestSize {
-		t.Fatalf("contentKey length = %d, want %d hex chars", len(contentKey(payload)), digestSize)
+	if len(ContentKey(payload)) != DigestSize {
+		t.Fatalf("contentKey length = %d, want %d hex chars", len(ContentKey(payload)), DigestSize)
 	}
 
 	// A known vector, so a change of hash function is caught rather than
 	// silently accepted.
 	const wantEmpty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-	if got := contentKey(nil); got != wantEmpty {
+	if got := ContentKey(nil); got != wantEmpty {
 		t.Errorf("contentKey of empty input = %s, want the SHA-256 of the empty string %s", got, wantEmpty)
 	}
 }
@@ -225,7 +213,7 @@ func TestDigesterMatchesContentKey(t *testing.T) {
 
 	// The streaming digest and the one-shot digest must agree, or a file
 	// would fail verification against its own recorded hash.
-	if dg.sum() != contentKey(payload) {
-		t.Errorf("digester gave %s, contentKey gave %s", dg.sum(), contentKey(payload))
+	if dg.sum() != ContentKey(payload) {
+		t.Errorf("digester gave %s, contentKey gave %s", dg.sum(), ContentKey(payload))
 	}
 }

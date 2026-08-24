@@ -1,4 +1,4 @@
-package main
+package node
 
 import (
 	"context"
@@ -10,6 +10,8 @@ import (
 	"time"
 
 	dbpkg "github.com/TinySkillet/DecentralizedP2PStorage/db"
+
+	"github.com/TinySkillet/DecentralizedP2PStorage/storage"
 )
 
 const (
@@ -177,7 +179,7 @@ func (s *FileServer) repairOnceFor(target int) (int, error) {
 
 		n, err := s.repairFile(f, target)
 		if err != nil {
-			log.Printf("[%s] Could not repair %s: %v", s.Transport.Address(), short(f.Hash), err)
+			log.Printf("[%s] Could not repair %s: %v", s.Transport.Address(), storage.Short(f.Hash), err)
 			continue
 		}
 		repaired += n
@@ -251,7 +253,7 @@ func (s *FileServer) repairFile(f dbpkg.File, target int) (int, error) {
 			continue
 		}
 		if err := s.pushTo(nodeID, f); err != nil {
-			log.Printf("[%s] Could not offer a copy of %s to %s: %v", s.Transport.Address(), short(f.Hash), short(nodeID), err)
+			log.Printf("[%s] Could not offer a copy of %s to %s: %v", s.Transport.Address(), storage.Short(f.Hash), storage.Short(nodeID), err)
 			continue
 		}
 		placed++
@@ -354,7 +356,7 @@ func (s *FileServer) collectOffers(req *fileRequest, asked int) []peerOffer {
 func (s *FileServer) pushTo(nodeID string, f dbpkg.File) error {
 	peer, ok := s.peer(nodeID)
 	if !ok {
-		return fmt.Errorf("peer %s is no longer connected", short(nodeID))
+		return fmt.Errorf("peer %s is no longer connected", storage.Short(nodeID))
 	}
 
 	_, body, err := s.store.ReadDecrypt(s.EncryptionKey, f.Hash)
@@ -378,14 +380,14 @@ func (s *FileServer) pushTo(nodeID string, f dbpkg.File) error {
 	}
 
 	if s.DB != nil {
-		shareID := contentKey([]byte(f.Hash + nodeID + "outgoing"))
+		shareID := storage.ContentKey([]byte(f.Hash + nodeID + "outgoing"))
 		if err := s.DB.InsertShare(context.Background(), dbpkg.Share{
 			ID:        shareID,
 			FileID:    f.ID,
 			PeerID:    nodeID,
 			Direction: "outgoing",
 		}); err != nil {
-			log.Printf("[%s] Failed to record outgoing share to %s: %v", s.Transport.Address(), short(nodeID), err)
+			log.Printf("[%s] Failed to record outgoing share to %s: %v", s.Transport.Address(), storage.Short(nodeID), err)
 		}
 	}
 
@@ -459,7 +461,7 @@ func (s *FileServer) SweepOrphans(grace time.Duration) (int, error) {
 			continue
 		}
 		if err := s.store.Delete(b.Digest); err != nil {
-			log.Printf("[%s] Could not reclaim %s: %v", s.Transport.Address(), short(b.Digest), err)
+			log.Printf("[%s] Could not reclaim %s: %v", s.Transport.Address(), storage.Short(b.Digest), err)
 			continue
 		}
 		removed++

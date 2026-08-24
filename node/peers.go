@@ -1,5 +1,5 @@
 // Tracking which peers this node is connected to, and admitting new ones.
-package main
+package node
 
 import (
 	"context"
@@ -9,6 +9,8 @@ import (
 
 	dbpkg "github.com/TinySkillet/DecentralizedP2PStorage/db"
 	"github.com/TinySkillet/DecentralizedP2PStorage/p2p"
+
+	"github.com/TinySkillet/DecentralizedP2PStorage/storage"
 )
 
 // connectedPeers returns a snapshot of the current peers.
@@ -84,9 +86,9 @@ func (s *FileServer) broadcast(msg *Message) error {
 
 	var lastErr error
 	for _, id := range addrs {
-		fmt.Printf("[%s] Sending message to peer %s\n", s.Transport.Address(), short(id))
+		fmt.Printf("[%s] Sending message to peer %s\n", s.Transport.Address(), storage.Short(id))
 		if err := sendMessage(peers[id], msg); err != nil {
-			fmt.Printf("[%s] Error sending message to peer %s: %v\n", s.Transport.Address(), short(id), err)
+			fmt.Printf("[%s] Error sending message to peer %s: %v\n", s.Transport.Address(), storage.Short(id), err)
 			lastErr = err
 		}
 	}
@@ -109,7 +111,7 @@ func (s *FileServer) OnPeer(p p2p.Peer) error {
 	s.peers[nodeID] = p
 	s.peersLock.Unlock()
 
-	fmt.Printf("[%s] Connected with %s at %s\n", s.Transport.Address(), short(nodeID), peerAddr)
+	fmt.Printf("[%s] Connected with %s at %s\n", s.Transport.Address(), storage.Short(nodeID), peerAddr)
 
 	if s.DB != nil {
 		now := time.Now()
@@ -174,7 +176,7 @@ func (s *FileServer) OnPeerDisconnect(p p2p.Peer) {
 	delete(s.peers, nodeID)
 	s.peersLock.Unlock()
 
-	fmt.Printf("[%s] Disconnected from %s\n", s.Transport.Address(), short(nodeID))
+	fmt.Printf("[%s] Disconnected from %s\n", s.Transport.Address(), storage.Short(nodeID))
 
 	if s.DB != nil {
 		now := time.Now()
@@ -200,7 +202,7 @@ func (s *FileServer) announceTo(nodeID string) {
 			return
 		} else {
 			fmt.Printf("[%s] Error sending peer exchange to %s: %v (attempt %d/%d)\n",
-				s.Transport.Address(), short(nodeID), err, i+1, attempts)
+				s.Transport.Address(), storage.Short(nodeID), err, i+1, attempts)
 		}
 
 		select {
@@ -228,7 +230,7 @@ func (s *FileServer) bootstrapNetwork() error {
 	return nil
 }
 
-// waitForPeerDiscovery waits until the peer set stops growing, and returns
+// WaitForPeerDiscovery waits until the peer set stops growing, and returns
 // the number of peers connected.
 //
 // Gossip reaches further than the bootstrap list names, so a command that
@@ -236,7 +238,7 @@ func (s *FileServer) bootstrapNetwork() error {
 // the network it could have reached. Waiting for the count to hold steady
 // adapts to how long discovery actually takes, where a fixed sleep is either
 // too short on a slow network or wasted time on a fast one.
-func (s *FileServer) waitForPeerDiscovery(quiet, max time.Duration) int {
+func (s *FileServer) WaitForPeerDiscovery(quiet, max time.Duration) int {
 	const poll = 25 * time.Millisecond
 
 	deadline := time.Now().Add(max)
@@ -264,8 +266,8 @@ func (s *FileServer) waitForPeerDiscovery(quiet, max time.Duration) int {
 	return s.peerCount()
 }
 
-// waitForPeers waits for at least one peer connection, with a timeout
-func (s *FileServer) waitForPeers(timeout time.Duration) error {
+// WaitForPeers waits for at least one peer connection, with a timeout
+func (s *FileServer) WaitForPeers(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if s.peerCount() > 0 {

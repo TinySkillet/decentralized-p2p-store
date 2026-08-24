@@ -1,4 +1,4 @@
-package main
+package node
 
 import (
 	"bytes"
@@ -6,6 +6,8 @@ import (
 	"io"
 	"testing"
 	"time"
+
+	"github.com/TinySkillet/DecentralizedP2PStorage/storage"
 )
 
 // TestOverwritingANameReclaimsTheOldContents is a regression test. Storing a
@@ -53,7 +55,7 @@ func TestOverwritingANameReclaimsTheOldContents(t *testing.T) {
 func TestDeleteDoesNotUnlinkNewlyReferencedContents(t *testing.T) {
 	node := newQuietNode(t)
 	payload := randomBytes(t, 4096)
-	digest := contentKey(payload)
+	digest := storage.ContentKey(payload)
 
 	if err := node.Store("first", bytes.NewReader(payload)); err != nil {
 		t.Fatalf("Store: %v", err)
@@ -109,7 +111,7 @@ func TestDeleteWithNoPeersLeavesRemoteCopies(t *testing.T) {
 		t.Fatalf("Store: %v", err)
 	}
 	waitFor(t, "the replica to receive it", 10*time.Second, func() bool {
-		return replica.store.Has(contentKey(payload))
+		return replica.store.Has(storage.ContentKey(payload))
 	})
 
 	// The replica goes away before the delete.
@@ -125,7 +127,7 @@ func TestDeleteWithNoPeersLeavesRemoteCopies(t *testing.T) {
 		t.Log("Delete reported success while a copy survives on an unreachable peer")
 	}
 
-	if !replica.store.Has(contentKey(payload)) {
+	if !replica.store.Has(storage.ContentKey(payload)) {
 		t.Error("the replica somehow lost the file")
 	}
 }
@@ -142,7 +144,7 @@ func TestDeletionSurvivesAPeerThatMissedIt(t *testing.T) {
 	waitForPeerCount(t, straggler, 1)
 
 	payload := randomBytes(t, 2048)
-	digest := contentKey(payload)
+	digest := storage.ContentKey(payload)
 
 	if err := origin.Store("secret", bytes.NewReader(payload)); err != nil {
 		t.Fatalf("Store: %v", err)
@@ -207,7 +209,7 @@ func TestDeleteOnlyAffectsMatchingContents(t *testing.T) {
 	// Each node's own "notes" must still be its own.
 	waitFor(t, "both nodes to settle", 10*time.Second, func() bool {
 		f, err := theirs.db.FindFileByName(context.Background(), "notes")
-		return err == nil && f != nil && f.Hash == contentKey(theirPayload)
+		return err == nil && f != nil && f.Hash == storage.ContentKey(theirPayload)
 	})
 
 	if err := mine.Delete("notes"); err != nil {
@@ -224,8 +226,8 @@ func TestDeleteOnlyAffectsMatchingContents(t *testing.T) {
 	if f == nil {
 		t.Fatal("deleting one node's file also deleted a different file of the same name on a peer")
 	}
-	if f.Hash != contentKey(theirPayload) {
-		t.Errorf("the peer's name now refers to %s, want its own contents", short(f.Hash))
+	if f.Hash != storage.ContentKey(theirPayload) {
+		t.Errorf("the peer's name now refers to %s, want its own contents", storage.Short(f.Hash))
 	}
 
 	_, r, err := theirs.Get("notes")
@@ -257,7 +259,7 @@ func TestRestoringADeletedFileSurvivesAPeerTombstone(t *testing.T) {
 	waitForPeerCount(t, peer, 1)
 
 	payload := randomBytes(t, 2048)
-	digest := contentKey(payload)
+	digest := storage.ContentKey(payload)
 
 	if err := owner.Store("revived", bytes.NewReader(payload)); err != nil {
 		t.Fatalf("Store: %v", err)

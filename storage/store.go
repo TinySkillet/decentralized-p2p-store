@@ -1,4 +1,4 @@
-package main
+package storage
 
 import (
 	"fmt"
@@ -38,8 +38,8 @@ func CASPathTransformFunc(key string) PathKey {
 
 	// A key that is not a digest (an unhashed name, in tests or older data)
 	// is hashed first, so every key still produces a valid sharded path.
-	if !isDigest(key) {
-		key = contentKey([]byte(key))
+	if !IsDigest(key) {
+		key = ContentKey([]byte(key))
 	}
 
 	sliceLen := len(key) / blockSize
@@ -56,8 +56,8 @@ func CASPathTransformFunc(key string) PathKey {
 }
 
 // isDigest reports whether key is a hex-encoded SHA-256 digest.
-func isDigest(key string) bool {
-	if len(key) != digestSize {
+func IsDigest(key string) bool {
+	if len(key) != DigestSize {
 		return false
 	}
 	for i := range len(key) {
@@ -122,7 +122,7 @@ func (s *Store) writeContent(encryptionKey []byte, want string, r io.Reader) (di
 	}
 
 	digest = dg.sum()
-	size = int64(written) - ivSize
+	size = int64(written) - IVSize
 
 	if want != "" && digest != want {
 		return "", 0, fmt.Errorf("content digest %s does not match the announced %s", digest, want)
@@ -162,7 +162,7 @@ func (s *Store) ReadDecrypt(encryptionKey []byte, key string) (int64, io.Reader,
 
 	// The file is an IV followed by the ciphertext, so the plaintext is
 	// shorter than the file by exactly one IV.
-	plaintextSize := info.Size() - ivSize
+	plaintextSize := info.Size() - IVSize
 	if plaintextSize < 0 {
 		f.Close()
 		return 0, nil, fmt.Errorf("stored file %q is shorter than an iv", key)
@@ -249,7 +249,7 @@ func (s *Store) Blobs() ([]BlobInfo, error) {
 			}
 			return err
 		}
-		if d.IsDir() || !isDigest(d.Name()) {
+		if d.IsDir() || !IsDigest(d.Name()) {
 			return nil
 		}
 

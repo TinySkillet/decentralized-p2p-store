@@ -1,5 +1,5 @@
 // Wire messages and the framing that carries them.
-package main
+package node
 
 import (
 	"bytes"

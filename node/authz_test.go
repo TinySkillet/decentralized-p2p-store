@@ -1,4 +1,4 @@
-package main
+package node
 
 import (
 	"bytes"
@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/TinySkillet/DecentralizedP2PStorage/storage"
 )
 
 // TestUnauthorisedDeleteIsRefused is the property that makes deletion safe to
@@ -24,7 +26,7 @@ func TestUnauthorisedDeleteIsRefused(t *testing.T) {
 	if err := owner.Store("valuable", bytes.NewReader(payload)); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
-	digest := contentKey(payload)
+	digest := storage.ContentKey(payload)
 
 	// The attacker asks the owner to delete it, with its own identity and a
 	// signature it is perfectly able to produce over the right bytes.
@@ -66,7 +68,7 @@ func TestDeleteWithForgedSignatureIsRefused(t *testing.T) {
 	if err := owner.Store("valuable", bytes.NewReader(payload)); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
-	digest := contentKey(payload)
+	digest := storage.ContentKey(payload)
 
 	attacker := mustIdentity(t)
 
@@ -114,7 +116,7 @@ func TestOwnerCanDeleteAcrossTheNetwork(t *testing.T) {
 		t.Fatalf("Store: %v", err)
 	}
 	waitFor(t, "the replica to receive it", 10*time.Second, func() bool {
-		return replica.store.Has(contentKey(payload))
+		return replica.store.Has(storage.ContentKey(payload))
 	})
 
 	if err := owner.Delete("mine"); err != nil {
@@ -152,7 +154,7 @@ func TestReplicaRecordsTheOwner(t *testing.T) {
 		t.Fatalf("FindFileByName: %v", err)
 	}
 	if f.Owner != owner.NodeID() {
-		t.Errorf("Owner = %q, want the storing node %q", short(f.Owner), short(owner.NodeID()))
+		t.Errorf("Owner = %q, want the storing node %q", storage.Short(f.Owner), storage.Short(owner.NodeID()))
 	}
 }
 
@@ -194,9 +196,9 @@ func TestFilesStoredByACommandStayDeletable(t *testing.T) {
 	node.OwnsDatabase = true
 
 	// A command against the same database, with its own network identity.
-	client, err := makeClientNode(freeAddr(t), node.db)
+	client, err := NewClient(freeAddr(t), node.db)
 	if err != nil {
-		t.Fatalf("makeClientNode: %v", err)
+		t.Fatalf("NewClient: %v", err)
 	}
 	client.EncryptionKey = node.EncryptionKey
 	client.RepairInterval = -1
@@ -226,7 +228,7 @@ func TestFilesStoredByACommandStayDeletable(t *testing.T) {
 		t.Fatal("the file was not recorded")
 	}
 	if f.Owner != node.OwnerID() {
-		t.Errorf("Owner = %q, want the database's identity %q", short(f.Owner), short(node.OwnerID()))
+		t.Errorf("Owner = %q, want the database's identity %q", storage.Short(f.Owner), storage.Short(node.OwnerID()))
 	}
 
 	// And the node itself must be able to delete what its command stored.

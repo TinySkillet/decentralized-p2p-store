@@ -13,6 +13,8 @@ import (
 	"time"
 
 	dbpkg "github.com/TinySkillet/DecentralizedP2PStorage/db"
+	"github.com/TinySkillet/DecentralizedP2PStorage/node"
+	"github.com/TinySkillet/DecentralizedP2PStorage/storage"
 	"github.com/spf13/cobra"
 )
 
@@ -42,10 +44,10 @@ func withBootstrap(bootstrap []string, addr string) []string {
 // running against this database, or a temporary one it starts itself.
 type nodeTarget struct {
 	// running is set when a node owns this database and can be asked to act.
-	running *controlClient
+	running *node.Client
 
 	// local is set instead, and is a node started for this command alone.
-	local *FileServer
+	local *node.FileServer
 }
 
 // onNode runs work against whichever node should carry it out.
@@ -56,7 +58,7 @@ type nodeTarget struct {
 // Starting a temporary node is safe only when there is no running one, which is
 // exactly when this takes that path.
 func onNode(dbPath, listen string, bootstrap []string, replicas int, work func(nodeTarget) error) error {
-	if node, ok := dialControl(dbPath); ok {
+	if node, ok := node.DialControl(dbPath); ok {
 		return work(nodeTarget{running: node})
 	}
 
@@ -93,8 +95,8 @@ func openDB(path string) (*dbpkg.DB, error) {
 //
 // Listen is synchronous, so a bind failure (a port already in use, most
 // often) is reported here rather than crashing a background goroutine.
-func startClientNode(listen string, d *dbpkg.DB, bootstrap []string, replicas int) (*FileServer, func(), error) {
-	keyBytes, err := loadOrInitKey(d)
+func startClientNode(listen string, d *dbpkg.DB, bootstrap []string, replicas int) (*node.FileServer, func(), error) {
+	keyBytes, err := node.LoadOrInitKey(d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -105,7 +107,7 @@ func startClientNode(listen string, d *dbpkg.DB, bootstrap []string, replicas in
 		bootstrap = withBootstrap(bootstrap, owner)
 	}
 
-	s, err := makeClientNode(listen, d, bootstrap...)
+	s, err := node.NewClient(listen, d, bootstrap...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -121,12 +123,12 @@ func startClientNode(listen string, d *dbpkg.DB, bootstrap []string, replicas in
 	go s.Serve()
 
 	if len(bootstrap) > 0 {
-		if err := s.waitForPeers(peerWaitTimeout); err != nil {
+		if err := s.WaitForPeers(peerWaitTimeout); err != nil {
 			fmt.Printf("Warning: %v. Proceeding anyway.\n", err)
 		}
 		// Gossip keeps introducing peers after the first connection lands.
 		// Wait for the set to settle rather than for a fixed period.
-		n := s.waitForPeerDiscovery(discoveryQuietPeriod, discoverySettleTimeout)
+		n := s.WaitForPeerDiscovery(discoveryQuietPeriod, discoverySettleTimeout)
 		fmt.Printf("Connected to %d peer(s).\n", n)
 	}
 
@@ -182,11 +184,11 @@ func setupCommands() *cobra.Command {
 			}
 			defer d.Close()
 
-			keyBytes, err := loadOrInitKey(d)
+			keyBytes, err := node.LoadOrInitKey(d)
 			if err != nil {
 				return err
 			}
-			s, err := makeServerWithDB(listen, d, bootstrap...)
+			s, err := node.NewServer(listen, d, bootstrap...)
 			if err != nil {
 				return err
 			}
@@ -200,7 +202,7 @@ func setupCommands() *cobra.Command {
 
 			// Commands ask this node to act rather than starting one of their
 			// own against the same storage.
-			if err := s.ListenControl(ControlSocketPath(dbPath)); err != nil {
+			if err := s.ListenControl(node.ControlSocketPath(dbPath)); err != nil {
 				return err
 			}
 
@@ -223,7 +225,7 @@ func setupCommands() *cobra.Command {
 	serveCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address")
 	serveCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes")
 	serveCmd.Flags().StringVar(&configPath, "config", "", "config file path (e.g., ~/.p2p/config)")
-	serveCmd.Flags().IntVar(&replicas, "replicas", DefaultReplicationFactor, "how many copies of each file the network should hold")
+	serveCmd.Flags().IntVar(&replicas, "replicas", node.DefaultReplicationFactor, "how many copies of each file the network should hold")
 	root.AddCommand(serveCmd)
 
 	storeCmd := &cobra.Command{
@@ -244,7 +246,7 @@ func setupCommands() *cobra.Command {
 					if err != nil {
 						return err
 					}
-					return t.running.store(key, info.Size(), f)
+					return t.running.Store(key, info.Size(), f)
 				}
 				return t.local.Store(key, f)
 			})
@@ -276,7 +278,7 @@ func setupCommands() *cobra.Command {
 
 			return onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
 				if t.running != nil {
-					return writeOut(func(w io.Writer) error { return t.running.get(key, w) })
+					return writeOut(func(w io.Writer) error { return t.running.Get(key, w) })
 				}
 
 				_, r, err := t.local.Get(key)
@@ -307,7 +309,7 @@ func setupCommands() *cobra.Command {
 
 			return onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
 				if t.running != nil {
-					return t.running.delete(key)
+					return t.running.Delete(key)
 				}
 				return t.local.Delete(key)
 			})
@@ -376,7 +378,7 @@ func setupCommands() *cobra.Command {
 			for _, s := range shares {
 				fmt.Printf("%-20s\t%-14s\t%-10s\t%-10d\t%s\n",
 					s.FileName,
-					short(s.PeerID),
+					storage.Short(s.PeerID),
 					s.Direction,
 					s.FileSize,
 					s.CreatedAt.Format("2006-01-02 15:04:05"))
@@ -445,11 +447,11 @@ func setupCommands() *cobra.Command {
 		Use:   "status",
 		Short: "Report how well replicated the local files are",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			var health []FileHealth
+			var health []node.FileHealth
 			err := onNode(dbPath, listen, bootstrap, replicas, func(t nodeTarget) error {
 				var err error
 				if t.running != nil {
-					health, err = t.running.status(replicas)
+					health, err = t.running.Status(replicas)
 				} else {
 					health, err = t.local.ReplicationStatus()
 				}
@@ -485,7 +487,7 @@ func setupCommands() *cobra.Command {
 	}
 	statusCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
 	statusCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
-	statusCmd.Flags().IntVar(&replicas, "replicas", DefaultReplicationFactor, "replication target to measure against")
+	statusCmd.Flags().IntVar(&replicas, "replicas", node.DefaultReplicationFactor, "replication target to measure against")
 	root.AddCommand(statusCmd)
 
 	repairCmd := &cobra.Command{
@@ -496,7 +498,7 @@ func setupCommands() *cobra.Command {
 			err := onNode(dbPath, listen, bootstrap, replicas, func(t nodeTarget) error {
 				var err error
 				if t.running != nil {
-					placed, err = t.running.repair(replicas)
+					placed, err = t.running.Repair(replicas)
 				} else {
 					placed, err = t.local.RepairOnce()
 				}
@@ -517,7 +519,7 @@ func setupCommands() *cobra.Command {
 	}
 	repairCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
 	repairCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
-	repairCmd.Flags().IntVar(&replicas, "replicas", DefaultReplicationFactor, "replication target to restore")
+	repairCmd.Flags().IntVar(&replicas, "replicas", node.DefaultReplicationFactor, "replication target to restore")
 	root.AddCommand(repairCmd)
 
 	demoCmd := &cobra.Command{
@@ -543,7 +545,7 @@ func setupCommands() *cobra.Command {
 			defer os.RemoveAll(root)
 			fmt.Printf("demo data in %s\n", root)
 
-			servers := make([]*FileServer, 0, len(specs))
+			servers := make([]*node.FileServer, 0, len(specs))
 			for i, spec := range specs {
 				dir := filepath.Join(root, fmt.Sprintf("node%d", i+1))
 				if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -556,11 +558,11 @@ func setupCommands() *cobra.Command {
 				}
 				defer d.Close()
 
-				s, err := makeServerWithDB(spec.listen, d, spec.bootstrap...)
+				s, err := node.NewServer(spec.listen, d, spec.bootstrap...)
 				if err != nil {
 					return err
 				}
-				key, err := loadOrInitKey(d)
+				key, err := node.LoadOrInitKey(d)
 				if err != nil {
 					return err
 				}
@@ -576,10 +578,10 @@ func setupCommands() *cobra.Command {
 
 			origin, other := servers[0], servers[2]
 
-			if err := other.waitForPeers(peerWaitTimeout); err != nil {
+			if err := other.WaitForPeers(peerWaitTimeout); err != nil {
 				return err
 			}
-			other.waitForPeerDiscovery(discoveryQuietPeriod, discoverySettleTimeout)
+			other.WaitForPeerDiscovery(discoveryQuietPeriod, discoverySettleTimeout)
 
 			// Store on one node.
 			const key = "coolpicture.jpg"

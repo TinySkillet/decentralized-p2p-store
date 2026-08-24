@@ -1,4 +1,4 @@
-package main
+package node
 
 import (
 	"context"
@@ -6,11 +6,13 @@ import (
 
 	dbpkg "github.com/TinySkillet/DecentralizedP2PStorage/db"
 	"github.com/TinySkillet/DecentralizedP2PStorage/p2p"
+
+	"github.com/TinySkillet/DecentralizedP2PStorage/storage"
 )
 
-// makeServerWithDB builds a long-lived node whose identity is persisted in db.
-func makeServerWithDB(listenAddr string, db *dbpkg.DB, nodes ...string) (*FileServer, error) {
-	identity, err := loadOrInitIdentity(db)
+// NewServer builds a long-lived node whose identity is persisted in db.
+func NewServer(listenAddr string, db *dbpkg.DB, nodes ...string) (*FileServer, error) {
+	identity, err := LoadOrInitIdentity(db)
 	if err != nil {
 		return nil, err
 	}
@@ -18,9 +20,9 @@ func makeServerWithDB(listenAddr string, db *dbpkg.DB, nodes ...string) (*FileSe
 	return newServer(listenAddr, identity, identity, db, storageRootFor(db), nodes...)
 }
 
-// loadOrInitIdentity returns the node's signing identity, persisted in db so
+// LoadOrInitIdentity returns the node's signing identity, persisted in db so
 // that it survives restarts and is shared by every process using it.
-func loadOrInitIdentity(db *dbpkg.DB) (Identity, error) {
+func LoadOrInitIdentity(db *dbpkg.DB) (Identity, error) {
 	if db == nil {
 		return newIdentity()
 	}
@@ -52,14 +54,14 @@ func loadOrInitIdentity(db *dbpkg.DB) (Identity, error) {
 	return identity, nil
 }
 
-// makeClientNode builds the short-lived node a one-shot command runs on.
+// NewClient builds the short-lived node a one-shot command runs on.
 //
 // It borrows a running node's database for metadata and for the encryption
 // key that its files are stored under, but it takes a fresh identity rather
 // than the persisted one. It is a separate participant on the network, and
 // sharing an identity would make the node it connects to refuse the
 // connection as one to itself.
-func makeClientNode(listenAddr string, db *dbpkg.DB, nodes ...string) (*FileServer, error) {
+func NewClient(listenAddr string, db *dbpkg.DB, nodes ...string) (*FileServer, error) {
 	identity, err := newIdentity()
 	if err != nil {
 		return nil, err
@@ -68,7 +70,7 @@ func makeClientNode(listenAddr string, db *dbpkg.DB, nodes ...string) (*FileServ
 	// Files belong to the database, not to this process. Without the
 	// database's own identity a command would store files owned by a key that
 	// disappears when it exits, leaving them undeletable by anyone.
-	owner, err := loadOrInitIdentity(db)
+	owner, err := LoadOrInitIdentity(db)
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +97,7 @@ func storageRootFor(db *dbpkg.DB) string {
 func newServer(listenAddr string, identity, owner Identity, db *dbpkg.DB, storageRoot string, nodes ...string) (*FileServer, error) {
 	// A per-process key is only a placeholder; commands with a database
 	// replace it with the node's persisted key.
-	key, err := newEncryptionKey()
+	key, err := storage.NewEncryptionKey()
 	if err != nil {
 		return nil, err
 	}
@@ -107,13 +109,13 @@ func newServer(listenAddr string, identity, owner Identity, db *dbpkg.DB, storag
 
 	// Set after construction: the handshake reads the port the transport
 	// actually bound, which is only known once it exists.
-	tcpTransport.HandshakeFunc = GetHandshakeFunc(identity, tcpTransport)
+	tcpTransport.HandshakeFunc = getHandshakeFunc(identity, tcpTransport)
 
 	s := NewFileServer(FileServerOpts{
 		Identity:          identity,
 		OwnerIdentity:     owner,
 		EncryptionKey:     key,
-		PathTransformFunc: CASPathTransformFunc,
+		PathTransformFunc: storage.CASPathTransformFunc,
 		StorageRoot:       storageRoot,
 		Transport:         tcpTransport,
 		BootstrapNodes:    nodes,
@@ -126,6 +128,6 @@ func newServer(listenAddr string, identity, owner Identity, db *dbpkg.DB, storag
 	return s, nil
 }
 
-func loadOrInitKey(d *dbpkg.DB) ([]byte, error) {
-	return d.GetOrCreateDefaultKey(context.Background(), newEncryptionKey)
+func LoadOrInitKey(d *dbpkg.DB) ([]byte, error) {
+	return d.GetOrCreateDefaultKey(context.Background(), storage.NewEncryptionKey)
 }

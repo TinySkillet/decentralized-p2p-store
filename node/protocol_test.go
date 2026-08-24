@@ -1,4 +1,4 @@
-package main
+package node
 
 import (
 	"bytes"
@@ -16,6 +16,8 @@ import (
 
 	dbpkg "github.com/TinySkillet/DecentralizedP2PStorage/db"
 	"github.com/TinySkillet/DecentralizedP2PStorage/p2p"
+
+	"github.com/TinySkillet/DecentralizedP2PStorage/storage"
 )
 
 // rawPeer speaks the handshake by hand, so a test can present a handshake a
@@ -254,9 +256,9 @@ func TestNodeIDSurvivesRestart(t *testing.T) {
 			t.Fatalf("Migrate: %v", err)
 		}
 
-		s, err := makeServerWithDB("127.0.0.1:0", d)
+		s, err := NewServer("127.0.0.1:0", d)
 		if err != nil {
-			t.Fatalf("makeServerWithDB: %v", err)
+			t.Fatalf("NewServer: %v", err)
 		}
 		ids = append(ids, s.NodeID())
 		d.Close()
@@ -298,7 +300,7 @@ func TestOnlyOnePeerStreamsOnGet(t *testing.T) {
 		t.Fatalf("Store: %v", err)
 	}
 
-	hash := contentKey(payload)
+	hash := storage.ContentKey(payload)
 	waitFor(t, "both replicas to receive the file", 10*time.Second, func() bool {
 		return replicaA.store.Has(hash) && replicaB.store.Has(hash)
 	})
@@ -353,8 +355,8 @@ func TestStoreIsContentAddressed(t *testing.T) {
 	if len(files) != 1 {
 		t.Fatalf("got %d files, want 1", len(files))
 	}
-	if files[0].Hash != contentKey(payload) {
-		t.Errorf("Hash = %q, want the digest of the contents %q", files[0].Hash, contentKey(payload))
+	if files[0].Hash != storage.ContentKey(payload) {
+		t.Errorf("Hash = %q, want the digest of the contents %q", files[0].Hash, storage.ContentKey(payload))
 	}
 
 	// Storing the same bytes under a different name must give the same hash,
@@ -504,7 +506,7 @@ func TestHandleStreamRejectsSubstitutedContents(t *testing.T) {
 	node.transferLock.Lock()
 	node.pendingFileTransfers["lying-peer"] = MessageStoreFile{
 		Name:   "tampered",
-		Digest: contentKey(promised),
+		Digest: storage.ContentKey(promised),
 		Size:   int64(len(actual)),
 	}
 	node.transferLock.Unlock()
@@ -518,10 +520,10 @@ func TestHandleStreamRejectsSubstitutedContents(t *testing.T) {
 	}
 
 	// Neither the promised nor the substituted contents may be readable.
-	if node.store.Has(contentKey(promised)) {
+	if node.store.Has(storage.ContentKey(promised)) {
 		t.Error("the store holds something under the promised digest")
 	}
-	if node.store.Has(contentKey(actual)) {
+	if node.store.Has(storage.ContentKey(actual)) {
 		t.Error("the substituted contents were stored anyway")
 	}
 	if n := countStoredFiles(t, node.store.Root); n != 0 {
@@ -539,7 +541,7 @@ func TestOfferForUnknownRequestIsIgnored(t *testing.T) {
 		RequestID: "a-request-that-never-existed",
 		Name:      "k",
 		Have:      true,
-		Digest:    contentKey([]byte("k")),
+		Digest:    storage.ContentKey([]byte("k")),
 	})
 	if err != nil {
 		t.Errorf("handleMessageFileOffer returned %v for an unknown request, want nil", err)

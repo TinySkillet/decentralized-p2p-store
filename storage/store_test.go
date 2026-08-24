@@ -1,10 +1,11 @@
-package main
+package storage
 
 import (
 	"bytes"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -23,7 +24,7 @@ func newTestStore(t *testing.T) *Store {
 func TestCASPathTransformFunc(t *testing.T) {
 	// The key is already a content digest, so the path shards it rather than
 	// hashing it again: a digest of a1b2c... becomes a1b2c/....
-	digest := contentKey([]byte("some file contents"))
+	digest := ContentKey([]byte("some file contents"))
 
 	pathKey := CASPathTransformFunc(digest)
 	if pathKey.Filename != digest {
@@ -31,7 +32,7 @@ func TestCASPathTransformFunc(t *testing.T) {
 	}
 
 	dirs := strings.Split(pathKey.Pathname, string(filepath.Separator))
-	if want := digestSize / 5; len(dirs) != want {
+	if want := DigestSize / 5; len(dirs) != want {
 		t.Errorf("got %d path segments, want %d", len(dirs), want)
 	}
 	for _, d := range dirs {
@@ -55,21 +56,21 @@ func TestCASPathTransformFuncHashesNonDigestKeys(t *testing.T) {
 	// A key that is not a digest still has to produce a valid sharded path.
 	pathKey := CASPathTransformFunc("just-a-name")
 
-	if len(pathKey.Filename) != digestSize {
-		t.Errorf("Filename = %q, want a %d character digest", pathKey.Filename, digestSize)
+	if len(pathKey.Filename) != DigestSize {
+		t.Errorf("Filename = %q, want a %d character digest", pathKey.Filename, DigestSize)
 	}
-	if !isDigest(pathKey.Filename) {
+	if !IsDigest(pathKey.Filename) {
 		t.Errorf("Filename %q is not a hex digest", pathKey.Filename)
 	}
 }
 
 func TestIsDigest(t *testing.T) {
-	if !isDigest(contentKey([]byte("x"))) {
+	if !IsDigest(ContentKey([]byte("x"))) {
 		t.Error("a real digest was not recognised")
 	}
-	for _, bad := range []string{"", "short", strings.Repeat("z", digestSize), strings.Repeat("a", digestSize-1), strings.ToUpper(contentKey([]byte("x")))} {
-		if isDigest(bad) {
-			t.Errorf("isDigest(%q) = true, want false", bad)
+	for _, bad := range []string{"", "short", strings.Repeat("z", DigestSize), strings.Repeat("a", DigestSize-1), strings.ToUpper(ContentKey([]byte("x")))} {
+		if IsDigest(bad) {
+			t.Errorf("IsDigest(%q) = true, want false", bad)
 		}
 	}
 }
@@ -108,7 +109,7 @@ func TestWriteContentIsAddressedByItsContents(t *testing.T) {
 	payload := bytes.Repeat([]byte("addressed by content "), 500)
 
 	digest := mustWrite(t, s, key, payload)
-	if digest != contentKey(payload) {
+	if digest != ContentKey(payload) {
 		t.Errorf("digest = %q, want the SHA-256 of the contents", digest)
 	}
 	if !s.Has(digest) {
@@ -123,7 +124,7 @@ func TestWriteContentIsAddressedByItsContents(t *testing.T) {
 	if bytes.Contains(onDisk, []byte("addressed by content")) {
 		t.Error("plaintext found on disk")
 	}
-	if want := len(payload) + ivSize; len(onDisk) != want {
+	if want := len(payload) + IVSize; len(onDisk) != want {
 		t.Errorf("stored %d bytes, want %d", len(onDisk), want)
 	}
 
@@ -152,7 +153,7 @@ func TestWriteContentStoresIdenticalBytesOnce(t *testing.T) {
 	second := mustWrite(t, s, key, payload)
 
 	if first != second {
-		t.Errorf("identical contents gave different digests: %s and %s", short(first), short(second))
+		t.Errorf("identical contents gave different digests: %s and %s", Short(first), Short(second))
 	}
 	if n := countStoredFiles(t, s.Root); n != 1 {
 		t.Errorf("%d files on disk, want 1", n)
@@ -162,7 +163,7 @@ func TestWriteContentStoresIdenticalBytesOnce(t *testing.T) {
 func TestStoreHas(t *testing.T) {
 	s := newTestStore(t)
 
-	if s.Has(contentKey([]byte("never stored"))) {
+	if s.Has(ContentKey([]byte("never stored"))) {
 		t.Error("Has reported contents that were never written")
 	}
 	if digest := mustWrite(t, s, mustKey(t), []byte("x")); !s.Has(digest) {
@@ -226,7 +227,7 @@ func TestDeleteIsIdempotent(t *testing.T) {
 
 	// Deletions are broadcast to peers that may never have held the file, so
 	// deleting something absent must succeed rather than fail the request.
-	if err := s.Delete(contentKey([]byte("never stored"))); err != nil {
+	if err := s.Delete(ContentKey([]byte("never stored"))); err != nil {
 		t.Errorf("deleting absent contents returned %v, want nil", err)
 	}
 
@@ -261,7 +262,7 @@ func TestDeletePrunesEmptyDirectories(t *testing.T) {
 
 func TestReadMissingContents(t *testing.T) {
 	s := newTestStore(t)
-	absent := contentKey([]byte("nope"))
+	absent := ContentKey([]byte("nope"))
 
 	if _, _, err := s.Read(absent); err == nil {
 		t.Error("expected an error reading missing contents, got nil")
@@ -331,22 +332,22 @@ func TestWriteContentExpectingRejectsMismatch(t *testing.T) {
 	key := mustKey(t)
 
 	actual := []byte("the real bytes")
-	wrong := contentKey([]byte("something else entirely"))
+	wrong := ContentKey([]byte("something else entirely"))
 
 	if _, err := s.WriteContentExpecting(key, wrong, bytes.NewReader(actual)); err == nil {
 		t.Fatal("contents that did not match the announced digest were accepted")
 	}
-	if s.Has(contentKey(actual)) {
+	if s.Has(ContentKey(actual)) {
 		t.Error("the rejected contents were stored anyway")
 	}
 	if n := countStoredFiles(t, s.Root); n != 0 {
 		t.Errorf("%d files left after a rejected write, want 0", n)
 	}
 
-	if _, err := s.WriteContentExpecting(key, contentKey(actual), bytes.NewReader(actual)); err != nil {
+	if _, err := s.WriteContentExpecting(key, ContentKey(actual), bytes.NewReader(actual)); err != nil {
 		t.Fatalf("WriteContentExpecting: %v", err)
 	}
-	if !s.Has(contentKey(actual)) {
+	if !s.Has(ContentKey(actual)) {
 		t.Error("matching contents were not stored")
 	}
 }
@@ -371,4 +372,19 @@ func TestWritesDoNotLeakDescriptors(t *testing.T) {
 	if after := openFDCount(t); after-before > 5 {
 		t.Errorf("open descriptors grew from %d to %d across 100 writes", before, after)
 	}
+}
+
+// countStoredFiles counts the regular files under root.
+func countStoredFiles(t *testing.T, root string) int {
+	t.Helper()
+	n := 0
+	if err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			n++
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walking %s: %v", root, err)
+	}
+	return n
 }
