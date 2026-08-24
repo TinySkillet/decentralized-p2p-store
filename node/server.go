@@ -277,6 +277,7 @@ func (s *FileServer) forget(name, digest, owner string, signature []byte) error 
 
 	fmt.Printf("[%s] Removed name '%s' from the database\n", s.Transport.Address(), name)
 
+	s.health.forget(hash)
 	s.publish(Event{Kind: EventFileDeleted, Name: name, Digest: hash})
 
 	if orphaned {
@@ -485,6 +486,10 @@ type FileServer struct {
 	// events fans node activity out to whoever is watching.
 	events *eventBus
 
+	// health caches replication measurements so they can be reported without
+	// touching the network.
+	health *healthCache
+
 	// transferLock guards the transfer maps below. They are written by the
 	// caller's goroutine (Get) and by the server loop, so they cannot be
 	// touched without it.
@@ -521,6 +526,7 @@ func NewFileServer(opts FileServerOpts) *FileServer {
 	return &FileServer{
 		FileServerOpts:       opts,
 		events:               newEventBus(),
+		health:               newHealthCache(),
 		store:                storage.NewStore(storeOpts),
 		quitch:               make(chan struct{}),
 		peers:                make(map[string]p2p.Peer),

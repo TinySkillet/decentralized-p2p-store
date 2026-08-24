@@ -188,6 +188,10 @@ func (s *FileServer) OnPeerDisconnect(p p2p.Peer) {
 
 	fmt.Printf("[%s] Disconnected from %s\n", s.Transport.Address(), storage.Short(nodeID))
 
+	// Corrected precisely rather than left to age out: a departed holder makes
+	// every file it held look better replicated than it is.
+	s.health.dropHolder(nodeID)
+
 	s.publish(Event{Kind: EventPeerDown, Node: nodeID, Peer: peerAddr})
 
 	if s.DB != nil {

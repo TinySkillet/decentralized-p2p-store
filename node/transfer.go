@@ -543,6 +543,14 @@ func (s *FileServer) Store(name string, r io.Reader) error {
 	fmt.Printf("[%s] Stored '%s' as %s (%d bytes), sent %d bytes to %d peer(s)\n",
 		s.Transport.Address(), name, storage.Short(digest), size, written, len(replicated))
 
+	// Storing is itself a measurement: the peers that accepted a copy are
+	// known holders, so record it rather than waiting for a repair cycle.
+	s.recordHealth(FileHealth{
+		Name: name, Digest: digest, Size: size,
+		Copies: 1 + len(replicated), Target: s.ReplicationFactor,
+		Holders: replicated,
+	})
+
 	s.publish(Event{
 		Kind: EventFileStored, Name: name, Digest: digest,
 		Size: size, Count: len(replicated),

@@ -297,6 +297,7 @@ func (s *FileServer) checkFile(f dbpkg.File, target int) (FileHealth, []string, 
 	peers, addrs := s.connectedPeers()
 	if len(addrs) == 0 {
 		health.Copies = 1
+		s.recordHealth(health)
 		return health, nil, nil
 	}
 
@@ -332,7 +333,24 @@ func (s *FileServer) checkFile(f dbpkg.File, target int) (FileHealth, []string, 
 		health.Copies++
 	}
 
+	// Every caller of checkFile pays for this measurement; keeping it is what
+	// makes ReplicationSnapshot free.
+	s.recordHealth(health)
+
 	return health, lacking, nil
+}
+
+// recordHealth caches a measurement just taken.
+func (s *FileServer) recordHealth(h FileHealth) {
+	if s.health == nil {
+		return
+	}
+	s.health.record(h.Digest, measurement{
+		copies:  h.Copies,
+		target:  h.Target,
+		holders: append([]string(nil), h.Holders...),
+		at:      time.Now(),
+	})
 }
 
 // collectOffers gathers every reply to a request, rather than stopping at the
