@@ -266,6 +266,7 @@ func (s *FileServer) repairFile(f dbpkg.File, target int) (int, error) {
 	ownerID := s.storageOwnerID()
 
 	placed := 0
+	placedOn := make([]string, 0, needed)
 	for _, nodeID := range lacking {
 		if placed >= needed {
 			break
@@ -280,6 +281,21 @@ func (s *FileServer) repairFile(f dbpkg.File, target int) (int, error) {
 			continue
 		}
 		placed++
+		placedOn = append(placedOn, nodeID)
+	}
+
+	// checkFile measured before any of this, so the cached count is now stale
+	// by exactly the copies just placed. Updated here rather than left for the
+	// next cycle, or a repair would appear to have done nothing.
+	//
+	// Optimistic, like the count recorded when a file is first stored: a peer
+	// that refuses still completes the transfer, and its refusal corrects this
+	// when it arrives.
+	if placed > 0 {
+		updated := health
+		updated.Copies += placed
+		updated.Holders = append(append([]string(nil), health.Holders...), placedOn...)
+		s.recordOptimisticHealth(updated)
 	}
 
 	if placed < needed {

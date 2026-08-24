@@ -563,3 +563,64 @@ func TestARefusedPushIsNotCountedAsACopy(t *testing.T) {
 		}
 	}
 }
+
+// Approving a peer must place the copies that approval just made possible.
+//
+// Otherwise approving appears to do nothing for up to RepairInterval — five
+// minutes by default — and the copy counts sit unchanged with nothing on screen
+// to explain why. That is indistinguishable from a fault.
+//
+// Fails against an approval that only records trust and waits for the cycle.
+func TestApprovingAPeerPlacesTheCopiesItMakesPossible(t *testing.T) {
+	// Repair disabled, so only the approval can place anything: a background
+	// cycle firing would make this pass either way.
+	sender := buildTestNode(t, freeAddr(t), nodeConfig{
+		trustMode:      dbpkg.TrustModeEnforcing,
+		repairInterval: -1,
+		sweepInterval:  -1,
+	})
+	receiver := buildTestNode(t, freeAddr(t), nodeConfig{
+		trustMode:      dbpkg.TrustModeEnforcing,
+		repairInterval: -1,
+		sweepInterval:  -1,
+	}, sender.addr)
+	waitForPeerCount(t, sender, 1)
+	waitForPeerCount(t, receiver, 1)
+
+	// The receiver approves first, so it will accept. The sender does not, so
+	// the file is stored with nowhere to go — exactly the state a person is in
+	// before they approve anyone.
+	if err := receiver.Trust(sender.NodeID(), "sender"); err != nil {
+		t.Fatalf("Trust: %v", err)
+	}
+
+	payload := []byte("stored before anyone was approved")
+	if err := sender.Store("early.txt", bytes.NewReader(payload)); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+
+	ctx := context.Background()
+	files, err := receiver.FileViews(ctx)
+	if err != nil {
+		t.Fatalf("FileViews: %v", err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("the receiver already has the file; the test proves nothing: %+v", files)
+	}
+
+	// Approving is the whole action under test.
+	if err := sender.Trust(receiver.NodeID(), "receiver"); err != nil {
+		t.Fatalf("Trust: %v", err)
+	}
+
+	waitFor(t, "the copy to be placed on approval", 20*time.Second, func() bool {
+		files, err := receiver.FileViews(ctx)
+		return err == nil && len(files) == 1
+	})
+
+	// And the sender's own count reflects it.
+	waitFor(t, "the sender to count the new copy", 20*time.Second, func() bool {
+		snaps, err := sender.ReplicationSnapshot(ctx)
+		return err == nil && len(snaps) == 1 && snaps[0].Copies == 2
+	})
+}

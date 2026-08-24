@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -245,6 +246,30 @@ func (s *FileServer) Trust(nodeID, label string) error {
 
 	fmt.Printf("[%s] Trusting %s\n", s.Transport.Address(), storage.Short(nodeID))
 	s.publish(Event{Kind: EventPeerTrusted, Node: nodeID})
+
+	// Approving a peer is exactly the moment under-replicated files become
+	// fixable, so the repair runs now rather than at the next cycle. Without
+	// this, approving a peer appears to do nothing at all for up to
+	// RepairInterval — five minutes by default — and the copy counts sit
+	// unchanged with nothing to explain why.
+	//
+	// In its own goroutine: this is called from a control request and a web
+	// handler, and repair talks to every peer.
+	if s.hasPeerWithNodeID(nodeID) {
+		go func() {
+			placed, err := s.RepairOnce()
+			if err != nil {
+				log.Printf("[%s] Repair after approving %s failed: %v",
+					s.Transport.Address(), storage.Short(nodeID), err)
+				return
+			}
+			if placed > 0 {
+				fmt.Printf("[%s] Placed %d copy(ies) after approving %s\n",
+					s.Transport.Address(), placed, storage.Short(nodeID))
+			}
+		}()
+	}
+
 	return nil
 }
 
