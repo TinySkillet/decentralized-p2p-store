@@ -45,8 +45,15 @@ fi
 echo "Step 2: Removing binary..."
 
 # Remove binary
+if [ -f /usr/local/bin/p2p ]; then
+    echo "  - Removing /usr/local/bin/p2p"
+    sudo rm /usr/local/bin/p2p
+fi
+
+# Earlier versions installed the binary under its package name. Removed too, so
+# upgrading and then uninstalling does not leave one behind.
 if [ -f /usr/local/bin/DecentralizedP2PStorage ]; then
-    echo "  - Removing /usr/local/bin/DecentralizedP2PStorage"
+    echo "  - Removing /usr/local/bin/DecentralizedP2PStorage (installed by an earlier version)"
     sudo rm /usr/local/bin/DecentralizedP2PStorage
 else
     echo "  - Binary not found (already removed)"
@@ -73,7 +80,7 @@ echo "=== Uninstallation Complete! ==="
 echo ""
 echo "The following were removed:"
 echo "  ✓ Systemd service"
-echo "  ✓ Binary (/usr/local/bin/DecentralizedP2PStorage)"
+echo "  ✓ Binary (/usr/local/bin/p2p)"
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "  ✓ Data directory (~/.p2p)"
 fi

@@ -19,6 +19,28 @@ db=~/.p2p/p2p.db
 # For production networks, specify 2-3 stable bootstrap nodes:
 bootstrap=
 
+# Replication target - how many copies of each file the network should hold,
+# counting this node's own. Files below it are repaired automatically.
+# Default: 3
+# replicas=3
+
+# Local web UI - address to serve it on. Empty means off, which is the default.
+#
+# Off by default deliberately: the UI can approve and revoke peers, so it grants
+# more than any other interface this node has. Keep it on loopback and reach it
+# over an SSH tunnel for a headless machine:
+#
+#   ssh -N -L 7654:127.0.0.1:7654 user@host
+#
+# http=127.0.0.1:7654
+
+# Allow binding the web UI somewhere other than loopback.
+#
+# A separate setting so exposing the UI is always a second, deliberate decision.
+# When set, callers must present the token written to http-token beside the
+# database. Prefer the SSH tunnel above.
+# http_exposed=false
+
 # ========================================
 # Example Configurations
 # ========================================

@@ -318,7 +318,7 @@ Install the service with:
 ./install.sh
 ```
 
-The installer builds the binary, copies `DecentralizedP2PStorage` to `/usr/local/bin`, creates `~/.p2p/config` if it does not exist, and installs `p2p-storage@.service`.
+The installer builds the binary, copies `p2p` to `/usr/local/bin`, creates `~/.p2p/config` if it does not exist, and installs `p2p-storage@.service`.
 
 Common commands:
 

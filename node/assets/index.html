@@ -16,6 +16,15 @@
 </header>
 
 <main>
+  <section class="panel">
+    <h2>This node</h2>
+    <p class="note">Another node needs this identity to approve you. Send it to them.</p>
+    <div class="identity">
+      <code id="node-id" class="full-id">…</code>
+      <button id="copy-id" type="button">Copy</button>
+    </div>
+    <p id="node-stats" class="note"></p>
+  </section>
   <section id="approval-section" class="panel accent" hidden>
     <h2>Waiting for approval <span id="pending-count" class="badge"></span></h2>
     <p class="note">These peers are on the network and visible, but may not send

@@ -146,6 +146,22 @@ button.danger:hover { border-color: var(--bad); color: var(--bad); }
 
 .empty { color: var(--muted); font-size: 12.5px; padding: 6px 0; }
 
+.identity { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+
+.full-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  word-break: break-all;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+}
+
+#node-stats { margin: 12px 0 0; }
+
+.why { color: var(--warn); font-size: 12.5px; }
+
 .toast {
   position: fixed;
   left: 50%;

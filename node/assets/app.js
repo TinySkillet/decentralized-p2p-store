@@ -128,7 +128,24 @@ function pips(copies, target, untrusted) {
   return wrap;
 }
 
-function fileItem(file, trustedIDs) {
+// whyShort explains a file below its replication target, which otherwise looks
+// like a fault. There are two quite different reasons and the numbers alone
+// cannot tell them apart: either there is somewhere for a copy to go and it has
+// not happened yet, or there is nowhere for it to go at all.
+function whyShort(file, candidates) {
+  if (file.Copies >= file.Target) {
+    if ((file.UntrustedHolders || []).length > 0) {
+      return "meets its target only by counting peers you no longer approve";
+    }
+    return "";
+  }
+  if (candidates > 0) {
+    return "waiting to be copied to " + candidates + " approved peer" + (candidates === 1 ? "" : "s");
+  }
+  return "no approved peer available to hold another copy — approve more peers, or lower the target";
+}
+
+function fileItem(file, trustedIDs, candidates) {
   const li = el("li");
   li.appendChild(el("span", "id", file.Name));
 
@@ -144,6 +161,9 @@ function fileItem(file, trustedIDs) {
   li.appendChild(el("span", "meta", state));
 
   li.appendChild(el("span", "meta", file.Size + " bytes"));
+
+  const why = whyShort(file, candidates);
+  if (why) li.appendChild(el("span", "why", why));
 
   const holders = el("span", "holders");
   (file.Holders || []).forEach((id) => {
@@ -211,8 +231,15 @@ function render(state) {
 
   const n = state.node;
   document.getElementById("node-summary").textContent =
-    short(n.NodeID) + " · " + n.Address + " · " + n.Peers + " connected · " +
-    n.Files + " files · trust " + state.mode;
+    n.Address + " · " + n.Peers + " connected · trust " + state.mode;
+
+  // The full identity, not the abbreviation: this is the string another
+  // operator has to type to approve this node, and it is the only place to
+  // read it from.
+  document.getElementById("node-id").textContent = n.NodeID;
+  document.getElementById("node-stats").textContent =
+    n.Files + " file" + (n.Files === 1 ? "" : "s") + " · " + n.Bytes +
+    " bytes · wants " + n.ReplicationFactor + " copies of each";
 
   const peers = state.peers || [];
   const online = peers.filter((p) => p.Online);
@@ -247,7 +274,13 @@ function render(state) {
   const files = document.getElementById("files");
   files.replaceChildren();
   if ((state.files || []).length === 0) files.appendChild(emptyItem("No files stored here."));
-  (state.files || []).forEach((f) => files.appendChild(fileItem(f, trustedIDs)));
+  (state.files || []).forEach((f) => {
+    // Peers that could take a copy: approved, connected, and not already
+    // holding it. This node's own copy is counted separately.
+    const holders = new Set(f.Holders || []);
+    const candidates = approved.filter((p) => !holders.has(p.NodeID)).length;
+    files.appendChild(fileItem(f, trustedIDs, candidates));
+  });
 }
 
 function renderActivity() {
@@ -305,6 +338,17 @@ function listen() {
     // EventSource reconnects on its own; nothing to do but stop reporting it.
   });
 }
+
+document.getElementById("copy-id").addEventListener("click", async () => {
+  const id = document.getElementById("node-id").textContent;
+  try {
+    await navigator.clipboard.writeText(id);
+    toast("Identity copied.");
+  } catch (err) {
+    // Clipboard access can be refused; selecting the text still works.
+    toast("Could not copy automatically — select the identity and copy it.");
+  }
+});
 
 document.getElementById("upload-input").addEventListener("change", async (change) => {
   const status = document.getElementById("upload-status");
