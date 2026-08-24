@@ -90,6 +90,7 @@ func (s *FileServer) repairLoop() {
 			log.Printf("[%s] Repair cycle failed: %v", s.Transport.Address(), err)
 		} else if repaired > 0 {
 			fmt.Printf("[%s] Repair: offered %d missing replica(s)\n", s.Transport.Address(), repaired)
+			s.publish(Event{Kind: EventRepaired, Count: repaired})
 		}
 
 	}
@@ -108,6 +109,7 @@ func (s *FileServer) sweepLoop() {
 			log.Printf("[%s] Sweep failed: %v", s.Transport.Address(), err)
 		} else if reclaimed > 0 {
 			fmt.Printf("[%s] Sweep: reclaimed %d unreferenced file(s)\n", s.Transport.Address(), reclaimed)
+			s.publish(Event{Kind: EventReclaimed, Count: reclaimed})
 		}
 	}
 }

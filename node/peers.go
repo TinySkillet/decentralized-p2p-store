@@ -126,6 +126,10 @@ func (s *FileServer) OnPeer(p p2p.Peer) error {
 		}
 	}
 
+	// Published after the lock is released and after the peer is registered,
+	// so a subscriber reacting to this can already see it in the peer set.
+	s.publish(Event{Kind: EventPeerUp, Node: nodeID, Peer: peerAddr})
+
 	go s.announceTo(nodeID)
 
 	return nil
@@ -162,8 +166,14 @@ func (s *FileServer) admit(peerAddr, nodeID string) error {
 		return nil
 	}
 
-	return fmt.Errorf("refusing peer %s: host %s already has %d identities, limit is %d",
+	err = fmt.Errorf("refusing peer %s: host %s already has %d identities, limit is %d",
 		nodeID, host, known, s.MaxPeersPerHost)
+
+	// Surfaced as an event so a peer bouncing off the limit is visible rather
+	// than buried in the log.
+	s.publish(Event{Kind: EventPeerRefused, Node: nodeID, Peer: peerAddr, Count: known, Err: err.Error()})
+
+	return err
 }
 
 // OnPeerDisconnect drops a peer whose connection has ended. Without it the
@@ -177,6 +187,8 @@ func (s *FileServer) OnPeerDisconnect(p p2p.Peer) {
 	s.peersLock.Unlock()
 
 	fmt.Printf("[%s] Disconnected from %s\n", s.Transport.Address(), storage.Short(nodeID))
+
+	s.publish(Event{Kind: EventPeerDown, Node: nodeID, Peer: peerAddr})
 
 	if s.DB != nil {
 		now := time.Now()

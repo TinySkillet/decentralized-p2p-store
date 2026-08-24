@@ -140,6 +140,15 @@ func (s *FileServer) handleStream(from string) (err error) {
 		}
 	}
 
+	// A transfer we asked for and one pushed at us are different events: the
+	// second is the one the trust rules care about, and the UI reports them
+	// differently.
+	kind := EventFileReceived
+	if msg.RequestID != "" {
+		kind = EventFileFetched
+	}
+	s.publish(Event{Kind: kind, Name: msg.Name, Digest: msg.Digest, Size: size, Node: from})
+
 	s.completeRequest(msg.RequestID)
 
 	return nil
@@ -533,6 +542,11 @@ func (s *FileServer) Store(name string, r io.Reader) error {
 
 	fmt.Printf("[%s] Stored '%s' as %s (%d bytes), sent %d bytes to %d peer(s)\n",
 		s.Transport.Address(), name, storage.Short(digest), size, written, len(replicated))
+
+	s.publish(Event{
+		Kind: EventFileStored, Name: name, Digest: digest,
+		Size: size, Count: len(replicated),
+	})
 
 	return nil
 }
