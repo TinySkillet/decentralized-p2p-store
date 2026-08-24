@@ -125,6 +125,14 @@ func newServer(listenAddr string, identity, owner Identity, db *dbpkg.DB, storag
 	tcpTransport.OnPeer = s.OnPeer
 	tcpTransport.OnPeerDisconnect = s.OnPeerDisconnect
 
+	// Loaded here rather than in Serve. Enforcement must be in place before
+	// the first peer can connect, and a one-shot command node never calls
+	// Serve at all — it would otherwise trust nobody, including the peers its
+	// own database has approved.
+	if err := s.loadTrust(); err != nil {
+		return nil, err
+	}
+
 	return s, nil
 }
 

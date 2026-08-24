@@ -99,6 +99,12 @@ const (
 
 	// opWatch streams events until the caller disconnects.
 	opWatch = "watch"
+
+	// Trust administration.
+	opTrust   = "trust"
+	opUntrust = "untrust"
+	opTrusted = "trusted"
+	opMode    = "mode"
 )
 
 // defaultWatchHeartbeat is how often a watch with nothing to report sends an
@@ -127,6 +133,10 @@ type controlRequest struct {
 
 	// Replicas overrides the node's replication target for this request.
 	Replicas int
+
+	// Value carries a free-form argument: a peer label when trusting, or the
+	// mode when setting one. Empty when reading.
+	Value string
 }
 
 // controlResponse answers a controlRequest.
@@ -150,6 +160,13 @@ type controlResponse struct {
 	// Streaming marks a response followed by a stream of gob-encoded events
 	// rather than a byte payload of known length.
 	Streaming bool
+
+	Trusted []TrustedPeerView
+	Mode    string
+
+	// Changed reports whether an operation altered anything, so "untrusted"
+	// and "was not trusted anyway" can be told apart.
+	Changed bool
 }
 
 // ListenControl starts accepting commands on the socket beside the database.
@@ -338,6 +355,35 @@ func (s *FileServer) runControl(req controlRequest, body io.Reader) (controlResp
 
 	case opWatch:
 		return controlResponse{Streaming: true}, s.watchPayload()
+
+	case opTrust:
+		if err := s.Trust(req.Name, req.Value); err != nil {
+			return controlResponse{Error: err.Error()}, nil
+		}
+		return controlResponse{Changed: true}, nil
+
+	case opUntrust:
+		had, err := s.Untrust(req.Name)
+		if err != nil {
+			return controlResponse{Error: err.Error()}, nil
+		}
+		return controlResponse{Changed: had}, nil
+
+	case opTrusted:
+		trusted, err := s.TrustedPeers(context.Background())
+		if err != nil {
+			return controlResponse{Error: err.Error()}, nil
+		}
+		return controlResponse{Trusted: trusted, Mode: s.TrustMode()}, nil
+
+	case opMode:
+		if req.Value == "" {
+			return controlResponse{Mode: s.TrustMode()}, nil
+		}
+		if err := s.SetTrustMode(req.Value); err != nil {
+			return controlResponse{Error: err.Error()}, nil
+		}
+		return controlResponse{Mode: s.TrustMode(), Changed: true}, nil
 
 	default:
 		return controlResponse{Error: fmt.Sprintf("unknown operation %q", req.Op)}, nil
@@ -648,6 +694,51 @@ func (c *Client) Watch() (<-chan Event, func(), error) {
 		})
 	}
 	return out, stop, nil
+}
+
+// Trust approves a peer on the running node.
+func (c *Client) Trust(nodeID, label string) error {
+	_, call, err := c.do(controlRequest{Op: opTrust, Name: nodeID, Value: label}, nil)
+	if call != nil {
+		call.Close()
+	}
+	return err
+}
+
+// Untrust withdraws approval, reporting whether the peer had it.
+func (c *Client) Untrust(nodeID string) (bool, error) {
+	resp, call, err := c.do(controlRequest{Op: opUntrust, Name: nodeID}, nil)
+	if call != nil {
+		call.Close()
+	}
+	if err != nil {
+		return false, err
+	}
+	return resp.Changed, nil
+}
+
+// Trusted lists the approved peers and reports the current trust mode.
+func (c *Client) Trusted() ([]TrustedPeerView, string, error) {
+	resp, call, err := c.do(controlRequest{Op: opTrusted}, nil)
+	if call != nil {
+		call.Close()
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	return resp.Trusted, resp.Mode, nil
+}
+
+// Mode reads the trust mode, or sets it when mode is not empty.
+func (c *Client) Mode(mode string) (string, error) {
+	resp, call, err := c.do(controlRequest{Op: opMode, Value: mode}, nil)
+	if call != nil {
+		call.Close()
+	}
+	if err != nil {
+		return "", err
+	}
+	return resp.Mode, nil
 }
 
 // get writes the fetched file to w.

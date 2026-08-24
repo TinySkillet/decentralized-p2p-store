@@ -53,6 +53,12 @@ type nodeConfig struct {
 	repairInterval    time.Duration
 	sweepInterval     time.Duration
 	watchHeartbeat    time.Duration
+
+	// trustMode defaults to open, so the great majority of tests — written
+	// before trust existed and about something else entirely — keep exercising
+	// replication rather than silently testing refusal. A test about trust
+	// sets enforcing explicitly.
+	trustMode string
 }
 
 // portOf returns the port half of a host:port pair.
@@ -88,6 +94,14 @@ func buildTestNodeWithDB(t *testing.T, dbPath, addr string, cfg nodeConfig, boot
 	}
 	if err := d.Migrate(context.Background()); err != nil {
 		t.Fatalf("Migrate: %v", err)
+	}
+
+	mode := cfg.trustMode
+	if mode == "" {
+		mode = dbpkg.TrustModeOpen
+	}
+	if err := d.PutSetting(context.Background(), dbpkg.TrustModeSetting, mode); err != nil {
+		t.Fatalf("setting the trust mode: %v", err)
 	}
 
 	s, err := NewServer(addr, d, bootstrap...)

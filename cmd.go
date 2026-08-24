@@ -517,6 +517,176 @@ func setupCommands() *cobra.Command {
 	}
 	root.AddCommand(watchCmd)
 
+	nodeCmd := &cobra.Command{
+		Use:   "node",
+		Short: "Report this node's identity and state",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var view node.NodeView
+			err := onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+				var err error
+				if t.running != nil {
+					view, err = t.running.Node()
+				} else {
+					view, err = t.local.NodeView(context.Background())
+				}
+				return err
+			})
+			if err != nil {
+				return err
+			}
+
+			// The full identity, not the abbreviation every table shows: this
+			// is the value another operator has to type to approve this node,
+			// and there is nowhere else to read it from.
+			fmt.Printf("Identity:    %s\n", view.NodeID)
+			if view.OwnerID != view.NodeID {
+				fmt.Printf("Owner:       %s\n", view.OwnerID)
+			}
+			fmt.Printf("Listening:   %s\n", view.Address)
+			fmt.Printf("Peers:       %d connected\n", view.Peers)
+			fmt.Printf("Files:       %d (%d bytes)\n", view.Files, view.Bytes)
+			fmt.Printf("Replicas:    %d wanted per file\n", view.ReplicationFactor)
+			return nil
+		},
+	}
+	nodeCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
+	nodeCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
+	root.AddCommand(nodeCmd)
+
+	trustCmd := &cobra.Command{Use: "trust", Short: "Approve peers, and see who is approved"}
+
+	trustAddCmd := &cobra.Command{
+		Use:   "add <node-id> [label]",
+		Short: "Approve a peer to push files and request deletions",
+		Long: "Approve a peer to push files and request deletions here.\n\n" +
+			"The identity may be abbreviated to any prefix that matches exactly one\n" +
+			"peer this node knows about. A peer that has never connected has to be\n" +
+			"named by its full 64-character identity, which 'p2p node' prints.",
+		Args: cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			label := ""
+			if len(args) > 1 {
+				label = args[1]
+			}
+			return onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+				if t.running != nil {
+					return t.running.Trust(args[0], label)
+				}
+				return t.local.Trust(args[0], label)
+			})
+		},
+	}
+
+	trustRemoveCmd := &cobra.Command{
+		Use:   "remove <node-id>",
+		Short: "Withdraw approval from a peer",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var had bool
+			err := onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+				var err error
+				if t.running != nil {
+					had, err = t.running.Untrust(args[0])
+				} else {
+					had, err = t.local.Untrust(args[0])
+				}
+				return err
+			})
+			if err != nil {
+				return err
+			}
+			if !had {
+				fmt.Printf("%s was not approved anyway.\n", storage.Short(args[0]))
+			}
+			return nil
+		},
+	}
+
+	trustListCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List approved peers",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var trusted []node.TrustedPeerView
+			var mode string
+			err := onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+				var err error
+				if t.running != nil {
+					trusted, mode, err = t.running.Trusted()
+					return err
+				}
+				trusted, err = t.local.TrustedPeers(context.Background())
+				mode = t.local.TrustMode()
+				return err
+			})
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("Trust mode: %s\n", mode)
+			if mode != dbpkg.TrustModeEnforcing {
+				fmt.Println("Approval is recorded but not enforced. Use 'p2p trust mode enforcing' to enforce it.")
+			}
+			fmt.Println()
+
+			if len(trusted) == 0 {
+				fmt.Println("No approved peers.")
+				return nil
+			}
+			fmt.Printf("%-14s\t%-9s\t%-20s\t%s\n", "PEER", "STATE", "LABEL", "APPROVED")
+			fmt.Println(strings.Repeat("-", 72))
+			for _, p := range trusted {
+				state := "offline"
+				if p.Online {
+					state = "online"
+				}
+				fmt.Printf("%-14s\t%-9s\t%-20s\t%s\n",
+					storage.Short(p.NodeID), state, p.Label,
+					p.TrustedAt.Format("2006-01-02 15:04:05"))
+			}
+			return nil
+		},
+	}
+
+	trustModeCmd := &cobra.Command{
+		Use:   "mode [open|enforcing]",
+		Short: "Show or set whether trust is enforced",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			wanted := ""
+			if len(args) > 0 {
+				wanted = args[0]
+			}
+
+			var mode string
+			err := onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+				if t.running != nil {
+					var err error
+					mode, err = t.running.Mode(wanted)
+					return err
+				}
+				if wanted != "" {
+					if err := t.local.SetTrustMode(wanted); err != nil {
+						return err
+					}
+				}
+				mode = t.local.TrustMode()
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Trust mode: %s\n", mode)
+			return nil
+		},
+	}
+
+	for _, c := range []*cobra.Command{trustAddCmd, trustRemoveCmd, trustListCmd, trustModeCmd} {
+		c.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
+		c.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
+		trustCmd.AddCommand(c)
+	}
+	root.AddCommand(trustCmd)
+
 	cleanupCmd := &cobra.Command{
 		Use:   "cleanup",
 		Short: "Remove stale peer records from database",

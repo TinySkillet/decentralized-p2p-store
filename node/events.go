@@ -7,15 +7,26 @@ import (
 
 // Event kinds.
 const (
-	EventPeerUp       = "peer.up"
-	EventPeerDown     = "peer.down"
-	EventPeerRefused  = "peer.refused"
-	EventFileStored   = "file.stored"
-	EventFileFetched  = "file.fetched"
-	EventFileReceived = "file.received"
-	EventFileDeleted  = "file.deleted"
-	EventRepaired     = "repair.offered"
-	EventReclaimed    = "sweep.reclaimed"
+	EventPeerUp      = "peer.up"
+	EventPeerDown    = "peer.down"
+	EventPeerRefused = "peer.refused"
+
+	EventPeerTrusted   = "peer.trusted"
+	EventPeerUntrusted = "peer.untrusted"
+
+	// EventPushRefused reports an unsolicited file turned away because the
+	// sender is not trusted.
+	EventPushRefused = "push.refused"
+
+	// EventDeleteRefused reports a deletion request turned away for the same
+	// reason.
+	EventDeleteRefused = "delete.refused"
+	EventFileStored    = "file.stored"
+	EventFileFetched   = "file.fetched"
+	EventFileReceived  = "file.received"
+	EventFileDeleted   = "file.deleted"
+	EventRepaired      = "repair.offered"
+	EventReclaimed     = "sweep.reclaimed"
 )
 
 // Event is one thing that happened on this node.

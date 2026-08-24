@@ -175,7 +175,11 @@ func (s *FileServer) isStorageOwner(nodeID, ownerID string) bool {
 func (s *FileServer) handleMessageDeleteFile(from string, msg MessageDeleteFile) error {
 	fmt.Printf("[%s] Received delete request for '%s' from %s\n", s.Transport.Address(), msg.Name, from)
 
-	if err := s.authorizeDelete(msg); err != nil {
+	if err := s.authorizeDelete(from, msg); err != nil {
+		s.publish(Event{
+			Kind: EventDeleteRefused, Name: msg.Name, Digest: msg.Digest,
+			Node: from, Err: err.Error(),
+		})
 		return fmt.Errorf("[%s] Refusing to delete '%s' for %s: %w", s.Transport.Address(), msg.Name, from, err)
 	}
 
@@ -192,9 +196,17 @@ func (s *FileServer) handleMessageDeleteFile(from string, msg MessageDeleteFile)
 // removal. Files stored before ownership was recorded have no owner, and are
 // accepted unsigned so that upgrading a network does not strand data nobody
 // can delete.
-func (s *FileServer) authorizeDelete(msg MessageDeleteFile) error {
+func (s *FileServer) authorizeDelete(from string, msg MessageDeleteFile) error {
 	if s.DB == nil {
 		return nil
+	}
+
+	// Deleting is destructive and cannot be undone by the peer that asked, so
+	// it is refused outright from a peer this node has not approved. Checked
+	// before the file is even looked up: whether the file exists here is not
+	// something an untrusted peer should be able to probe.
+	if s.TrustEnforced() && !s.Trusts(from) {
+		return fmt.Errorf("peer %s is not trusted", storage.Short(from))
 	}
 
 	f, err := s.DB.FindFileByName(context.Background(), msg.Name)
@@ -211,7 +223,15 @@ func (s *FileServer) authorizeDelete(msg MessageDeleteFile) error {
 	}
 
 	if f.Owner == "" {
-		// Stored before ownership was recorded.
+		// Stored before ownership was recorded, so there is no signature to
+		// check. Accepted unsigned so that upgrading a network does not
+		// strand data nobody can delete — but only from a trusted peer, which
+		// the check above has already established when enforcement is on.
+		//
+		// With enforcement off this is as permissive as it always was: any
+		// handshaked peer may delete an unowned file. That is the behaviour
+		// being preserved for an existing network, and the reason a fresh
+		// database starts enforcing instead.
 		return nil
 	}
 	if msg.Owner != f.Owner {
@@ -495,6 +515,10 @@ type FileServer struct {
 	// touching the network.
 	health *healthCache
 
+	// trust is the in-memory view of which peers are approved, read on every
+	// enforced operation.
+	trust *trustSet
+
 	// transferLock guards the transfer maps below. They are written by the
 	// caller's goroutine (Get) and by the server loop, so they cannot be
 	// touched without it.
@@ -532,6 +556,7 @@ func NewFileServer(opts FileServerOpts) *FileServer {
 		FileServerOpts:       opts,
 		events:               newEventBus(),
 		health:               newHealthCache(),
+		trust:                newTrustSet(),
 		store:                storage.NewStore(storeOpts),
 		quitch:               make(chan struct{}),
 		peers:                make(map[string]p2p.Peer),

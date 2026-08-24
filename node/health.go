@@ -33,10 +33,11 @@ import (
 // they all share its copies: measuring per name would ask the same question
 // several times and could hold contradictory answers.
 type measurement struct {
-	copies  int
-	target  int
-	holders []string
-	at      time.Time
+	copies    int
+	target    int
+	holders   []string
+	untrusted []string
+	at        time.Time
 }
 
 // healthCache remembers the most recent measurement for each blob.
@@ -99,6 +100,17 @@ func (c *healthCache) dropHolder(nodeID string) {
 			m.copies = 0
 		}
 		m.holders = kept
+
+		// The departed peer must leave the untrusted list too, or a file
+		// would keep reporting a fragility that no longer applies.
+		stillUntrusted := m.untrusted[:0:0]
+		for _, h := range m.untrusted {
+			if h != nodeID {
+				stillUntrusted = append(stillUntrusted, h)
+			}
+		}
+		m.untrusted = stillUntrusted
+
 		c.entries[digest] = m
 	}
 }
@@ -164,6 +176,7 @@ func (s *FileServer) ReplicationSnapshot(ctx context.Context) ([]ReplicaSnapshot
 		if m, ok := s.health.lookup(f.Hash); ok {
 			snap.Copies = m.copies
 			snap.Holders = m.holders
+			snap.UntrustedHolders = m.untrusted
 			snap.MeasuredAt = m.at
 			if m.target > 0 {
 				snap.Target = m.target

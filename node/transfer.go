@@ -84,6 +84,29 @@ func (s *FileServer) handleStream(from string) (err error) {
 
 	body := io.LimitReader(peer, msg.Size)
 
+	// An unsolicited push from a peer this node has not approved is refused.
+	// A transfer with a request id is one this node asked for, and is allowed
+	// whoever answers: the request named a digest and the contents are
+	// verified against it, so an untrusted peer cannot substitute anything.
+	// What it must not do is put a file here that was never asked for.
+	if msg.RequestID == "" && s.TrustEnforced() && !s.Trusts(from) {
+		// The body is already in flight, so it has to be read off the
+		// connection even though it is discarded. Skipping this, or skipping
+		// the deferred CloseStream, wedges the connection permanently.
+		if _, cerr := io.Copy(io.Discard, body); cerr != nil {
+			return cerr
+		}
+		fmt.Printf("[%s] Refused a push of '%s' (%s) from untrusted peer %s\n",
+			s.Transport.Address(), msg.Name, storage.Short(msg.Digest), storage.Short(from))
+
+		s.publish(Event{
+			Kind: EventPushRefused, Name: msg.Name, Digest: msg.Digest,
+			Size: msg.Size, Node: from,
+			Err: "the sending peer is not trusted",
+		})
+		return nil
+	}
+
 	// A peer that missed a deletion still holds the file and its repair cycle
 	// will offer it back. The tombstone is what stops the deletion being
 	// undone; the sender is told so it stops holding the file too.
@@ -567,7 +590,9 @@ func (s *FileServer) Store(name string, r io.Reader) error {
 // once to keep the transfer indivisible, and one slow peer would stall
 // delivery to all the others.
 func (s *FileServer) replicate(digest string, msg *Message) ([]string, int64) {
-	peers, addrs := s.connectedPeers()
+	// Trusted rather than merely connected: sending a copy hands the contents
+	// over, so it goes only to peers the operator approved.
+	peers, addrs := s.trustedPeers()
 
 	type result struct {
 		addr    string

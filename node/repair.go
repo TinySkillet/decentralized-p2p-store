@@ -63,10 +63,31 @@ type FileHealth struct {
 
 	// Holders are the node ids of peers that answered yes, excluding this node.
 	Holders []string
+
+	// UntrustedHolders are those of Holders this node has not approved.
+	//
+	// They are counted in Copies, because they really do hold the file, but
+	// they are named separately: this node will not send them a replacement
+	// copy, so a file kept alive only by peers that are no longer trusted is
+	// healthy today and fragile tomorrow. Reporting one number would hide
+	// that entirely.
+	UntrustedHolders []string
 }
 
 // AtRisk reports whether the file has fewer copies than the target.
 func (h FileHealth) AtRisk() bool { return h.Copies < h.Target }
+
+// TrustedCopies counts the copies this node could still rely on: its own, plus
+// the holders it has approved.
+func (h FileHealth) TrustedCopies() int {
+	return h.Copies - len(h.UntrustedHolders)
+}
+
+// Fragile reports whether the file meets its target only by counting holders
+// this node no longer trusts.
+func (h FileHealth) Fragile() bool {
+	return !h.AtRisk() && h.TrustedCopies() < h.Target
+}
 
 // repairLoop periodically restores files that have fallen below the
 // replication target.
@@ -319,6 +340,9 @@ func (s *FileServer) checkFile(f dbpkg.File, target int) (FileHealth, []string, 
 		if reply.offer.Have && reply.offer.Digest == f.Hash {
 			health.Copies++
 			health.Holders = append(health.Holders, reply.from)
+			if s.TrustEnforced() && !s.Trusts(reply.from) {
+				health.UntrustedHolders = append(health.UntrustedHolders, reply.from)
+			}
 			if s.isStorageOwner(reply.from, ownerID) {
 				ownerAnswered = true
 			}
@@ -346,10 +370,11 @@ func (s *FileServer) recordHealth(h FileHealth) {
 		return
 	}
 	s.health.record(h.Digest, measurement{
-		copies:  h.Copies,
-		target:  h.Target,
-		holders: append([]string(nil), h.Holders...),
-		at:      time.Now(),
+		copies:    h.Copies,
+		target:    h.Target,
+		holders:   append([]string(nil), h.Holders...),
+		untrusted: append([]string(nil), h.UntrustedHolders...),
+		at:        time.Now(),
 	})
 }
 
