@@ -577,6 +577,77 @@ func (d *DB) ListKnownPeers(ctx context.Context) ([]Peer, error) {
 	return out, rows.Err()
 }
 
+// TrustModeSetting names the setting that decides whether trust is enforced.
+const TrustModeSetting = "trust_mode"
+
+const (
+	// TrustModeOpen records and reports trust without acting on it.
+	TrustModeOpen = "open"
+
+	// TrustModeEnforcing refuses pushes and deletions from untrusted peers.
+	TrustModeEnforcing = "enforcing"
+)
+
+// TrustedPeer is a peer that has been approved.
+type TrustedPeer struct {
+	NodeID string
+
+	// Label is an optional human name for the peer, since a node id is a
+	// 64-character hex key and nobody recognises one on sight.
+	Label     string
+	TrustedAt time.Time
+}
+
+// TrustPeer approves a peer, or updates the label of one already approved.
+func (d *DB) TrustPeer(ctx context.Context, nodeID, label string) error {
+	if nodeID == "" {
+		return fmt.Errorf("a peer cannot be trusted without an identity")
+	}
+	_, err := d.sql.ExecContext(ctx, `
+		INSERT INTO trusted_peers(node_id,label) VALUES(?,?)
+		ON CONFLICT(node_id) DO UPDATE SET label=excluded.label
+	`, nodeID, label)
+	return err
+}
+
+// UntrustPeer withdraws approval, and reports whether the peer had it.
+func (d *DB) UntrustPeer(ctx context.Context, nodeID string) (bool, error) {
+	result, err := d.sql.ExecContext(ctx, `DELETE FROM trusted_peers WHERE node_id=?`, nodeID)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
+// ListTrustedPeers returns every approved peer, most recently approved first.
+func (d *DB) ListTrustedPeers(ctx context.Context) ([]TrustedPeer, error) {
+	rows, err := d.sql.QueryContext(ctx, `
+		SELECT node_id, label, trusted_at FROM trusted_peers ORDER BY trusted_at DESC, node_id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []TrustedPeer
+	for rows.Next() {
+		var p TrustedPeer
+		var trustedAt string
+		if err := rows.Scan(&p.NodeID, &p.Label, &trustedAt); err != nil {
+			return nil, err
+		}
+		if parsed, err := parseTime(trustedAt); err == nil {
+			p.TrustedAt = parsed
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // CleanupStalePeers removes peer records not seen within maxAge.
 func (d *DB) CleanupStalePeers(ctx context.Context, maxAge time.Duration) (int, error) {
 	cutoff := formatTime(time.Now().Add(-maxAge))

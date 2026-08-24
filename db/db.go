@@ -71,6 +71,15 @@ func (d *DB) Migrate(ctx context.Context) error {
 			deleted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (name, digest)
 		);`,
+		// Trust is its own table rather than a column on peers, because
+		// CleanupStalePeers deletes rows by recency: trust recorded there
+		// would be silently revoked for any peer that went offline for an
+		// hour, which is the opposite of what approving a peer means.
+		`CREATE TABLE IF NOT EXISTS trusted_peers (
+			node_id TEXT PRIMARY KEY,
+			label TEXT NOT NULL DEFAULT '',
+			trusted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);`,
 		`CREATE TABLE IF NOT EXISTS settings (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
@@ -149,7 +158,60 @@ func (d *DB) Migrate(ctx context.Context) error {
 		return err
 	}
 
+	if err := seedTrustMode(ctx, tx); err != nil {
+		return err
+	}
+
 	return tx.Commit()
+}
+
+// seedTrustMode chooses the initial trust mode for a database that has none.
+//
+// A database with data in it predates trust, so it starts open: recording and
+// displaying trust without enforcing it means an upgrade changes no behaviour
+// and cannot cut a working network off from itself. A fresh database has no
+// history to preserve and starts enforcing.
+//
+// Existing peers are deliberately **not** auto-trusted. Trust that was never
+// granted is not trust, and seeding it would make the approval step a
+// formality on exactly the networks where it matters.
+func seedTrustMode(ctx context.Context, tx *sql.Tx) error {
+	var existing string
+	err := tx.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, TrustModeSetting).Scan(&existing)
+	if err == nil {
+		// Already chosen, by an earlier migration or by the user.
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	populated, err := hasStoredData(ctx, tx)
+	if err != nil {
+		return err
+	}
+
+	mode := TrustModeEnforcing
+	if populated {
+		mode = TrustModeOpen
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING
+	`, TrustModeSetting, mode)
+	return err
+}
+
+// hasStoredData reports whether this database has ever held a file or met a
+// peer, which is what distinguishes an upgrade from a first run.
+func hasStoredData(ctx context.Context, tx *sql.Tx) (bool, error) {
+	var n int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT (SELECT COUNT(*) FROM files) + (SELECT COUNT(*) FROM peers)
+	`).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // backfillPeerHosts fills in the host column for rows written before it
