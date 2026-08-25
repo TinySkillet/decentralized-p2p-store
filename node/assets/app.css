@@ -50,6 +50,8 @@ main {
 }
 
 .panel.accent { border-color: var(--accent); }
+.panel.warn { border-color: var(--warn); }
+.panel.warn h2 { color: var(--warn); }
 
 .note { margin: 0 0 12px; color: var(--muted); font-size: 12.5px; }
 

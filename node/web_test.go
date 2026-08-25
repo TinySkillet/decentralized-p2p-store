@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -516,5 +517,35 @@ func TestThePageCarriesTheToken(t *testing.T) {
 	}
 	if !strings.Contains(string(body), f.ui.token) {
 		t.Fatal("the page does not carry the token, so the script cannot authenticate")
+	}
+}
+
+// A syntax error in app.js breaks the whole interface and nothing else would
+// notice: CI runs gofmt and vet, which look only at Go. The script is embedded,
+// so it ships broken and the page renders blank.
+//
+// Skipped where node is unavailable rather than failing, since it is a
+// convenience check and not something the build should depend on.
+func TestTheScriptParses(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed; skipping the script syntax check")
+	}
+
+	script, err := assetFS.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatalf("reading app.js: %v", err)
+	}
+
+	// Written out rather than checked in place, so this tests the copy that is
+	// actually embedded in the binary.
+	path := filepath.Join(t.TempDir(), "app.js")
+	if err := os.WriteFile(path, script, 0o600); err != nil {
+		t.Fatalf("writing the script: %v", err)
+	}
+
+	out, err := exec.Command(node, "--check", path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("app.js does not parse:\n%s", out)
 	}
 }

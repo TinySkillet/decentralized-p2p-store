@@ -624,3 +624,68 @@ func TestApprovingAPeerPlacesTheCopiesItMakesPossible(t *testing.T) {
 		return err == nil && len(snaps) == 1 && snaps[0].Copies == 2
 	})
 }
+
+// Two operators approving each other do it one after the other, and the first
+// approval places nothing: at that moment the other side still refuses. The
+// second approval has to make the first one's copies happen, or the ordinary
+// first-run flow appears to do nothing for a full repair cycle.
+//
+// Fails against an approval that only acts locally.
+func TestMutualApprovalConvergesWithoutWaitingForACycle(t *testing.T) {
+	// Repair disabled, so only the approvals themselves can place anything.
+	holder := buildTestNode(t, freeAddr(t), nodeConfig{
+		trustMode:      dbpkg.TrustModeEnforcing,
+		repairInterval: -1,
+		sweepInterval:  -1,
+	})
+	other := buildTestNode(t, freeAddr(t), nodeConfig{
+		trustMode:      dbpkg.TrustModeEnforcing,
+		repairInterval: -1,
+		sweepInterval:  -1,
+	}, holder.addr)
+	waitForPeerCount(t, holder, 1)
+	waitForPeerCount(t, other, 1)
+
+	if err := holder.Store("shared.txt", bytes.NewReader([]byte("wants a second home"))); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Watched on the refusing side, because the approvals are milliseconds
+	// apart and the first one's repair runs in the background. Waiting for the
+	// refusal to actually happen is what puts the two approvals in the order
+	// this test is about; without it the first repair can land after the
+	// second approval and the test passes for the wrong reason.
+	refusals, cancel := other.Subscribe(8)
+	defer cancel()
+
+	if err := holder.Trust(other.NodeID(), "other"); err != nil {
+		t.Fatalf("Trust: %v", err)
+	}
+
+	waitForEvent(t, refusals, EventPushRefused)
+
+	files, err := other.FileViews(ctx)
+	if err != nil {
+		t.Fatalf("FileViews: %v", err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("the refusing node kept the file: %+v", files)
+	}
+
+	// The approval that matters: nothing happens on the holder unless being
+	// approved reaches it.
+	if err := other.Trust(holder.NodeID(), "holder"); err != nil {
+		t.Fatalf("Trust: %v", err)
+	}
+
+	waitFor(t, "the copy to arrive once both sides approve", 20*time.Second, func() bool {
+		files, err := other.FileViews(ctx)
+		return err == nil && len(files) == 1
+	})
+	waitFor(t, "the holder to count the copy", 20*time.Second, func() bool {
+		snaps, err := holder.ReplicationSnapshot(ctx)
+		return err == nil && len(snaps) == 1 && snaps[0].Copies == 2
+	})
+}

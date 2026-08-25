@@ -30,6 +30,34 @@ const (
 	discoverySettleTimeout = 5 * time.Second
 )
 
+// defaultDBPath is where a node keeps its database unless told otherwise.
+// Shown with the tilde because that is what a person recognises; expandHome
+// resolves it before use.
+const defaultDBPath = "~/.p2p/p2p.db"
+
+// expandHome resolves a leading ~ against the user's home directory.
+func expandHome(path string) (string, error) {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolving %q: %w", path, err)
+	}
+	if path == "~" {
+		return home, nil
+	}
+	return filepath.Join(home, path[2:]), nil
+}
+
+// withNetworkFlags adds the flags a command needs only when it has to start a
+// node of its own, which is to say when no node is already running.
+func withNetworkFlags(c *cobra.Command, listen *string, bootstrap *[]string) *cobra.Command {
+	c.Flags().StringVar(listen, "listen", ":3000", "listen address (only used when no node is running)")
+	c.Flags().StringSliceVar(bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
+	return c
+}
+
 // withBootstrap adds addr to the bootstrap list if it is not already there.
 func withBootstrap(bootstrap []string, addr string) []string {
 	for _, b := range bootstrap {
@@ -38,43 +66,6 @@ func withBootstrap(bootstrap []string, addr string) []string {
 		}
 	}
 	return append(bootstrap, addr)
-}
-
-// nodeTarget describes where a command should send its work: the node already
-// running against this database, or a temporary one it starts itself.
-type nodeTarget struct {
-	// running is set when a node owns this database and can be asked to act.
-	running *node.Client
-
-	// local is set instead, and is a node started for this command alone.
-	local *node.FileServer
-}
-
-// onNode runs work against whichever node should carry it out.
-//
-// A running node owns the database and its storage, so it does the work; a
-// command that started a second node against the same files is what produced
-// races, miscounted replica counts and files owned by a key that vanished.
-// Starting a temporary node is safe only when there is no running one, which is
-// exactly when this takes that path.
-func onNode(dbPath, listen string, bootstrap []string, replicas int, work func(nodeTarget) error) error {
-	if node, ok := node.DialControl(dbPath); ok {
-		return work(nodeTarget{running: node})
-	}
-
-	d, err := openDB(dbPath)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-
-	s, stop, err := startClientNode(listen, d, bootstrap, replicas)
-	if err != nil {
-		return err
-	}
-	defer stop()
-
-	return work(nodeTarget{local: s})
 }
 
 // describeEvent renders the fields an event actually carries, since which
@@ -105,64 +96,6 @@ func describeEvent(e node.Event) string {
 	return strings.Join(parts, "  ")
 }
 
-// openDB opens and migrates the node database.
-func openDB(path string) (*dbpkg.DB, error) {
-	d, err := dbpkg.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	if err := d.Migrate(context.Background()); err != nil {
-		d.Close()
-		return nil, err
-	}
-	return d, nil
-}
-
-// startClientNode brings up a short-lived node for a one-shot command and
-// returns it together with a shutdown function.
-//
-// Listen is synchronous, so a bind failure (a port already in use, most
-// often) is reported here rather than crashing a background goroutine.
-func startClientNode(listen string, d *dbpkg.DB, bootstrap []string, replicas int) (*node.FileServer, func(), error) {
-	keyBytes, err := node.LoadOrInitKey(d)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// A command run against a serving node's database can reach the network
-	// through that node without being told where it is.
-	if owner, ok, err := d.GetSetting(context.Background(), dbpkg.ServingAddressSetting); err == nil && ok && owner != "" {
-		bootstrap = withBootstrap(bootstrap, owner)
-	}
-
-	s, err := node.NewClient(listen, d, bootstrap...)
-	if err != nil {
-		return nil, nil, err
-	}
-	s.EncryptionKey = keyBytes
-	if replicas > 0 {
-		// Applied before Serve: the goroutines it starts read this.
-		s.ReplicationFactor = replicas
-	}
-
-	if err := s.Listen(); err != nil {
-		return nil, nil, fmt.Errorf("starting node on %s: %w", listen, err)
-	}
-	go s.Serve()
-
-	if len(bootstrap) > 0 {
-		if err := s.WaitForPeers(peerWaitTimeout); err != nil {
-			fmt.Printf("Warning: %v. Proceeding anyway.\n", err)
-		}
-		// Gossip keeps introducing peers after the first connection lands.
-		// Wait for the set to settle rather than for a fixed period.
-		n := s.WaitForPeerDiscovery(discoveryQuietPeriod, discoverySettleTimeout)
-		fmt.Printf("Connected to %d peer(s).\n", n)
-	}
-
-	return s, s.Stop, nil
-}
-
 func setupCommands() *cobra.Command {
 	var (
 		dbPath     string
@@ -183,7 +116,23 @@ func setupCommands() *cobra.Command {
 		// correctly, so printing the usage text buries the actual error.
 		SilenceUsage: true,
 	}
-	root.PersistentFlags().StringVar(&dbPath, "db", "p2p.db", "sqlite database path")
+	// One default path, not one per working directory. The old default was
+	// "p2p.db", resolved against wherever the command happened to be run, so
+	// the same command in two directories talked to two different databases
+	// and the second one was empty. This is the path config.example has always
+	// documented.
+	root.PersistentFlags().StringVar(&dbPath, "db", defaultDBPath, "sqlite database path")
+
+	// Resolved once, before any command runs, so every path below sees the
+	// same expanded value.
+	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		expanded, err := expandHome(dbPath)
+		if err != nil {
+			return err
+		}
+		dbPath = expanded
+		return nil
+	}
 
 	serveCmd := &cobra.Command{
 		Use:   "serve",
@@ -277,11 +226,11 @@ func setupCommands() *cobra.Command {
 	root.AddCommand(serveCmd)
 
 	storeCmd := &cobra.Command{
-		Use:   "store <key> <file>",
+		Use:   "store <name> <file>",
 		Short: "Store a file locally and broadcast to peers",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			key, path := args[0], args[1]
+			name, path := args[0], args[1]
 			f, err := os.Open(path)
 			if err != nil {
 				return err
@@ -289,27 +238,19 @@ func setupCommands() *cobra.Command {
 			defer f.Close()
 
 			return onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
-				if t.running != nil {
-					info, err := f.Stat()
-					if err != nil {
-						return err
-					}
-					return t.running.Store(key, info.Size(), f)
-				}
-				return t.local.Store(key, f)
+				return t.Store(name, f)
 			})
 		},
 	}
-	storeCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
-	storeCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
+	withNetworkFlags(storeCmd, &listen, &bootstrap)
 	root.AddCommand(storeCmd)
 
 	getCmd := &cobra.Command{
-		Use:   "get <key>",
+		Use:   "get <name>",
 		Short: "Fetch a file (local or from peers)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			key := args[0]
+			name := args[0]
 			out, _ := cmd.Flags().GetString("out")
 
 			writeOut := func(fn func(io.Writer) error) error {
@@ -325,90 +266,87 @@ func setupCommands() *cobra.Command {
 			}
 
 			return onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
-				if t.running != nil {
-					return writeOut(func(w io.Writer) error { return t.running.Get(key, w) })
-				}
-
-				_, r, err := t.local.Get(key)
-				if err != nil {
-					return err
-				}
-				if rc, ok := r.(io.Closer); ok {
-					defer rc.Close()
-				}
-				return writeOut(func(w io.Writer) error {
-					_, err := io.Copy(w, r)
-					return err
-				})
+				return writeOut(func(w io.Writer) error { return t.Get(name, w) })
 			})
 		},
 	}
-	getCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
-	getCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
+	withNetworkFlags(getCmd, &listen, &bootstrap)
 	getCmd.Flags().String("out", "", "output file path")
 	root.AddCommand(getCmd)
 
 	deleteCmd := &cobra.Command{
-		Use:   "delete <key>",
+		Use:   "delete <name>",
 		Short: "Delete a file locally and from all peers",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			key := args[0]
+			name := args[0]
 
 			return onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
-				if t.running != nil {
-					return t.running.Delete(key)
-				}
-				return t.local.Delete(key)
+				return t.Delete(name)
 			})
 		},
 	}
-	deleteCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
-	deleteCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
+	withNetworkFlags(deleteCmd, &listen, &bootstrap)
 	root.AddCommand(deleteCmd)
 
-	filesCmd := &cobra.Command{Use: "files", Short: "File operations"}
-	filesListCmd := &cobra.Command{
-		Use:   "list",
-		Short: "List known files",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			// Routed through the running node rather than opening the
-			// database directly: the node owns it, and its cached
-			// replication measurements come along for free.
-			var files []node.ReplicaSnapshot
-			err := onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
-				var err error
-				if t.running != nil {
-					files, err = t.running.Files()
-				} else {
-					files, err = t.local.ReplicationSnapshot(context.Background())
-				}
-				return err
-			})
-			if err != nil {
-				return err
-			}
-			if len(files) == 0 {
-				fmt.Println("No files found.")
-				return nil
-			}
-			fmt.Printf("%-24s\t%-10s\t%-12s\t%s\n", "FILE", "SIZE", "COPIES", "CHECKED")
-			fmt.Println(strings.Repeat("-", 72))
-			for _, f := range files {
-				copies := "not checked"
-				checked := "never"
-				if f.Measured() {
-					copies = fmt.Sprintf("%d of %d", f.Copies, f.Target)
-					checked = f.Age().Round(time.Second).String() + " ago"
-				}
-				fmt.Printf("%-24s\t%-10d\t%-12s\t%s\n", f.Name, f.Size, copies, checked)
-			}
+	// "files" lists on its own; "files list" still works, because that is what
+	// the README and the thesis document.
+	listFiles := func(cmd *cobra.Command, args []string) error {
+		// Routed through the running node rather than opening the
+		// database directly: the node owns it, and its cached
+		// replication measurements come along for free.
+		var files []node.ReplicaSnapshot
+		err := onNodeReading(dbPath, func(t nodeTarget) error {
+			var err error
+			files, err = t.Files()
+			return err
+		})
+		if err != nil {
+			return err
+		}
+		if len(files) == 0 {
+			fmt.Println("No files stored here.")
 			return nil
-		},
+		}
+
+		fmt.Printf("%-24s\t%-10s\t%-12s\t%s\n", "FILE", "SIZE", "COPIES", "CHECKED")
+		fmt.Println(strings.Repeat("-", 72))
+
+		stale := false
+		for _, f := range files {
+			copies := "not checked"
+			checked := "never"
+			if f.Measured() {
+				copies = fmt.Sprintf("%d of %d", f.Copies, f.Target)
+				checked = f.Age().Round(time.Second).String() + " ago"
+			} else {
+				stale = true
+			}
+			fmt.Printf("%-24s\t%-10d\t%-12s\t%s\n", f.Name, f.Size, copies, checked)
+		}
+
+		// Said plainly, because this table and the one 'p2p status' prints
+		// show the same columns with different numbers, and nothing else
+		// explains why: these counts are remembered, those are measured.
+		if stale {
+			fmt.Println("\nCounts are from the last check. 'p2p status' measures them now.")
+		} else {
+			fmt.Println("\nCounts are from the last check, not measured just now. Use 'p2p status' for that.")
+		}
+		return nil
 	}
-	filesListCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
-	filesListCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
-	filesCmd.AddCommand(filesListCmd)
+
+	filesCmd := &cobra.Command{
+		Use:   "files",
+		Short: "List stored files and their last known replication",
+		RunE:  listFiles,
+	}
+	filesCmd.AddCommand(&cobra.Command{
+		Use:    "list",
+		Short:  "List stored files",
+		RunE:   listFiles,
+		Hidden: true,
+	})
 	root.AddCommand(filesCmd)
 
 	sharesCmd := &cobra.Command{
@@ -416,13 +354,9 @@ func setupCommands() *cobra.Command {
 		Short: "List file shares (files stored in other peers)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var shares []node.ShareView
-			err := onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+			err := onNodeReading(dbPath, func(t nodeTarget) error {
 				var err error
-				if t.running != nil {
-					shares, err = t.running.Shares()
-				} else {
-					shares, err = t.local.ShareViews(context.Background())
-				}
+				shares, err = t.Shares()
 				return err
 			})
 			if err != nil {
@@ -445,8 +379,6 @@ func setupCommands() *cobra.Command {
 			return nil
 		},
 	}
-	sharesCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
-	sharesCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
 	root.AddCommand(sharesCmd)
 
 	peersCmd := &cobra.Command{
@@ -458,13 +390,9 @@ func setupCommands() *cobra.Command {
 			// node dies, and GetActivePeers hides the 4th and later identity
 			// on a host. Both are wrong for a list a person reads.
 			var peers []node.PeerView
-			err := onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+			err := onNodeReading(dbPath, func(t nodeTarget) error {
 				var err error
-				if t.running != nil {
-					peers, err = t.running.Peers()
-				} else {
-					peers, err = t.local.PeerViews(context.Background())
-				}
+				peers, err = t.Peers()
 				return err
 			})
 			if err != nil {
@@ -491,8 +419,6 @@ func setupCommands() *cobra.Command {
 			return nil
 		},
 	}
-	peersCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
-	peersCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
 	root.AddCommand(peersCmd)
 
 	watchCmd := &cobra.Command{
@@ -542,13 +468,9 @@ func setupCommands() *cobra.Command {
 		Short: "Report this node's identity and state",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var view node.NodeView
-			err := onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+			err := onNodeReading(dbPath, func(t nodeTarget) error {
 				var err error
-				if t.running != nil {
-					view, err = t.running.Node()
-				} else {
-					view, err = t.local.NodeView(context.Background())
-				}
+				view, err = t.Node()
 				return err
 			})
 			if err != nil {
@@ -569,8 +491,6 @@ func setupCommands() *cobra.Command {
 			return nil
 		},
 	}
-	nodeCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
-	nodeCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
 	root.AddCommand(nodeCmd)
 
 	trustCmd := &cobra.Command{Use: "trust", Short: "Approve peers, and see who is approved"}
@@ -588,11 +508,37 @@ func setupCommands() *cobra.Command {
 			if len(args) > 1 {
 				label = args[1]
 			}
-			return onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
-				if t.running != nil {
-					return t.running.Trust(args[0], label)
+			return onNodeReading(dbPath, func(t nodeTarget) error {
+				if err := t.Trust(args[0], label); err != nil {
+					return err
 				}
-				return t.local.Trust(args[0], label)
+
+				// Read back rather than echoing what was typed: the argument
+				// may have been an abbreviation, and confirming the full
+				// identity is how the operator knows it resolved to the peer
+				// they meant.
+				approved, mode, err := t.Trusted()
+				if err != nil {
+					return err
+				}
+				for _, p := range approved {
+					if !strings.HasPrefix(p.NodeID, args[0]) && p.NodeID != args[0] {
+						continue
+					}
+					state := "not connected"
+					if p.Online {
+						state = "connected"
+					}
+					fmt.Printf("Approved %s (%s).\n", storage.Short(p.NodeID), state)
+					if mode != dbpkg.TrustModeEnforcing {
+						fmt.Println("Approval is recorded but not enforced. See 'p2p trust mode'.")
+					} else if p.Online {
+						fmt.Println("Any copies this makes possible are being placed now.")
+					}
+					return nil
+				}
+				fmt.Printf("Approved %s.\n", args[0])
+				return nil
 			})
 		},
 	}
@@ -603,13 +549,9 @@ func setupCommands() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var had bool
-			err := onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+			err := onNodeReading(dbPath, func(t nodeTarget) error {
 				var err error
-				if t.running != nil {
-					had, err = t.running.Untrust(args[0])
-				} else {
-					had, err = t.local.Untrust(args[0])
-				}
+				had, err = t.Untrust(args[0])
 				return err
 			})
 			if err != nil {
@@ -628,14 +570,9 @@ func setupCommands() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var trusted []node.TrustedPeerView
 			var mode string
-			err := onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+			err := onNodeReading(dbPath, func(t nodeTarget) error {
 				var err error
-				if t.running != nil {
-					trusted, mode, err = t.running.Trusted()
-					return err
-				}
-				trusted, err = t.local.TrustedPeers(context.Background())
-				mode = t.local.TrustMode()
+				trusted, mode, err = t.Trusted()
 				return err
 			})
 			if err != nil {
@@ -678,19 +615,10 @@ func setupCommands() *cobra.Command {
 			}
 
 			var mode string
-			err := onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
-				if t.running != nil {
-					var err error
-					mode, err = t.running.Mode(wanted)
-					return err
-				}
-				if wanted != "" {
-					if err := t.local.SetTrustMode(wanted); err != nil {
-						return err
-					}
-				}
-				mode = t.local.TrustMode()
-				return nil
+			err := onNodeReading(dbPath, func(t nodeTarget) error {
+				var err error
+				mode, err = t.Mode(wanted)
+				return err
 			})
 			if err != nil {
 				return err
@@ -701,8 +629,6 @@ func setupCommands() *cobra.Command {
 	}
 
 	for _, c := range []*cobra.Command{trustAddCmd, trustRemoveCmd, trustListCmd, trustModeCmd} {
-		c.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
-		c.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
 		trustCmd.AddCommand(c)
 	}
 	root.AddCommand(trustCmd)
@@ -733,14 +659,39 @@ func setupCommands() *cobra.Command {
 		Short: "Report how well replicated the local files are",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var health []node.FileHealth
+			var approvedOnline, connected int
+			approvedIDs := map[string]bool{}
 			err := onNode(dbPath, listen, bootstrap, replicas, func(t nodeTarget) error {
 				var err error
-				if t.running != nil {
-					health, err = t.running.Status(replicas)
-				} else {
-					health, err = t.local.ReplicationStatus()
+				if health, err = t.Status(replicas); err != nil {
+					return err
 				}
-				return err
+
+				// Gathered so the advice below can tell "not copied yet" from
+				// "nowhere to copy to", which look identical in the table.
+				peers, err := t.Peers()
+				if err != nil {
+					return err
+				}
+				trusted, _, err := t.Trusted()
+				if err != nil {
+					return err
+				}
+				approved := make(map[string]bool, len(trusted))
+				for _, p := range trusted {
+					approved[p.NodeID] = true
+				}
+				for _, p := range peers {
+					if !p.Online {
+						continue
+					}
+					connected++
+					if approved[p.NodeID] {
+						approvedOnline++
+						approvedIDs[p.NodeID] = true
+					}
+				}
+				return nil
 			})
 			if err != nil {
 				return err
@@ -750,28 +701,59 @@ func setupCommands() *cobra.Command {
 				return nil
 			}
 
+			fmt.Println("Asked every connected peer just now.")
+			fmt.Println()
 			fmt.Printf("%-24s\t%-12s\t%-10s\t%s\n", "FILE", "COPIES", "SIZE", "STATE")
 			fmt.Println(strings.Repeat("-", 70))
 
 			atRisk := 0
+			placeable := 0
 			for _, h := range health {
 				state := "ok"
 				if h.AtRisk() {
 					state = "AT RISK"
 					atRisk++
+
+					// Somewhere for another copy to go means an approved peer
+					// that is connected and does not already hold this file.
+					holders := make(map[string]bool, len(h.Holders))
+					for _, id := range h.Holders {
+						holders[id] = true
+					}
+					for id := range approvedIDs {
+						if !holders[id] {
+							placeable++
+							break
+						}
+					}
 				}
 				fmt.Printf("%-24s\t%d of %-8d\t%-10d\t%s\n", h.Name, h.Copies, h.Target, h.Size, state)
 			}
 
 			if atRisk > 0 {
 				fmt.Printf("\n%d file(s) below the replication target of %d.\n", atRisk, replicas)
-				fmt.Println("Run 'p2p repair' to place the missing copies, or start more nodes.")
+
+				// Three quite different situations reach this line, and the
+				// table cannot tell them apart. Suggesting a repair that
+				// cannot place anything is how a working system looks broken.
+				switch {
+				case connected == 0:
+					fmt.Println("No peers are connected, so there is nowhere to put another copy.")
+					fmt.Println("Start another node, or check 'p2p peers'.")
+				case approvedOnline == 0:
+					fmt.Printf("%d peer(s) are connected but none is approved, so copies cannot be placed.\n", connected)
+					fmt.Println("Approve one with 'p2p trust add <peer>', or see 'p2p peers'.")
+				case placeable == 0:
+					fmt.Printf("Every approved peer already holds a copy, so %d is as many as this\n", approvedOnline+1)
+					fmt.Println("network can hold. Approve or start more nodes, or lower --replicas.")
+				default:
+					fmt.Println("Run 'p2p repair' to place the missing copies, or start more nodes.")
+				}
 			}
 			return nil
 		},
 	}
-	statusCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
-	statusCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
+	withNetworkFlags(statusCmd, &listen, &bootstrap)
 	statusCmd.Flags().IntVar(&replicas, "replicas", node.DefaultReplicationFactor, "replication target to measure against")
 	root.AddCommand(statusCmd)
 
@@ -782,11 +764,7 @@ func setupCommands() *cobra.Command {
 			var placed int
 			err := onNode(dbPath, listen, bootstrap, replicas, func(t nodeTarget) error {
 				var err error
-				if t.running != nil {
-					placed, err = t.running.Repair(replicas)
-				} else {
-					placed, err = t.local.RepairOnce()
-				}
+				placed, err = t.Repair(replicas)
 				return err
 			})
 			if err != nil {
@@ -802,8 +780,7 @@ func setupCommands() *cobra.Command {
 			return nil
 		},
 	}
-	repairCmd.Flags().StringVar(&listen, "listen", ":3000", "listen address (only used when no node is running)")
-	repairCmd.Flags().StringSliceVar(&bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
+	withNetworkFlags(repairCmd, &listen, &bootstrap)
 	repairCmd.Flags().IntVar(&replicas, "replicas", node.DefaultReplicationFactor, "replication target to restore")
 	root.AddCommand(repairCmd)
 

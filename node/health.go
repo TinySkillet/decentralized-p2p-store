@@ -19,7 +19,7 @@ import (
 // repair cycle already performs exactly that measurement on every file it
 // examines and then throws the result away. The cache is that result, kept.
 //
-// **Invalidation is by direct call, not by the event bus.** The bus drops
+// Invalidation is by direct call, not by the event bus. The bus drops
 // events for a subscriber that is not keeping up — that is what stops a
 // stalled browser tab stalling the node — so anything built on it may miss a
 // message. Missing a UI update is a cosmetic fault; missing an invalidation

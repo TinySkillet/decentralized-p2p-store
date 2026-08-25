@@ -241,6 +241,18 @@ function render(state) {
     n.Files + " file" + (n.Files === 1 ? "" : "s") + " · " + n.Bytes +
     " bytes · wants " + n.ReplicationFactor + " copies of each";
 
+  // Enforcement changes what approving a peer actually means, so the page has
+  // to say which mode it is in. Saying "they cannot send you files until you
+  // approve them" while the node accepts anything is worse than saying nothing.
+  const enforcing = state.mode === "enforcing";
+  document.getElementById("mode-banner").hidden = enforcing;
+  document.getElementById("approval-note").textContent = enforcing
+    ? "These peers are on the network and visible, but may not send you files " +
+      "or ask you to delete anything until you approve them."
+    : "Approval is not being enforced, so these peers can already send you files " +
+      "and ask you to delete them. Approving records your intent for when you " +
+      "start enforcing.";
+
   const peers = state.peers || [];
   const online = peers.filter((p) => p.Online);
   const pending = online.filter((p) => !trustedIDs.has(p.NodeID));
@@ -338,6 +350,16 @@ function listen() {
     // EventSource reconnects on its own; nothing to do but stop reporting it.
   });
 }
+
+document.getElementById("enforce-button").addEventListener("click", async () => {
+  try {
+    await post("/api/mode", { Mode: "enforcing" });
+    await refresh();
+    toast("Approval is now enforced.");
+  } catch (err) {
+    toast("Could not switch: " + err.message);
+  }
+});
 
 document.getElementById("copy-id").addEventListener("click", async () => {
   const id = document.getElementById("node-id").textContent;

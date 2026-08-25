@@ -60,6 +60,7 @@ func init() {
 	gob.Register(MessageFetchFile{})
 	gob.Register(MessageDeleteFile{})
 	gob.Register(MessageStoreRefused{})
+	gob.Register(MessageTrustGranted{})
 	gob.Register(MessagePeerExchange{})
 	gob.Register(PeerInfo{})
 	gob.Register(Handshake{})
@@ -145,6 +146,19 @@ type MessageStoreRefused struct {
 	// refusal itself is what matters.
 	Reason string
 }
+
+// MessageTrustGranted tells a peer this node has approved it.
+//
+// Two operators approving each other do so one after the other, and the first
+// approval places nothing: at that moment the other side still refuses. Without
+// this the copies wait for the next repair cycle, five minutes later, so the
+// ordinary first-run flow — two people approving each other — appears to do
+// nothing at all.
+//
+// It does tell the peer something about this node's trust state. That is
+// information it can establish anyway by pushing a file and seeing whether it
+// is kept, and it concerns only the peer being told.
+type MessageTrustGranted struct{}
 
 type MessagePeerExchange struct {
 	Peers []PeerInfo

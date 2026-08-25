@@ -247,7 +247,8 @@ The binary is invoked as:
 
 Common flags:
 
-- `--db <path>`: SQLite database path. Defaults to `p2p.db`.
+- `--db <path>`: SQLite database path. Defaults to `~/.p2p/p2p.db`, so the same
+  command means the same thing from any directory.
 - `--listen <addr>`: Local listen address for commands that start a temporary node, for example `:3000`.
 - `--bootstrap <host:port>`: One or more peer addresses to join an existing network.
 
@@ -255,14 +256,15 @@ Command formats:
 
 - `serve --listen <addr> [--db <path>] [--bootstrap <host:port>] [--config <path>]`
   Starts a node and keeps it running. Use this for long-lived peers.
-- `store <key> <file> [--db <path>]`
-  Stores a local file under a key and broadcasts it to peers.
-- `get <key> [--db <path>] [--out <file>]`
-  Fetches a file by key from the local node or the network. If `--out` is omitted, the file is written to stdout.
-- `delete <key> [--db <path>]`
-  Deletes a file by key locally and propagates the deletion to peers.
-- `files list [--db <path>]`
-  Lists files known to the local database.
+- `store <name> <file> [--db <path>]`
+  Stores a local file under a name and offers it to approved peers.
+- `get <name> [--db <path>] [--out <file>]`
+  Fetches a file by name from the local node or the network. If `--out` is omitted, the file is written to stdout.
+- `delete <name> [--db <path>]`
+  Deletes a file by name locally and propagates the deletion to peers.
+- `files [--db <path>]`
+  Lists stored files with their last known replication. The counts are
+  remembered from the last check; `status` measures them now.
 - `shares [--db <path>]`
   Lists file share records for files stored on other peers.
 - `peers [--db <path>]`
@@ -273,11 +275,68 @@ Command formats:
 - `repair [--db <path>] [--replicas <n>]`
   Places copies of under-replicated files immediately, rather than waiting for
   the next automatic cycle.
+- `node [--db <path>]`
+  Prints this node's full identity, which another operator needs in order to
+  approve it, along with its address and totals.
+- `trust add <peer> [label]` / `trust remove <peer>` / `trust list` / `trust mode [open|enforcing]`
+  Approves peers, withdraws approval, and shows or sets whether approval is
+  enforced. A peer may be named by any unambiguous prefix of its identity.
+- `watch [--db <path>]`
+  Follows what the running node is doing, as it happens.
 - `cleanup [--db <path>]`
   Removes stale peer records from the database.
 - `demo`
   Starts three nodes in temporary directories, stores a file on one, fetches it
   from another, then deletes it and confirms it is gone.
+
+## Approving peers
+
+Discovering a peer and trusting it are separate steps. Any node that completes
+the handshake becomes visible and may gossip, but until it is approved it may
+not push files to this node, ask it to delete anything, or receive a copy of
+anything this node holds. It may still serve a file this node asks for: the
+request names a digest and the transfer is verified against it, so refusing
+would gain nothing.
+
+```
+p2p node                     # print this node's identity, to send to the other operator
+p2p peers                    # who is here, and which are online right now
+p2p trust add 96b1b3b05c93   # approve, by any unambiguous prefix
+p2p trust list               # who is approved, and whether approval is enforced
+```
+
+Approving a connected peer places any copies that approval just made possible,
+rather than waiting for the next repair cycle.
+
+`p2p trust mode` shows whether approval is enforced, and sets it. A database
+created before approval existed starts in `open` mode — trust is recorded and
+displayed but not acted on — so that upgrading a working network changes no
+behaviour. A fresh database starts `enforcing`. Existing peers are never
+auto-trusted: trust that was never granted is not trust.
+
+## Web interface
+
+An optional local page showing who is around, what is replicated where, and an
+approval queue. Off by default, because it can approve and revoke peers and so
+grants more than any other interface the node has.
+
+```
+p2p serve --http 127.0.0.1:7654
+```
+
+or `http=127.0.0.1:7654` in the config file. For a headless machine, keep it on
+loopback and reach it over a tunnel:
+
+```
+ssh -N -L 7654:127.0.0.1:7654 user@host
+```
+
+The page requires a token that it reads from its own markup and sends as a
+header; there is no cookie, so another origin has no ambient authority to
+borrow. The `Host` header is checked on every request, which is what stops DNS
+rebinding. Binding anywhere other than loopback is refused unless explicitly
+allowed with `--http-exposed`, and is then protected by a token written to
+`http-token` beside the database.
 
 ## Local Testing
 
@@ -304,7 +363,7 @@ Use node `5000` for client operations:
 echo "Hello P2P World" > hello.txt
 
 ./bin/p2p store hello hello.txt --listen 127.0.0.1:6000 --db node_5000/p2p.db --bootstrap 127.0.0.1:4000
-./bin/p2p files list --db node_5000/p2p.db
+./bin/p2p files --db node_5000/p2p.db
 ./bin/p2p get hello --listen 127.0.0.1:6000 --db node_5000/p2p.db --bootstrap 127.0.0.1:4000 --out retrieved_hello.txt
 ./bin/p2p delete hello --listen 127.0.0.1:6000 --db node_5000/p2p.db --bootstrap 127.0.0.1:4000
 ./bin/p2p peers --db node_5000/p2p.db

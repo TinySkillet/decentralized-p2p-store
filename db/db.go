@@ -172,7 +172,7 @@ func (d *DB) Migrate(ctx context.Context) error {
 // and cannot cut a working network off from itself. A fresh database has no
 // history to preserve and starts enforcing.
 //
-// Existing peers are deliberately **not** auto-trusted. Trust that was never
+// Existing peers are deliberately not auto-trusted. Trust that was never
 // granted is not trust, and seeding it would make the approval step a
 // formality on exactly the networks where it matters.
 func seedTrustMode(ctx context.Context, tx *sql.Tx) error {

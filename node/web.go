@@ -20,31 +20,18 @@ import (
 
 // The local web UI.
 //
-// **This surface grants everything the control socket grants, plus trust
-// administration, which makes it the most powerful entry point the node has.**
+// This surface grants everything the control socket grants, plus trust
+// administration, which makes it the most powerful entry point the node has.
 // The socket's own justification does not carry over: a 0600 socket is
 // restricted to one user, but a loopback port is reachable by every process and
 // every user on the machine, and a browser on it can be steered by any page the
-// person happens to be visiting.
+// person happens to be visiting. The checks below are all aimed at that — at
+// stopping another origin reach through the browser — and each is explained
+// where it is enforced.
 //
-// So, cheapest control first:
-//
-//   - Host is validated on every /api/ request. This is the DNS-rebinding kill
-//     switch: an attacker's page can make the browser resolve their domain to
-//     127.0.0.1, but it cannot change the Host header it sends.
-//   - Origin and Sec-Fetch-Site are validated on mutations.
-//   - A CSRF token is required in a header, **with no cookie anywhere**. No
-//     cookie means no ambient authority: a cross-site request cannot borrow
-//     credentials it was never given. The token is required on GET too, because
-//     GET /api/file reads file contents out.
-//   - A non-loopback bind is refused unless explicitly allowed and backed by a
-//     token file, since off-machine exposure is a different threat entirely.
-//   - CSP forbids everything but this origin's own script and style, which is
-//     why they are separate files rather than inline.
-//
-// There is no login. The security boundary is the machine, as it is for the
-// control socket; these controls exist to stop *other* origins reaching
-// through the browser, not to authenticate the person at the keyboard.
+// There is no login, deliberately. The security boundary is the machine, as it
+// is for the control socket. These controls authenticate the *origin* of a
+// request, never the person at the keyboard.
 
 //go:embed assets
 var assetFS embed.FS
@@ -194,12 +181,16 @@ func (ui *webUI) guardStream(next http.HandlerFunc) http.HandlerFunc {
 func (ui *webUI) guard(mutating bool, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !ui.hostAllowed(r.Host) {
-			// The rebinding kill switch. Deliberately before the token check:
-			// a wrong Host is never worth answering.
+			// The DNS-rebinding kill switch, and the cheapest check there is,
+			// so it runs first: an attacker's page can make the browser
+			// resolve their domain to 127.0.0.1, but it cannot change the Host
+			// header the browser then sends.
 			http.Error(w, "unexpected Host", http.StatusForbidden)
 			return
 		}
 
+		// Demanded on reads as well as writes, because GET /api/file reads
+		// file contents out: this is not only about preventing writes.
 		if subtle.ConstantTimeCompare([]byte(r.Header.Get(csrfHeader)), []byte(ui.token)) != 1 {
 			http.Error(w, "missing or wrong "+csrfHeader, http.StatusForbidden)
 			return

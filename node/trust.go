@@ -17,7 +17,7 @@ import (
 // Trust is approval: a peer this node is willing to accept files and deletion
 // requests from. Discovery makes peers visible; trust decides what they may do.
 //
-// **Trust is not checked when a peer connects.** Three reasons, any one of them
+// Trust is not checked when a peer connects. Three reasons, any one of them
 // sufficient. A UI could never show a peer awaiting approval if unapproved
 // peers were refused at the door. Gossip travels over admitted connections, so
 // refusing untrusted peers would partition a network in which nobody is
@@ -256,6 +256,16 @@ func (s *FileServer) Trust(nodeID, label string) error {
 	// In its own goroutine: this is called from a control request and a web
 	// handler, and repair talks to every peer.
 	if s.hasPeerWithNodeID(nodeID) {
+		// Told rather than left to discover it: the peer may be holding files
+		// it could not place here until now.
+		if peer, ok := s.peer(nodeID); ok {
+			msg := Message{Payload: MessageTrustGranted{}}
+			if err := sendMessage(peer, &msg); err != nil {
+				log.Printf("[%s] Could not tell %s it is approved: %v",
+					s.Transport.Address(), storage.Short(nodeID), err)
+			}
+		}
+
 		go func() {
 			placed, err := s.RepairOnce()
 			if err != nil {
@@ -315,6 +325,29 @@ func (s *FileServer) SetTrustMode(mode string) error {
 	s.trust.setMode(mode)
 
 	fmt.Printf("[%s] Trust mode is now %s\n", s.Transport.Address(), mode)
+	return nil
+}
+
+// handleMessageTrustGranted reacts to a peer approving this node.
+//
+// Whatever this node could not place there before, it may be able to place
+// now, so it repairs rather than waiting for the next cycle.
+func (s *FileServer) handleMessageTrustGranted(from string) error {
+	fmt.Printf("[%s] %s has approved this node\n", s.Transport.Address(), storage.Short(from))
+
+	go func() {
+		placed, err := s.RepairOnce()
+		if err != nil {
+			log.Printf("[%s] Repair after being approved by %s failed: %v",
+				s.Transport.Address(), storage.Short(from), err)
+			return
+		}
+		if placed > 0 {
+			fmt.Printf("[%s] Placed %d copy(ies) after %s approved this node\n",
+				s.Transport.Address(), placed, storage.Short(from))
+		}
+	}()
+
 	return nil
 }
 

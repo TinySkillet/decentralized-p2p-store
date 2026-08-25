@@ -16,6 +16,14 @@
 </header>
 
 <main>
+  <section id="mode-banner" class="panel warn" hidden>
+    <h2>Approval is not being enforced</h2>
+    <p class="note">Trust is recorded and shown, but not acted on: any connected peer
+      can send this node files and ask it to delete them. Databases created before
+      approval existed start this way, so that upgrading changes no behaviour.</p>
+    <button id="enforce-button" class="primary" type="button">Start enforcing approval</button>
+  </section>
+
   <section class="panel">
     <h2>This node</h2>
     <p class="note">Another node needs this identity to approve you. Send it to them.</p>
@@ -27,8 +35,7 @@
   </section>
   <section id="approval-section" class="panel accent" hidden>
     <h2>Waiting for approval <span id="pending-count" class="badge"></span></h2>
-    <p class="note">These peers are on the network and visible, but may not send
-      you files or ask you to delete anything until you approve them.</p>
+    <p id="approval-note" class="note"></p>
     <ul id="pending-peers" class="peers"></ul>
   </section>
 

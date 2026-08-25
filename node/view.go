@@ -14,8 +14,8 @@ import (
 // should be shown about the node. It answers from memory and the database and
 // never touches the network, so it is safe behind a refresh or a poll.
 //
-// The rule that shapes it: **liveness is membership of the live peer set, never
-// the peers.status column.** Status is written only on connect and disconnect,
+// The rule that shapes it: liveness is membership of the live peer set, never
+// the peers.status column. Status is written only on connect and disconnect,
 // so a node that crashed reads "connected" for ever, and GetActivePeers hides
 // the 4th and later identity on a host as an anti-Sybil measure. A view built
 // from SQLite would therefore show peers that are gone and hide peers that are

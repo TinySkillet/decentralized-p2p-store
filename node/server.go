@@ -90,6 +90,8 @@ func (s *FileServer) handleMessage(from string, msg *Message) error {
 		return s.handleMessageDeleteFile(from, v)
 	case MessageStoreRefused:
 		return s.handleMessageStoreRefused(from, v)
+	case MessageTrustGranted:
+		return s.handleMessageTrustGranted(from)
 	case MessagePeerExchange:
 		return s.handleMessagePeerExchange(from, v)
 	}
