@@ -13,14 +13,17 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.25'
 
-      # gofmt recurses into directories, so the vendored dependencies have to
-      # be excluded by listing files: they are third-party code, formatted for
-      # whichever Go version produced them, and not ours to reformat.
+      # Dependencies are no longer vendored, so this needs the network. It is a
+      # separate step from Build so that a proxy outage reads as a fetch
+      # failure rather than a compile error.
+      - name: Download dependencies
+        run: go mod download
+
       - name: Check formatting
         run: |
-          unformatted=$(gofmt -l $(find . -name '*.go' -not -path './vendor/*'))
+          unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then
             echo "These files are not gofmt'd:"
             echo "$unformatted"

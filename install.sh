@@ -12,7 +12,10 @@ if [ "$EUID" -eq 0 ]; then
   exit 1
 fi
 
-# Build the binary
+# Build the binary. Dependencies are not vendored, so the first build on a
+# machine fetches them from the module proxy and needs network access.
+echo "Fetching dependencies..."
+go mod download
 echo "Building binary..."
 go build -o bin/p2p
 

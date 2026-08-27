@@ -3,7 +3,8 @@ bin/
 .codex
 .cursorignore
 daily_progress/
-vendor/**/.gitignore
+# Dependencies are fetched from the module proxy, not vendored (see README).
+vendor/
 
 node_*/
 hello.txt

@@ -1,6 +1,6 @@
 module github.com/TinySkillet/DecentralizedP2PStorage
 
-go 1.24.5
+go 1.25.7
 
 require (
 	github.com/spf13/cobra v1.8.0

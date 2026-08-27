@@ -219,9 +219,21 @@ name derived from that path, so node and commands still agree where to meet.
 
 ## Build
 
+Needs Go 1.25.7 or newer.
+
 ```bash
 make build          # builds bin/p2p
 ```
+
+Dependencies are fetched from the module proxy rather than vendored, so the
+first build on a machine needs network access:
+
+```bash
+go mod download     # once per machine, or after go.mod changes
+```
+
+The `v1.0-thesis` tag carries its own complete `vendor/` tree, so the submitted
+artifact still builds with no network.
 
 ## Tests
 

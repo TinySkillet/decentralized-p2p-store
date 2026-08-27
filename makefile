@@ -20,11 +20,9 @@ test-race:
 vet:
 	@go vet ./...
 
-# Excludes vendor/: gofmt recurses into directories, and the vendored
-# dependencies are third-party code we do not reformat. Kept identical to the
-# check CI runs.
+# Kept identical to the check CI runs.
 fmt:
-	@gofmt -l $(shell find . -name '*.go' -not -path './vendor/*')
+	@gofmt -l .
 
 check: fmt vet test-race
 
