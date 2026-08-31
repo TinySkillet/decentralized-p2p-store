@@ -55,7 +55,7 @@ func expandHome(path string) (string, error) {
 func withNetworkFlags(c *cobra.Command, listen *string, bootstrap *[]string, transport *string) *cobra.Command {
 	c.Flags().StringVar(listen, "listen", ":3000", "listen address (only used when no node is running)")
 	c.Flags().StringSliceVar(bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
-	c.Flags().StringVar(transport, "transport", node.TransportTCP, "network transport: tcp or libp2p (must match the network's)")
+	c.Flags().StringVar(transport, "transport", node.TransportLibp2p, "network transport: libp2p or tcp (must match the network's)")
 	return c
 }
 
@@ -239,7 +239,7 @@ func setupCommands() *cobra.Command {
 	serveCmd.Flags().StringVar(&configPath, "config", "", "config file path (e.g., ~/.p2p/config)")
 	serveCmd.Flags().IntVar(&replicas, "replicas", node.DefaultReplicationFactor, "how many copies of each file the network should hold")
 	serveCmd.Flags().StringVar(&httpAddr, "http", "", "serve the local web UI on this address (e.g. 127.0.0.1:7654); off by default")
-	serveCmd.Flags().StringVar(&transport, "transport", node.TransportTCP, "network transport: tcp or libp2p (peers must use the same one)")
+	serveCmd.Flags().StringVar(&transport, "transport", node.TransportLibp2p, "network transport: libp2p or tcp (peers must use the same one)")
 	serveCmd.Flags().BoolVar(&discover, "discover", false, "announce on the local network and list peers found there (needs --transport libp2p)")
 	serveCmd.Flags().BoolVar(&httpExposed, "http-exposed", false, "allow binding the web UI off loopback, protected by a token file")
 	root.AddCommand(serveCmd)

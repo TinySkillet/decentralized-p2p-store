@@ -1,6 +1,6 @@
 DEFAULT_TARGET: build
 
-.PHONY: build run test test-race vet fmt check clean
+.PHONY: build run test test-race test-race-libp2p vet fmt check clean
 
 build:
 	@go build -o bin/p2p
@@ -17,6 +17,12 @@ test:
 test-race:
 	@go test ./... -race -timeout 900s
 
+# The node suite again over the other transport. The suite default is tcp;
+# both must stay green, because which one a network runs is a deployment
+# choice.
+test-race-libp2p:
+	@P2PSTORAGE_TEST_TRANSPORT=libp2p go test ./node/ -race -timeout 900s
+
 vet:
 	@go vet ./...
 
@@ -24,7 +30,7 @@ vet:
 fmt:
 	@gofmt -l .
 
-check: fmt vet test-race
+check: fmt vet test-race test-race-libp2p
 
 clean:
 	@rm -rf bin/

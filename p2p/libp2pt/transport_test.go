@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -520,5 +521,44 @@ func TestReconnectAfterRestartWithNewAddress(t *testing.T) {
 	secondPeer := dialPeer(t, sender, second)
 	if secondPeer.ID() != firstPeer.ID() {
 		t.Errorf("the restarted node has id %s, want the same identity %s", secondPeer.ID(), firstPeer.ID())
+	}
+}
+
+// TestDialOverQUIC: the transport must listen on QUIC as well as TCP, and a
+// peer reachable only by its QUIC address must be dialable. QUIC is what
+// makes NAT traversal workable later — UDP hole punching succeeds far more
+// often than TCP's — so it needs to be a first-class listener, not an option.
+func TestDialOverQUIC(t *testing.T) {
+	receiver := newTestTransport(t, Opts{})
+	sender := newTestTransport(t, Opts{})
+
+	var quicAddr string
+	for _, addr := range receiver.host.Network().ListenAddresses() {
+		s := addr.String()
+		if strings.Contains(s, "/quic") {
+			quicAddr = s
+			break
+		}
+	}
+	if quicAddr == "" {
+		t.Fatalf("the transport listens on %v, none of which is QUIC", receiver.host.Network().ListenAddresses())
+	}
+
+	got := make(chan p2p.Peer, 1)
+	sender.OnPeer = func(p p2p.Peer) error { got <- p; return nil }
+	if err := sender.Dial(p2p.Addr{NodeID: receiver.nodeID(), Addrs: []string{quicAddr}}); err != nil {
+		t.Fatalf("Dial over QUIC: %v", err)
+	}
+
+	select {
+	case peer := <-got:
+		if err := peer.Send(frame([]byte("over quic"))); err != nil {
+			t.Fatalf("Send over QUIC: %v", err)
+		}
+		if rpc := consumeRPC(t, receiver); string(rpc.Payload) != "over quic" {
+			t.Errorf("received %q", rpc.Payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out connecting over QUIC")
 	}
 }

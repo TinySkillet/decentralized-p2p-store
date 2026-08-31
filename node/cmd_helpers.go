@@ -18,9 +18,10 @@ import (
 const (
 	// TransportTCP is the custom TCP transport with its own handshake.
 	TransportTCP = "tcp"
-	// TransportLibp2p is TCP + Noise + yamux via libp2p. Identity is proven
-	// by the connection itself, and dialling requires knowing who is being
-	// dialled: bare "host:port" bootstrap entries do not work on it.
+	// TransportLibp2p is TCP+QUIC with Noise and yamux via libp2p, and the
+	// default. Identity is proven by the connection itself, and dialling
+	// requires knowing who is being dialled: bare "host:port" bootstrap
+	// entries do not work on it.
 	TransportLibp2p = "libp2p"
 )
 
@@ -151,7 +152,7 @@ func newServer(transport, listenAddr string, identity, owner Identity, db *dbpkg
 // because each depends on the other.
 func buildTransport(transport, listenAddr string, identity Identity) (p2p.Transport, func(*FileServer), error) {
 	switch transport {
-	case TransportLibp2p:
+	case "", TransportLibp2p:
 		tr, err := libp2pt.New(libp2pt.Opts{
 			ListenAddr: listenAddr,
 			// The node keeps its identity across transports: libp2p accepts
@@ -167,7 +168,7 @@ func buildTransport(transport, listenAddr string, identity Identity) (p2p.Transp
 			tr.OnPeerDisconnect = s.OnPeerDisconnect
 		}, nil
 
-	case "", TransportTCP:
+	case TransportTCP:
 		tr := p2p.NewTCPTransport(p2p.TCPTransportOpts{
 			ListenAddr: listenAddr,
 			Decoder:    p2p.DefaultDecoder{},

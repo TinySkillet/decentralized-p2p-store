@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
+	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	tcp "github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	ma "github.com/multiformats/go-multiaddr"
 
@@ -114,7 +116,7 @@ func (t *Transport) BoundAddr() string {
 func (t *Transport) Consume() <-chan p2p.RPC { return t.rpcChan }
 
 func (t *Transport) ListenAndAccept() error {
-	listen, err := multiaddrFrom(t.ListenAddr)
+	listens, err := listenMultiaddrs(t.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("listen address %q: %w", t.ListenAddr, err)
 	}
@@ -130,7 +132,7 @@ func (t *Transport) ListenAndAccept() error {
 	// are deliberately added.
 	h, err := libp2p.New(
 		libp2p.Identity(key),
-		libp2p.ListenAddrs(listen),
+		libp2p.ListenAddrs(listens...),
 		// Without this, an outbound dial originates from the listen port
 		// (SO_REUSEPORT), so two nodes dialling each other at once produce
 		// mirrored 4-tuples that the kernel merges into one TCP
@@ -140,8 +142,16 @@ func (t *Transport) ListenAndAccept() error {
 		// picks one. Costs reuseport's NAT friendliness, which matters only
 		// when hole punching lands.
 		libp2p.Transport(tcp.NewTCPTransport, tcp.DisableReuseport()),
+		libp2p.Transport(quic.NewTransport),
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.ConnectionGater(ed25519Gate{}),
+		// NAT traversal, in the two forms that need no outside help: ask the
+		// router for a port mapping (UPnP/NAT-PMP), and answer other peers'
+		// dial-back probes so they can learn their own reachability. Relay
+		// and hole punching stay out: they need relay servers granting
+		// reservations, an operational dependency this project lacks.
+		libp2p.NATPortMap(),
+		libp2p.EnableNATService(),
 		libp2p.DisableRelay(),
 	)
 	if err != nil {
@@ -152,6 +162,8 @@ func (t *Transport) ListenAndAccept() error {
 	h.SetStreamHandler(protocolID, func(s network.Stream) {
 		t.adopt(s, false)
 	})
+
+	log.Printf("Listening via libp2p at %v\n", h.Network().ListenAddresses())
 	return nil
 }
 
@@ -368,6 +380,25 @@ func (t *Transport) Close() error {
 // the form the keys table stores.
 func libp2pKey(key []byte) (crypto.PrivKey, error) {
 	return crypto.UnmarshalEd25519PrivateKey(key)
+}
+
+// listenMultiaddrs expands one configured listen address into everything the
+// node listens on. A "host:port" form yields both TCP and QUIC on that port —
+// QUIC is a separate UDP socket, so the same number serves both. An explicit
+// multiaddr is taken as exactly what the operator chose.
+func listenMultiaddrs(s string) ([]ma.Multiaddr, error) {
+	tcpAddr, err := multiaddrFrom(s)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasPrefix(s, "/") {
+		return []ma.Multiaddr{tcpAddr}, nil
+	}
+	quicAddr, err := ma.NewMultiaddr(strings.Replace(tcpAddr.String(), "/tcp/", "/udp/", 1) + "/quic-v1")
+	if err != nil {
+		return nil, err
+	}
+	return []ma.Multiaddr{tcpAddr, quicAddr}, nil
 }
 
 // dialMultiaddrFrom is multiaddrFrom for dial targets, where an address with

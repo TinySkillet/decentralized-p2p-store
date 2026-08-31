@@ -23,13 +23,15 @@ db=~/.p2p/p2p.db
 # For production networks, specify 2-3 stable bootstrap nodes:
 bootstrap=
 
-# Network transport - "tcp" (default) or "libp2p".
+# Network transport - "libp2p" (default) or "tcp".
 #
 # The two are not interoperable: every node on a network must use the same
-# one. On libp2p, identity is proven by the connection itself, and bootstrap
-# entries must therefore say who they name: use the id@host:port form (get the
-# id from 'p2p node' on that machine), or a full multiaddr.
-# transport=tcp
+# one. On libp2p (TCP and QUIC, Noise-encrypted), identity is proven by the
+# connection itself, and bootstrap entries must therefore say who they name:
+# use the id@host:port form (get the id from 'p2p node' on that machine), or
+# a full multiaddr. A network built before the default changed keeps working
+# by setting transport=tcp.
+# transport=libp2p
 
 # Local-network discovery - announce this node and list peers found nearby.
 # Needs transport=libp2p.

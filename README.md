@@ -223,11 +223,13 @@ The node can run on either of two transports, chosen with `--transport` or
 `transport=` in the config file. They are not interoperable — different wire
 security and framing — so every node on a network must use the same one.
 
-- **`tcp`** (default): the custom TCP transport with its own Ed25519
-  challenge-response handshake, as documented in the thesis.
-- **`libp2p`**: TCP + Noise + yamux via [libp2p](https://libp2p.io). Identity
-  is proven by the connection itself. Only Ed25519 peers are accepted, and the
-  node keeps its existing identity — the same key bytes back both transports.
+- **`libp2p`** (default): TCP and QUIC with Noise encryption and yamux, via
+  [libp2p](https://libp2p.io). Identity is proven by the connection itself.
+  Only Ed25519 peers are accepted, and the node keeps its existing identity —
+  the same key bytes back both transports.
+- **`tcp`**: the custom TCP transport with its own Ed25519
+  challenge-response handshake, as documented in the thesis. A network built
+  before the default changed keeps working with `--transport tcp`.
 
 One consequence of libp2p is that a bare `--bootstrap host:port` cannot work:
 libp2p cannot dial an address without knowing whose it is. Name the peer with
@@ -297,8 +299,8 @@ Common flags:
 - `--bootstrap <host:port>`: One or more peer addresses to join an existing
   network. The `<node-id>@host:port` form also names who is expected there,
   which is verified — and required on the libp2p transport.
-- `--transport <tcp|libp2p>`: Which network transport to run on; `tcp` is the
-  default. See "Transports" below.
+- `--transport <libp2p|tcp>`: Which network transport to run on; `libp2p` is
+  the default. See "Transports" below.
 
 Command formats:
 

@@ -246,7 +246,9 @@ func TestPeerAddressIsRoutable(t *testing.T) {
 		if strings.Contains(addr, "/0.0.0.0/") {
 			t.Errorf("recorded address %q names the wildcard host, which no other machine can dial", addr)
 		}
-		if want := portOf(t, bare.addr); !strings.Contains(addr, "/tcp/"+want) {
+		// TCP and QUIC both listen on the peer's port; either address form
+		// proves the port survived.
+		if want := portOf(t, bare.addr); !strings.Contains(addr, "/tcp/"+want) && !strings.Contains(addr, "/udp/"+want) {
 			t.Errorf("recorded address %q does not carry the peer's listen port %s", addr, want)
 		}
 		return
