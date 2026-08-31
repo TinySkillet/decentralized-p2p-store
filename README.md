@@ -14,8 +14,9 @@ mark the states worth distinguishing:
 | `v1.1-durability` | Adds a replication target with automatic repair. |
 | `v1.2-consistency` | Fixes the data-integrity bugs found by auditing the two releases above. |
 | `v1.3-identity` | Peers prove who they are, and deleting a file requires its owner's authorisation. |
-| `v1.4-control` | Commands ask the running node to act instead of starting one of their own. |
-| _unreleased_ | Peers keyed by identity rather than address; repair works through every file; re-storing a deleted file sticks. Existing databases are migrated in place on first start. |
+| `v1.4-durability-fixes` | Repair checks every file, not just the newest 25, and re-storing a deleted file sticks. |
+| `v1.5-identity-keyed` | Peers keyed by identity rather than address, and commands ask the running node to act instead of starting one of their own. Existing databases are migrated in place on first start. |
+| _unreleased_ | Approval-based trust with a local web UI; a libp2p transport (now the default) with QUIC, NAT port mapping, and local-network discovery — peers on the same network appear and connect on approval. |
 
 **Run the newest tag.** The earlier tags are kept as reference
 points, not as versions to deploy.
