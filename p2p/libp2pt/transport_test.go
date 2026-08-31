@@ -21,6 +21,10 @@ import (
 	"github.com/TinySkillet/DecentralizedP2PStorage/p2p"
 )
 
+func generateTestKey() (ed25519.PublicKey, ed25519.PrivateKey, error) {
+	return ed25519.GenerateKey(rand.Reader)
+}
+
 // newTestTransport starts a transport with a fresh identity on an ephemeral
 // loopback port.
 func newTestTransport(t *testing.T, opts Opts) *Transport {
@@ -30,7 +34,7 @@ func newTestTransport(t *testing.T, opts Opts) *Transport {
 		opts.ListenAddr = "127.0.0.1:0"
 	}
 	if opts.Key == nil {
-		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		_, priv, err := generateTestKey()
 		if err != nil {
 			t.Fatalf("GenerateKey: %v", err)
 		}

@@ -14,7 +14,15 @@ type DB struct {
 }
 
 func Open(path string) (*DB, error) {
-	dsn := path + "?_pragma=busy_timeout=5000&_pragma=journal_mode=WAL&_pragma=foreign_keys=on"
+	// _txlock=immediate: every transaction takes the write lock at BEGIN.
+	// Every transaction here writes, and the deferred default is a trap: a
+	// transaction that reads before writing — Migrate's columnExists checks —
+	// gets SQLITE_BUSY *immediately* if another connection commits in
+	// between, because SQLite bypasses the busy handler on that read→write
+	// upgrade. A one-shot command migrating while the node writes hits
+	// exactly that; taking the lock up front makes busy_timeout apply
+	// instead.
+	dsn := path + "?_txlock=immediate&_pragma=busy_timeout=5000&_pragma=journal_mode=WAL&_pragma=foreign_keys=on"
 	d, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err

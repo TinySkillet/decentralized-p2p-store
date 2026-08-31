@@ -62,6 +62,22 @@ type Addr struct {
 	Addrs []string
 }
 
+// Discoverer is implemented by transports that can find peers on the local
+// network without being given any address.
+//
+// A capability interface like Located, and for the same reason: discovery is
+// a property of the transport, not of the node. The custom TCP transport has
+// no discovery; asking for the capability keeps that a checkable fact rather
+// than a silent no-op.
+type Discoverer interface {
+	// Discover starts announcing this node on the local network and calls
+	// found for every peer noticed there, with its node id and addresses in
+	// whatever form this transport's Dial accepts. It requires the transport
+	// to be listening already, announces until the transport closes, and may
+	// report the same peer repeatedly. found must not block.
+	Discover(found func(nodeID string, addrs []string)) error
+}
+
 type Transport interface {
 	Address() string
 	Dial(Addr) error

@@ -280,8 +280,13 @@ function render(state) {
   const offlineList = document.getElementById("offline-peers");
   offlineList.replaceChildren();
   if (offline.length === 0) offlineList.appendChild(emptyItem("Nothing remembered."));
+  // Approve works here too: a peer discovered on the local network sits in
+  // this list until someone approves it, and approving is what connects it.
   offline.forEach((p) => offlineList.appendChild(
-    peerItem(p, trustedIDs, { revoke: trustedIDs.has(p.NodeID) })));
+    peerItem(p, trustedIDs, {
+      approve: !trustedIDs.has(p.NodeID),
+      revoke: trustedIDs.has(p.NodeID),
+    })));
 
   const files = document.getElementById("files");
   files.replaceChildren();

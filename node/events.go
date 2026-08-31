@@ -7,9 +7,10 @@ import (
 
 // Event kinds.
 const (
-	EventPeerUp      = "peer.up"
-	EventPeerDown    = "peer.down"
-	EventPeerRefused = "peer.refused"
+	EventPeerUp         = "peer.up"
+	EventPeerDown       = "peer.down"
+	EventPeerRefused    = "peer.refused"
+	EventPeerDiscovered = "peer.discovered"
 
 	EventPeerTrusted   = "peer.trusted"
 	EventPeerUntrusted = "peer.untrusted"

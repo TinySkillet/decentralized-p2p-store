@@ -31,6 +31,15 @@ bootstrap=
 # id from 'p2p node' on that machine), or a full multiaddr.
 # transport=tcp
 
+# Local-network discovery - announce this node and list peers found nearby.
+# Needs transport=libp2p.
+#
+# Discovered peers only become visible and approvable; nothing connects until
+# you approve a peer ('p2p trust add' or the web UI), and approving is what
+# connects it. Two machines with discovery on find each other with no
+# addresses configured anywhere.
+# discover=true
+
 # Replication target - how many copies of each file the network should hold,
 # counting this node's own. Files below it are repaired automatically.
 # Default: 3

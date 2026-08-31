@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	dbpkg "github.com/TinySkillet/DecentralizedP2PStorage/db"
 	"github.com/TinySkillet/DecentralizedP2PStorage/p2p"
@@ -266,20 +267,92 @@ func (s *FileServer) Trust(nodeID, label string) error {
 			}
 		}
 
-		go func() {
-			placed, err := s.RepairOnce()
-			if err != nil {
-				log.Printf("[%s] Repair after approving %s failed: %v",
-					s.Transport.Address(), storage.Short(nodeID), err)
-				return
-			}
-			if placed > 0 {
-				fmt.Printf("[%s] Placed %d copy(ies) after approving %s\n",
-					s.Transport.Address(), placed, storage.Short(nodeID))
-			}
-		}()
+		go s.repairAfterApproving(nodeID)
+	} else {
+		// Not connected — a discovered peer being approved, most often.
+		// Approval is what gates dialling, so this is the moment to connect,
+		// not some later rediscovery.
+		go s.connectApproved(nodeID)
 	}
 
+	return nil
+}
+
+// repairAfterApproving places whatever copies the approval made possible.
+// In its own goroutine at every call site: Trust is called from a control
+// request and a web handler, and repair talks to every peer.
+func (s *FileServer) repairAfterApproving(nodeID string) {
+	placed, err := s.RepairOnce()
+	if err != nil {
+		log.Printf("[%s] Repair after approving %s failed: %v",
+			s.Transport.Address(), storage.Short(nodeID), err)
+		return
+	}
+	if placed > 0 {
+		fmt.Printf("[%s] Placed %d copy(ies) after approving %s\n",
+			s.Transport.Address(), placed, storage.Short(nodeID))
+	}
+}
+
+// connectApproved dials a peer that was approved while not connected, at the
+// addresses it was last known at, then places whatever copies the approval
+// made possible.
+func (s *FileServer) connectApproved(nodeID string) {
+	addrs := s.knownAddrsFor(nodeID)
+	if len(addrs) == 0 {
+		// Approved sight unseen, by full identity. Nothing to dial yet; the
+		// connection happens when the peer turns up.
+		return
+	}
+
+	if err := s.Transport.Dial(p2p.Addr{NodeID: nodeID, Addrs: addrs}); err != nil {
+		fmt.Printf("[%s] Could not connect to approved peer %s: %v\n",
+			s.Transport.Address(), storage.Short(nodeID), err)
+		return
+	}
+
+	// Dial returns once the connection is up, but registration completes
+	// asynchronously. The repair only helps once the peer is in the set.
+	deadline := time.Now().Add(3 * time.Second)
+	for !s.hasPeerWithNodeID(nodeID) {
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	if peer, ok := s.peer(nodeID); ok {
+		msg := Message{Payload: MessageTrustGranted{}}
+		if err := sendMessage(peer, &msg); err != nil {
+			log.Printf("[%s] Could not tell %s it is approved: %v",
+				s.Transport.Address(), storage.Short(nodeID), err)
+		}
+	}
+
+	s.repairAfterApproving(nodeID)
+}
+
+// knownAddrsFor returns every address a peer was last known at, from the
+// database.
+func (s *FileServer) knownAddrsFor(nodeID string) []string {
+	if s.DB == nil {
+		return nil
+	}
+	peers, err := s.DB.ListKnownPeers(context.Background())
+	if err != nil {
+		return nil
+	}
+	for _, p := range peers {
+		if p.NodeID != nodeID {
+			continue
+		}
+		if len(p.Addrs) > 0 {
+			return p.Addrs
+		}
+		if p.Address != "" {
+			return []string{p.Address}
+		}
+	}
 	return nil
 }
 

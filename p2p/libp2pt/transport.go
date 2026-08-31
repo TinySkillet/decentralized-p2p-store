@@ -13,6 +13,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -69,6 +70,10 @@ type Transport struct {
 	mu      sync.Mutex
 	adoptMu sync.Mutex
 	peers   map[peer.ID]*Peer
+
+	// found and mdns exist once Discover has been called.
+	found func(nodeID string, addrs []string)
+	mdns  io.Closer
 
 	closed bool
 }
@@ -344,8 +349,12 @@ func (t *Transport) readLoop(p *Peer) {
 func (t *Transport) Close() error {
 	t.mu.Lock()
 	t.closed = true
+	mdnsSvc := t.mdns
 	t.mu.Unlock()
 
+	if mdnsSvc != nil {
+		mdnsSvc.Close()
+	}
 	if t.host == nil {
 		return nil
 	}

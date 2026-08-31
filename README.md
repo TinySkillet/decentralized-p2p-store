@@ -234,6 +234,21 @@ libp2p cannot dial an address without knowing whose it is. Name the peer with
 the `<node-id>@host:port` form (get the id from `p2p node` on that machine),
 or use a full multiaddr (`/ip4/…/tcp/…/p2p/…`).
 
+### Finding peers on the local network
+
+With `--discover` (or `discover=true` in the config; libp2p only), the node
+announces itself over multicast DNS and lists every peer it hears on the same
+network — no addresses configured anywhere:
+
+```bash
+p2p serve --transport libp2p --discover
+```
+
+Discovery only makes peers visible. A discovered peer shows up in `p2p peers`
+and in the web UI with an Approve button; nothing connects until someone
+approves it, and approving is what connects it. Two mutually approved
+machines joining the same network find each other and reconnect on their own.
+
 ## Build
 
 Needs Go 1.25.7 or newer.
@@ -287,7 +302,7 @@ Common flags:
 
 Command formats:
 
-- `serve --listen <addr> [--db <path>] [--bootstrap <host:port>] [--config <path>]`
+- `serve --listen <addr> [--db <path>] [--bootstrap <host:port>] [--config <path>] [--transport tcp|libp2p] [--discover]`
   Starts a node and keeps it running. Use this for long-lived peers.
 - `store <name> <file> [--db <path>]`
   Stores a local file under a name and offers it to approved peers.

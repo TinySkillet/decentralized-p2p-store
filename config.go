@@ -27,6 +27,11 @@ type Config struct {
 	// Transport selects the network transport: "tcp" (default) or "libp2p".
 	// Every node on a network must use the same one.
 	Transport string
+
+	// Discover announces this node on the local network and lists peers
+	// found there. Discovered peers are visible and approvable, nothing
+	// more; only approved peers are dialled. Needs the libp2p transport.
+	Discover bool
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -74,6 +79,8 @@ func LoadConfig(path string) (*Config, error) {
 			config.DB = value
 		case "transport":
 			config.Transport = value
+		case "discover":
+			config.Discover = value == "true" || value == "1" || value == "yes"
 		case "http":
 			config.HTTP = value
 		case "http_exposed":

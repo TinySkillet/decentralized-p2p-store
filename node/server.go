@@ -520,6 +520,11 @@ type FileServer struct {
 	// touching the network.
 	health *healthCache
 
+	// discoveredAt debounces local-network discovery, which re-announces the
+	// same peers every few seconds.
+	discoveredMu sync.Mutex
+	discoveredAt map[string]time.Time
+
 	// trust is the in-memory view of which peers are approved, read on every
 	// enforced operation.
 	trust *trustSet

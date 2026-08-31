@@ -108,6 +108,7 @@ func setupCommands() *cobra.Command {
 
 		httpAddr    string
 		httpExposed bool
+		discover    bool
 	)
 
 	root := &cobra.Command{
@@ -167,6 +168,9 @@ func setupCommands() *cobra.Command {
 				if !cmd.Flags().Changed("transport") && cfg.Transport != "" {
 					transport = cfg.Transport
 				}
+				if !cmd.Flags().Changed("discover") && cfg.Discover {
+					discover = true
+				}
 			}
 
 			d, err := openDB(dbPath)
@@ -189,6 +193,14 @@ func setupCommands() *cobra.Command {
 
 			if err := s.Listen(); err != nil {
 				return err
+			}
+
+			// After Listen: discovery announces on the network, so it only
+			// makes sense once the node is reachable.
+			if discover {
+				if err := s.EnableDiscovery(); err != nil {
+					return err
+				}
 			}
 
 			// Commands ask this node to act rather than starting one of their
@@ -228,6 +240,7 @@ func setupCommands() *cobra.Command {
 	serveCmd.Flags().IntVar(&replicas, "replicas", node.DefaultReplicationFactor, "how many copies of each file the network should hold")
 	serveCmd.Flags().StringVar(&httpAddr, "http", "", "serve the local web UI on this address (e.g. 127.0.0.1:7654); off by default")
 	serveCmd.Flags().StringVar(&transport, "transport", node.TransportTCP, "network transport: tcp or libp2p (peers must use the same one)")
+	serveCmd.Flags().BoolVar(&discover, "discover", false, "announce on the local network and list peers found there (needs --transport libp2p)")
 	serveCmd.Flags().BoolVar(&httpExposed, "http-exposed", false, "allow binding the web UI off loopback, protected by a token file")
 	root.AddCommand(serveCmd)
 
@@ -531,7 +544,7 @@ func setupCommands() *cobra.Command {
 					if !strings.HasPrefix(p.NodeID, args[0]) && p.NodeID != args[0] {
 						continue
 					}
-					state := "not connected"
+					state := "not connected — connecting now if it is reachable"
 					if p.Online {
 						state = "connected"
 					}
