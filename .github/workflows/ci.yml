@@ -43,3 +43,27 @@ jobs:
       # detector is the check that actually matters here.
       - name: Test with the race detector
         run: go test ./... -race -timeout 900s
+
+  # The node suite again, over the libp2p transport. Both transports must
+  # stay working: which one a network runs is a deployment choice.
+  test-libp2p:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Test the node over libp2p
+        run: go test ./node/ -timeout 300s
+        env:
+          P2PSTORAGE_TEST_TRANSPORT: libp2p
+
+      - name: Test the node over libp2p with the race detector
+        run: go test ./node/ -race -timeout 900s
+        env:
+          P2PSTORAGE_TEST_TRANSPORT: libp2p

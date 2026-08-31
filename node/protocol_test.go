@@ -96,7 +96,18 @@ func assertNoPeers(t *testing.T, node *testNode, why string) {
 	}
 }
 
+// skipUnlessTCP marks a test that exercises the custom TCP handshake's wire
+// protocol with raw connections. The libp2p transport proves identity in the
+// connection itself; its equivalents live in p2p/libp2pt's own tests.
+func skipUnlessTCP(t *testing.T) {
+	t.Helper()
+	if testTransport() != TransportTCP {
+		t.Skipf("exercises the custom TCP handshake; transport is %s", testTransport())
+	}
+}
+
 func TestHandshakeRejectsProtocolVersionMismatch(t *testing.T) {
+	skipUnlessTCP(t)
 	node := newTestNode(t)
 
 	other, err := newIdentity()
@@ -119,6 +130,7 @@ func TestHandshakeRejectsProtocolVersionMismatch(t *testing.T) {
 // it liked. Deciding what a peer is allowed to do is meaningless on top of an
 // identity anyone can wear.
 func TestHandshakeRejectsUnprovenIdentity(t *testing.T) {
+	skipUnlessTCP(t)
 	node := newTestNode(t)
 
 	// A real identity's public key, presented by someone who does not hold
@@ -139,6 +151,7 @@ func TestHandshakeRejectsUnprovenIdentity(t *testing.T) {
 // TestHandshakeAcceptsProvenIdentity is the positive case, so the rejection
 // tests above are not passing because the handshake refuses everything.
 func TestHandshakeAcceptsProvenIdentity(t *testing.T) {
+	skipUnlessTCP(t)
 	node := newTestNode(t)
 
 	caller, err := newIdentity()
@@ -159,6 +172,7 @@ func TestHandshakeAcceptsProvenIdentity(t *testing.T) {
 }
 
 func TestHandshakeRejectsUnidentifiedPeer(t *testing.T) {
+	skipUnlessTCP(t)
 	node := newTestNode(t)
 
 	// No public key at all, so there is nothing to verify against.
@@ -172,6 +186,7 @@ func TestHandshakeRejectsUnidentifiedPeer(t *testing.T) {
 }
 
 func TestHandshakeRejectsPeerWithoutListenPort(t *testing.T) {
+	skipUnlessTCP(t)
 	node := newTestNode(t)
 
 	other, err := newIdentity()
@@ -189,9 +204,10 @@ func TestHandshakeRejectsPeerWithoutListenPort(t *testing.T) {
 // TestHandshakeRejectsSelfConnection covers the case gossip eventually
 // produces: a node is handed its own address and dials it.
 func TestHandshakeRejectsSelfConnection(t *testing.T) {
+	skipUnlessTCP(t)
 	node := newTestNode(t)
 
-	if err := node.Transport.Dial(node.addr); err != nil {
+	if err := node.Transport.Dial(p2p.Addr{Addrs: []string{node.addr}}); err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
 
@@ -221,6 +237,19 @@ func TestPeerAddressIsRoutable(t *testing.T) {
 	}
 	if strings.HasPrefix(addr, ":") {
 		t.Fatalf("peer recorded as %q, which names no host and is not reachable from another machine", addr)
+	}
+
+	// The invariant is the same on both transports — the recorded address
+	// must name an actual host and the peer's real port — but the libp2p
+	// transport records it as a multiaddr.
+	if strings.HasPrefix(addr, "/") {
+		if strings.Contains(addr, "/0.0.0.0/") {
+			t.Errorf("recorded address %q names the wildcard host, which no other machine can dial", addr)
+		}
+		if want := portOf(t, bare.addr); !strings.Contains(addr, "/tcp/"+want) {
+			t.Errorf("recorded address %q does not carry the peer's listen port %s", addr, want)
+		}
+		return
 	}
 
 	host, port, err := net.SplitHostPort(addr)
@@ -256,7 +285,7 @@ func TestNodeIDSurvivesRestart(t *testing.T) {
 			t.Fatalf("Migrate: %v", err)
 		}
 
-		s, err := NewServer("127.0.0.1:0", d)
+		s, err := NewServer(testTransport(), "127.0.0.1:0", d)
 		if err != nil {
 			t.Fatalf("NewServer: %v", err)
 		}
@@ -600,12 +629,12 @@ func TestAdmitLimitsIdentitiesPerHost(t *testing.T) {
 		}
 	}
 
-	if err := node.admit("10.0.0.5:3002", "sybil-2"); err == nil {
+	if err := node.admit("10.0.0.5", "10.0.0.5:3002", "sybil-2"); err == nil {
 		t.Fatal("a third identity from the same host was admitted, want a refusal")
 	}
 
 	// A different host is unaffected.
-	if err := node.admit("10.0.0.6:3000", "genuine-peer"); err != nil {
+	if err := node.admit("10.0.0.6", "10.0.0.6:3000", "genuine-peer"); err != nil {
 		t.Errorf("a peer on a different host was refused: %v", err)
 	}
 }
@@ -629,7 +658,7 @@ func TestAdmitExemptsLoopback(t *testing.T) {
 		}
 	}
 
-	if err := node.admit("127.0.0.1:3005", "local-5"); err != nil {
+	if err := node.admit("127.0.0.1", "127.0.0.1:3005", "local-5"); err != nil {
 		t.Errorf("a loopback peer was refused: %v", err)
 	}
 }
@@ -654,7 +683,46 @@ func TestAdmitAllowsReconnectionOfKnownIdentity(t *testing.T) {
 	node.peers[peer.ID()] = peer
 	node.peersLock.Unlock()
 
-	if err := node.admit("10.0.0.5:3000", peer.ID()); err != nil {
+	if err := node.admit("10.0.0.5", "10.0.0.5:3000", peer.ID()); err != nil {
 		t.Errorf("a already-connected identity was refused on reconnect: %v", err)
+	}
+}
+
+// locatedPeer is a countingPeer that also reports where it connected from and
+// what addresses it advertises — the shape a libp2p peer presents, where the
+// advertised addresses are multiaddrs rather than "host:port".
+type locatedPeer struct {
+	countingPeer
+	id         string
+	remoteHost string
+	advertised []string
+}
+
+func (p *locatedPeer) ID() string                { return p.id }
+func (p *locatedPeer) RemoteHost() string        { return p.remoteHost }
+func (p *locatedPeer) AdvertisedAddrs() []string { return p.advertised }
+
+// TestAdmitCountsByObservedHost: the per-host limit must count the host a
+// connection actually arrived from, not a host parsed out of the peer's
+// advertised address. On the libp2p transport the advertised addresses are
+// multiaddrs, which the "host:port" parsing cannot read — so every identity
+// would land in its own bucket and the Sybil cap would never trip.
+func TestAdmitCountsByObservedHost(t *testing.T) {
+	node := newTestNode(t)
+	node.MaxPeersPerHost = 2
+
+	for i := range 3 {
+		p := &locatedPeer{
+			id:         fmt.Sprintf("%064d", i),
+			remoteHost: "10.0.0.5",
+			advertised: []string{fmt.Sprintf("/ip4/10.0.0.5/tcp/%d/p2p/12D3KooWpeer%d", 3000+i, i)},
+		}
+		err := node.OnPeer(p)
+		if i < 2 && err != nil {
+			t.Fatalf("peer %d was refused: %v", i, err)
+		}
+		if i == 2 && err == nil {
+			t.Fatal("a third identity from host 10.0.0.5 was admitted, want a refusal")
+		}
 	}
 }

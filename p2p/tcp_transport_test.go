@@ -65,7 +65,7 @@ func dialPeer(t *testing.T, sender *TCPTransport, addr string) Peer {
 	t.Helper()
 	got := make(chan Peer, 1)
 	sender.OnPeer = func(p Peer) error { got <- p; return nil }
-	if err := sender.Dial(addr); err != nil {
+	if err := sender.Dial(Addr{Addrs: []string{addr}}); err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
 	select {
@@ -110,7 +110,7 @@ func TestTransportCloseIsSafeBeforeListening(t *testing.T) {
 func TestTransportDialUnreachableAddress(t *testing.T) {
 	tr := newTestTransport(t, TCPTransportOpts{})
 	// Port 1 on loopback is not listening.
-	if err := tr.Dial("127.0.0.1:1"); err == nil {
+	if err := tr.Dial(Addr{Addrs: []string{"127.0.0.1:1"}}); err == nil {
 		t.Error("Dial to an unreachable address returned nil, want an error")
 	}
 }
@@ -147,7 +147,7 @@ func TestTransportOnPeerDisconnectFires(t *testing.T) {
 	})
 	sender := newTestTransport(t, TCPTransportOpts{})
 
-	if err := sender.Dial(receiver.BoundAddr()); err != nil {
+	if err := sender.Dial(Addr{Addrs: []string{receiver.BoundAddr()}}); err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
 
@@ -239,7 +239,7 @@ func TestTransportHandshakeFailureDropsConnection(t *testing.T) {
 	})
 	sender := newTestTransport(t, TCPTransportOpts{})
 
-	if err := sender.Dial(receiver.BoundAddr()); err != nil {
+	if err := sender.Dial(Addr{Addrs: []string{receiver.BoundAddr()}}); err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
 
@@ -383,5 +383,58 @@ func TestTCPPeerReportsItsLocation(t *testing.T) {
 	addrs := located.AdvertisedAddrs()
 	if len(addrs) != 1 || addrs[0] == "" {
 		t.Errorf("AdvertisedAddrs = %v, want exactly one usable address", addrs)
+	}
+}
+
+// TestDialRefusesUnexpectedIdentity covers dialling with the peer's identity
+// known in advance: gossip and the shares table both name who should answer.
+// If the handshake proves someone else — a different node reused the address,
+// or the address was poisoned — the connection must be dropped before the
+// impostor is registered as the peer that was asked for.
+func TestDialRefusesUnexpectedIdentity(t *testing.T) {
+	receiver := newTestTransport(t, TCPTransportOpts{})
+
+	registered := make(chan Peer, 1)
+	sender := newTestTransport(t, TCPTransportOpts{
+		OnPeer: func(p Peer) error { registered <- p; return nil },
+	})
+
+	// The default test handshake assigns the next counter identity, so
+	// whatever it assigns, it is not this.
+	if err := sender.Dial(Addr{
+		NodeID: "not-the-node-that-will-answer",
+		Addrs:  []string{receiver.BoundAddr()},
+	}); err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+
+	select {
+	case p := <-registered:
+		t.Fatalf("peer %s was registered, want the connection dropped: the answering identity is not the one dialled", p.ID())
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// TestDialTriesAddressesInOrder covers a peer known at several addresses,
+// some stale: the dial must fall through dead addresses to one that answers.
+func TestDialTriesAddressesInOrder(t *testing.T) {
+	receiver := newTestTransport(t, TCPTransportOpts{})
+
+	registered := make(chan Peer, 1)
+	sender := newTestTransport(t, TCPTransportOpts{
+		OnPeer: func(p Peer) error { registered <- p; return nil },
+	})
+
+	// Port 1 on loopback is not listening; the live listener comes second.
+	if err := sender.Dial(Addr{
+		Addrs: []string{"127.0.0.1:1", receiver.BoundAddr()},
+	}); err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+
+	select {
+	case <-registered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the second address answers, but the peer never registered")
 	}
 }

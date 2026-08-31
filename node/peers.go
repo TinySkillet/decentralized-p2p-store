@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	dbpkg "github.com/TinySkillet/DecentralizedP2PStorage/db"
@@ -63,6 +64,19 @@ func advertisedAddrs(p p2p.Peer) []string {
 	return located.AdvertisedAddrs()
 }
 
+// peerHost returns the host a peer's connection was observed from, or ""
+// when its transport cannot say. This, not a host parsed out of an
+// advertised address, is what the per-host admission limit counts: an
+// advertised address is the peer's own claim, and on the libp2p transport it
+// is a multiaddr that "host:port" parsing cannot read at all.
+func peerHost(p p2p.Peer) string {
+	located, ok := p.(p2p.Located)
+	if !ok {
+		return ""
+	}
+	return located.RemoteHost()
+}
+
 // hasPeerWithNodeID reports whether a peer with this identity is already
 // connected, possibly at a different address.
 func (s *FileServer) hasPeerWithNodeID(nodeID string) bool {
@@ -100,7 +114,7 @@ func (s *FileServer) OnPeer(p p2p.Peer) error {
 	nodeID := p.ID()
 	peerAddr := peerAddress(p)
 
-	if err := s.admit(peerAddr, nodeID); err != nil {
+	if err := s.admit(peerHost(p), peerAddr, nodeID); err != nil {
 		return err
 	}
 
@@ -119,6 +133,7 @@ func (s *FileServer) OnPeer(p p2p.Peer) error {
 			NodeID:   nodeID,
 			Address:  peerAddr,
 			Addrs:    advertisedAddrs(p),
+			Host:     peerHost(p),
 			Status:   "connected",
 			LastSeen: &now,
 		}); err != nil {
@@ -145,12 +160,11 @@ func (s *FileServer) OnPeer(p p2p.Peer) error {
 //
 // Loopback is exempt: several nodes on one machine is the normal local
 // testing arrangement, not an attack.
-func (s *FileServer) admit(peerAddr, nodeID string) error {
+func (s *FileServer) admit(host, peerAddr, nodeID string) error {
 	if s.DB == nil || nodeID == "" {
 		return nil
 	}
 
-	host := dbpkg.HostOf(peerAddr)
 	if dbpkg.IsLoopbackHost(host) {
 		return nil
 	}
@@ -200,6 +214,7 @@ func (s *FileServer) OnPeerDisconnect(p p2p.Peer) {
 			NodeID:   nodeID,
 			Address:  peerAddr,
 			Addrs:    advertisedAddrs(p),
+			Host:     peerHost(p),
 			Status:   "disconnected",
 			LastSeen: &now,
 		}); err != nil {
@@ -237,13 +252,24 @@ func (s *FileServer) bootstrapNetwork() error {
 		go func(addr string) {
 			fmt.Printf("[%s] Attempting to connect with remote: %s\n", s.Transport.Address(), addr)
 
-			err := s.Transport.Dial(addr)
+			err := s.Transport.Dial(bootstrapAddr(addr))
 			if err != nil {
 				fmt.Printf("[%s] Dial error: %v\n", s.Transport.Address(), err)
 			}
 		}(addr)
 	}
 	return nil
+}
+
+// bootstrapAddr parses one configured bootstrap entry. The plain form is a
+// bare location; "<node-id>@<address>" also names who is expected there,
+// which the TCP transport verifies and the libp2p transport requires — it
+// cannot dial an address without knowing whose it is.
+func bootstrapAddr(entry string) p2p.Addr {
+	if id, rest, ok := strings.Cut(entry, "@"); ok && len(id) == nodeIDLength && rest != "" {
+		return p2p.Addr{NodeID: id, Addrs: []string{rest}}
+	}
+	return p2p.Addr{Addrs: []string{entry}}
 }
 
 // WaitForPeerDiscovery waits until the peer set stops growing, and returns

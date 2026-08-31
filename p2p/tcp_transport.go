@@ -33,14 +33,24 @@ func (t *TCPTransport) Consume() <-chan RPC {
 	return t.rpcChan
 }
 
-func (t *TCPTransport) Dial(addr string) error {
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		return err
+// Dial tries addr's locations in order until one accepts a connection. The
+// handshake then runs asynchronously; when addr names an identity, a peer
+// that proves a different one is dropped before it is registered.
+func (t *TCPTransport) Dial(addr Addr) error {
+	if len(addr.Addrs) == 0 {
+		return errors.New("no address to dial")
 	}
-
-	go t.handleConn(conn, true)
-	return nil
+	var errs []error
+	for _, location := range addr.Addrs {
+		conn, err := net.Dial("tcp", location)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		go t.handleConn(conn, true, addr.NodeID)
+		return nil
+	}
+	return errors.Join(errs...)
 }
 
 func (t *TCPTransport) ListenAndAccept() error {
@@ -70,11 +80,14 @@ func (t *TCPTransport) startAcceptLoop() {
 		}
 
 		fmt.Printf("[%s] New Incoming Connection: %+v\n", t.ListenAddr, conn.RemoteAddr().String())
-		go t.handleConn(conn, false)
+		go t.handleConn(conn, false, "")
 	}
 }
 
-func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
+// handleConn owns a connection for its whole life. wantNodeID is the identity
+// the dialler expected to answer, or "" for inbound connections and bare
+// bootstrap addresses.
+func (t *TCPTransport) handleConn(conn net.Conn, outbound bool, wantNodeID string) {
 	var err error
 
 	peer := NewTCPPeer(conn, outbound)
@@ -96,6 +109,14 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 	}()
 
 	if err = t.HandshakeFunc(peer); err != nil {
+		return
+	}
+
+	// The handshake proves who answered; this checks it is who was asked
+	// for. An address can go stale and be reused by a different node, and a
+	// gossiped address can simply lie.
+	if wantNodeID != "" && peer.NodeID != wantNodeID {
+		err = fmt.Errorf("dialled expecting node %s, but %s answered", wantNodeID, peer.NodeID)
 		return
 	}
 

@@ -15,9 +15,21 @@ db=~/.p2p/p2p.db
 # Examples:
 #   Single node:    bootstrap=localhost:4000
 #   Multiple nodes: bootstrap=192.168.1.100:3000,192.168.1.101:3000,bootstrap.example.com:3000
+#   Named peer:     bootstrap=<node-id>@192.168.1.100:3000
+#
+# The named form also checks that whoever answers is the node you meant, and
+# it is required on the libp2p transport (see transport below).
 #
 # For production networks, specify 2-3 stable bootstrap nodes:
 bootstrap=
+
+# Network transport - "tcp" (default) or "libp2p".
+#
+# The two are not interoperable: every node on a network must use the same
+# one. On libp2p, identity is proven by the connection itself, and bootstrap
+# entries must therefore say who they name: use the id@host:port form (get the
+# id from 'p2p node' on that machine), or a full multiaddr.
+# transport=tcp
 
 # Replication target - how many copies of each file the network should hold,
 # counting this node's own. Files below it are repaired automatically.

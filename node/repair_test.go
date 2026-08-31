@@ -337,7 +337,7 @@ func TestBorrowedStorageIsNotCountedTwice(t *testing.T) {
 	}
 
 	// A command node against the same database and storage root.
-	client, err := NewClient(freeAddr(t), owner.db, owner.addr)
+	client, err := NewClient(testTransport(), freeAddr(t), owner.db, qualifyBootstrap(owner.addr))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}

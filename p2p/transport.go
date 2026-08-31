@@ -45,9 +45,26 @@ type Located interface {
 	AdvertisedAddrs() []string
 }
 
+// Addr names a peer to dial: who it is, and where it might be reached.
+//
+// Identity and location are separate on purpose. A node keeps its identity as
+// it moves between networks, so the same peer may be reachable at several
+// addresses, and an address alone says nothing about who will answer.
+type Addr struct {
+	// NodeID is the identity expected to answer, or "" when it is not known
+	// — a configured bootstrap address is just a location. When set, a
+	// connection that handshakes as anyone else is dropped before it is
+	// registered.
+	NodeID string
+
+	// Addrs are candidate locations for the peer, tried in order until one
+	// connects, in whatever form this transport accepts.
+	Addrs []string
+}
+
 type Transport interface {
 	Address() string
-	Dial(string) error
+	Dial(Addr) error
 	ListenAndAccept() error
 	Consume() <-chan RPC
 	Close() error

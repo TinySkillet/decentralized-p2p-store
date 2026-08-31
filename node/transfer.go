@@ -38,7 +38,10 @@ func (s *FileServer) Listen() error {
 	if s.OwnsDatabase && s.DB != nil {
 		// Record who owns this storage, so commands opening the same database
 		// can tell that their copy of a file is really this node's copy.
-		if err := s.DB.PutSetting(context.Background(), dbpkg.ServingAddressSetting, s.Transport.Address()); err != nil {
+		// Recorded with the identity ("id@addr"): commands bootstrap to this
+		// value, and a location alone cannot be dialled on every transport.
+		serving := s.NodeID() + "@" + s.Transport.Address()
+		if err := s.DB.PutSetting(context.Background(), dbpkg.ServingAddressSetting, serving); err != nil {
 			log.Printf("[%s] Could not record the serving address: %v", s.Transport.Address(), err)
 		}
 	}

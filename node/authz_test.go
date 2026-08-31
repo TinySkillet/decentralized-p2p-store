@@ -196,7 +196,7 @@ func TestFilesStoredByACommandStayDeletable(t *testing.T) {
 	node.OwnsDatabase = true
 
 	// A command against the same database, with its own network identity.
-	client, err := NewClient(freeAddr(t), node.db)
+	client, err := NewClient(testTransport(), freeAddr(t), node.db)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}

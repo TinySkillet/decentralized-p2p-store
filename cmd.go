@@ -52,9 +52,10 @@ func expandHome(path string) (string, error) {
 
 // withNetworkFlags adds the flags a command needs only when it has to start a
 // node of its own, which is to say when no node is already running.
-func withNetworkFlags(c *cobra.Command, listen *string, bootstrap *[]string) *cobra.Command {
+func withNetworkFlags(c *cobra.Command, listen *string, bootstrap *[]string, transport *string) *cobra.Command {
 	c.Flags().StringVar(listen, "listen", ":3000", "listen address (only used when no node is running)")
 	c.Flags().StringSliceVar(bootstrap, "bootstrap", nil, "bootstrap nodes (only used when no node is running)")
+	c.Flags().StringVar(transport, "transport", node.TransportTCP, "network transport: tcp or libp2p (must match the network's)")
 	return c
 }
 
@@ -103,6 +104,7 @@ func setupCommands() *cobra.Command {
 		bootstrap  []string
 		configPath string
 		replicas   int
+		transport  string
 
 		httpAddr    string
 		httpExposed bool
@@ -162,6 +164,9 @@ func setupCommands() *cobra.Command {
 				if !cmd.Flags().Changed("http-exposed") && cfg.HTTPExposed {
 					httpExposed = true
 				}
+				if !cmd.Flags().Changed("transport") && cfg.Transport != "" {
+					transport = cfg.Transport
+				}
 			}
 
 			d, err := openDB(dbPath)
@@ -174,7 +179,7 @@ func setupCommands() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			s, err := node.NewServer(listen, d, bootstrap...)
+			s, err := node.NewServer(transport, listen, d, bootstrap...)
 			if err != nil {
 				return err
 			}
@@ -222,6 +227,7 @@ func setupCommands() *cobra.Command {
 	serveCmd.Flags().StringVar(&configPath, "config", "", "config file path (e.g., ~/.p2p/config)")
 	serveCmd.Flags().IntVar(&replicas, "replicas", node.DefaultReplicationFactor, "how many copies of each file the network should hold")
 	serveCmd.Flags().StringVar(&httpAddr, "http", "", "serve the local web UI on this address (e.g. 127.0.0.1:7654); off by default")
+	serveCmd.Flags().StringVar(&transport, "transport", node.TransportTCP, "network transport: tcp or libp2p (peers must use the same one)")
 	serveCmd.Flags().BoolVar(&httpExposed, "http-exposed", false, "allow binding the web UI off loopback, protected by a token file")
 	root.AddCommand(serveCmd)
 
@@ -237,12 +243,12 @@ func setupCommands() *cobra.Command {
 			}
 			defer f.Close()
 
-			return onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+			return onNode(dbPath, transport, listen, bootstrap, 0, func(t nodeTarget) error {
 				return t.Store(name, f)
 			})
 		},
 	}
-	withNetworkFlags(storeCmd, &listen, &bootstrap)
+	withNetworkFlags(storeCmd, &listen, &bootstrap, &transport)
 	root.AddCommand(storeCmd)
 
 	getCmd := &cobra.Command{
@@ -265,12 +271,12 @@ func setupCommands() *cobra.Command {
 				return fn(of)
 			}
 
-			return onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+			return onNode(dbPath, transport, listen, bootstrap, 0, func(t nodeTarget) error {
 				return writeOut(func(w io.Writer) error { return t.Get(name, w) })
 			})
 		},
 	}
-	withNetworkFlags(getCmd, &listen, &bootstrap)
+	withNetworkFlags(getCmd, &listen, &bootstrap, &transport)
 	getCmd.Flags().String("out", "", "output file path")
 	root.AddCommand(getCmd)
 
@@ -281,12 +287,12 @@ func setupCommands() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
 
-			return onNode(dbPath, listen, bootstrap, 0, func(t nodeTarget) error {
+			return onNode(dbPath, transport, listen, bootstrap, 0, func(t nodeTarget) error {
 				return t.Delete(name)
 			})
 		},
 	}
-	withNetworkFlags(deleteCmd, &listen, &bootstrap)
+	withNetworkFlags(deleteCmd, &listen, &bootstrap, &transport)
 	root.AddCommand(deleteCmd)
 
 	// "files" lists on its own; "files list" still works, because that is what
@@ -661,7 +667,7 @@ func setupCommands() *cobra.Command {
 			var health []node.FileHealth
 			var approvedOnline, connected int
 			approvedIDs := map[string]bool{}
-			err := onNode(dbPath, listen, bootstrap, replicas, func(t nodeTarget) error {
+			err := onNode(dbPath, transport, listen, bootstrap, replicas, func(t nodeTarget) error {
 				var err error
 				if health, err = t.Status(replicas); err != nil {
 					return err
@@ -753,7 +759,7 @@ func setupCommands() *cobra.Command {
 			return nil
 		},
 	}
-	withNetworkFlags(statusCmd, &listen, &bootstrap)
+	withNetworkFlags(statusCmd, &listen, &bootstrap, &transport)
 	statusCmd.Flags().IntVar(&replicas, "replicas", node.DefaultReplicationFactor, "replication target to measure against")
 	root.AddCommand(statusCmd)
 
@@ -762,7 +768,7 @@ func setupCommands() *cobra.Command {
 		Short: "Place missing copies of under-replicated files",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var placed int
-			err := onNode(dbPath, listen, bootstrap, replicas, func(t nodeTarget) error {
+			err := onNode(dbPath, transport, listen, bootstrap, replicas, func(t nodeTarget) error {
 				var err error
 				placed, err = t.Repair(replicas)
 				return err
@@ -780,7 +786,7 @@ func setupCommands() *cobra.Command {
 			return nil
 		},
 	}
-	withNetworkFlags(repairCmd, &listen, &bootstrap)
+	withNetworkFlags(repairCmd, &listen, &bootstrap, &transport)
 	repairCmd.Flags().IntVar(&replicas, "replicas", node.DefaultReplicationFactor, "replication target to restore")
 	root.AddCommand(repairCmd)
 
@@ -820,7 +826,7 @@ func setupCommands() *cobra.Command {
 				}
 				defer d.Close()
 
-				s, err := node.NewServer(spec.listen, d, spec.bootstrap...)
+				s, err := node.NewServer(transport, spec.listen, d, spec.bootstrap...)
 				if err != nil {
 					return err
 				}

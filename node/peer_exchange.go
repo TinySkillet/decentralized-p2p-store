@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/TinySkillet/DecentralizedP2PStorage/p2p"
 	"github.com/TinySkillet/DecentralizedP2PStorage/storage"
 )
 
@@ -52,7 +53,7 @@ func (s *FileServer) discoverPeers(peers []PeerInfo) {
 		// let a list of dead addresses run far past the limit.
 		attempted++
 
-		if err := s.Transport.Dial(peerInfo.Address); err != nil {
+		if err := s.Transport.Dial(p2p.Addr{NodeID: peerInfo.NodeID, Addrs: []string{peerInfo.Address}}); err != nil {
 			continue
 		}
 

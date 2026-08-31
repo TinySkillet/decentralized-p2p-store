@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -23,6 +24,54 @@ import (
 // freeAddr reserves a loopback port and releases it, so the node started next
 // can bind it. Nodes advertise their listen address during the handshake, so
 // tests cannot simply use port 0.
+// testTransport selects the transport the whole node suite runs on. The
+// default is the custom TCP transport; CI runs the suite a second time with
+// P2PSTORAGE_TEST_TRANSPORT=libp2p, so both stay working.
+func testTransport() string {
+	if v := os.Getenv("P2PSTORAGE_TEST_TRANSPORT"); v != "" {
+		return v
+	}
+	return TransportTCP
+}
+
+// testNodePorts maps a test node's listen port to its identity, so that a
+// test bootstrapping one node at another's address works on the libp2p
+// transport too, where a location alone cannot be dialled.
+var (
+	testNodePortsMu sync.Mutex
+	testNodePorts   = map[string]string{}
+)
+
+func registerTestNode(addr, nodeID string) {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return
+	}
+	testNodePortsMu.Lock()
+	defer testNodePortsMu.Unlock()
+	testNodePorts[port] = nodeID
+}
+
+// qualifyBootstrap rewrites a bare test bootstrap address into the
+// "<node-id>@<address>" form when the transport requires an identity. The
+// production equivalent is writing that form in the config file.
+func qualifyBootstrap(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	testNodePortsMu.Lock()
+	id := testNodePorts[port]
+	testNodePortsMu.Unlock()
+	if id == "" {
+		return addr
+	}
+	return id + "@" + net.JoinHostPort(host, port)
+}
+
 func freeAddr(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -104,10 +153,19 @@ func buildTestNodeWithDB(t *testing.T, dbPath, addr string, cfg nodeConfig, boot
 		t.Fatalf("setting the trust mode: %v", err)
 	}
 
-	s, err := NewServer(addr, d, bootstrap...)
+	if testTransport() == TransportLibp2p {
+		qualified := make([]string, len(bootstrap))
+		for i, b := range bootstrap {
+			qualified[i] = qualifyBootstrap(b)
+		}
+		bootstrap = qualified
+	}
+
+	s, err := NewServer(testTransport(), addr, d, bootstrap...)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
+	registerTestNode(addr, s.NodeID())
 
 	key, err := LoadOrInitKey(d)
 	if err != nil {

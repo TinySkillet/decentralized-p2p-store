@@ -394,12 +394,12 @@ func (s *FileServer) Delete(name string) error {
 			}
 
 			wg.Add(1)
-			go func(addr string) {
+			go func(nodeID, addr string) {
 				defer wg.Done()
-				if err := s.Transport.Dial(addr); err != nil {
+				if err := s.Transport.Dial(p2p.Addr{NodeID: nodeID, Addrs: []string{addr}}); err != nil {
 					fmt.Printf("[%s] Could not connect to share peer %s: %v\n", s.Transport.Address(), addr, err)
 				}
-			}(addr)
+			}(nodeID, addr)
 		}
 		wg.Wait()
 

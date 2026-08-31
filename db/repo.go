@@ -53,6 +53,12 @@ type Peer struct {
 	// Addrs are additional places this peer may be reachable.
 	Addrs []string
 
+	// Host is the host the peer's connection was actually observed from,
+	// which is what the per-host admission limit counts. It is recorded
+	// separately because it cannot generally be parsed out of Address: on
+	// the libp2p transport, Address is a multiaddr.
+	Host string
+
 	Status   string
 	LastSeen *time.Time
 }
@@ -169,8 +175,17 @@ func (d *DB) UpsertPeer(ctx context.Context, p Peer) error {
 			host=excluded.host,
 			status=excluded.status,
 			last_seen=excluded.last_seen
-	`, p.NodeID, p.Address, joinAddrs(p.Addrs), HostOf(p.Address), p.Status, lastSeen)
+	`, p.NodeID, p.Address, joinAddrs(p.Addrs), hostOfPeer(p), p.Status, lastSeen)
 	return err
+}
+
+// hostOfPeer prefers the observed host and falls back to parsing the
+// address, which is the right answer for "host:port" records.
+func hostOfPeer(p Peer) string {
+	if p.Host != "" {
+		return p.Host
+	}
+	return HostOf(p.Address)
 }
 
 // InsertFileWithKey records a file and the key it was encrypted under.

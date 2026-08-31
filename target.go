@@ -148,7 +148,7 @@ func (t nodeTarget) Delete(name string) error {
 // races, miscounted replica counts and files owned by a key that vanished.
 // Starting a temporary node is safe only when there is no running one, which is
 // exactly when this takes that path.
-func onNode(dbPath, listen string, bootstrap []string, replicas int, work func(nodeTarget) error) error {
+func onNode(dbPath, transport, listen string, bootstrap []string, replicas int, work func(nodeTarget) error) error {
 	if client, ok := node.DialControl(dbPath); ok {
 		return work(nodeTarget{running: client})
 	}
@@ -159,7 +159,7 @@ func onNode(dbPath, listen string, bootstrap []string, replicas int, work func(n
 	}
 	defer d.Close()
 
-	s, stop, err := startClientNode(listen, d, bootstrap, replicas)
+	s, stop, err := startClientNode(transport, listen, d, bootstrap, replicas)
 	if err != nil {
 		return err
 	}
@@ -204,7 +204,7 @@ func onNodeReading(dbPath string, work func(nodeTarget) error) error {
 
 	// Constructed but never started: it answers from the database and its own
 	// storage, and its live peer set is empty because it has no connections.
-	s, err := node.NewClient("", d)
+	s, err := node.NewClient(node.TransportTCP, "", d)
 	if err != nil {
 		return err
 	}
@@ -243,7 +243,7 @@ func openDB(path string) (*dbpkg.DB, error) {
 //
 // Listen is synchronous, so a bind failure (a port already in use, most
 // often) is reported here rather than crashing a background goroutine.
-func startClientNode(listen string, d *dbpkg.DB, bootstrap []string, replicas int) (*node.FileServer, func(), error) {
+func startClientNode(transport, listen string, d *dbpkg.DB, bootstrap []string, replicas int) (*node.FileServer, func(), error) {
 	keyBytes, err := node.LoadOrInitKey(d)
 	if err != nil {
 		return nil, nil, err
@@ -255,7 +255,7 @@ func startClientNode(listen string, d *dbpkg.DB, bootstrap []string, replicas in
 		bootstrap = withBootstrap(bootstrap, owner)
 	}
 
-	s, err := node.NewClient(listen, d, bootstrap...)
+	s, err := node.NewClient(transport, listen, d, bootstrap...)
 	if err != nil {
 		return nil, nil, err
 	}

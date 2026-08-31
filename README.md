@@ -217,6 +217,23 @@ is the same boundary as the database beside it. Where the database path is too
 long for a unix socket, the socket moves to the user's runtime directory under a
 name derived from that path, so node and commands still agree where to meet.
 
+## Transports
+
+The node can run on either of two transports, chosen with `--transport` or
+`transport=` in the config file. They are not interoperable — different wire
+security and framing — so every node on a network must use the same one.
+
+- **`tcp`** (default): the custom TCP transport with its own Ed25519
+  challenge-response handshake, as documented in the thesis.
+- **`libp2p`**: TCP + Noise + yamux via [libp2p](https://libp2p.io). Identity
+  is proven by the connection itself. Only Ed25519 peers are accepted, and the
+  node keeps its existing identity — the same key bytes back both transports.
+
+One consequence of libp2p is that a bare `--bootstrap host:port` cannot work:
+libp2p cannot dial an address without knowing whose it is. Name the peer with
+the `<node-id>@host:port` form (get the id from `p2p node` on that machine),
+or use a full multiaddr (`/ip4/…/tcp/…/p2p/…`).
+
 ## Build
 
 Needs Go 1.25.7 or newer.
@@ -262,7 +279,11 @@ Common flags:
 - `--db <path>`: SQLite database path. Defaults to `~/.p2p/p2p.db`, so the same
   command means the same thing from any directory.
 - `--listen <addr>`: Local listen address for commands that start a temporary node, for example `:3000`.
-- `--bootstrap <host:port>`: One or more peer addresses to join an existing network.
+- `--bootstrap <host:port>`: One or more peer addresses to join an existing
+  network. The `<node-id>@host:port` form also names who is expected there,
+  which is verified — and required on the libp2p transport.
+- `--transport <tcp|libp2p>`: Which network transport to run on; `tcp` is the
+  default. See "Transports" below.
 
 Command formats:
 

@@ -23,6 +23,10 @@ type Config struct {
 	// Separate from HTTP so that exposing it is always a deliberate second
 	// decision.
 	HTTPExposed bool
+
+	// Transport selects the network transport: "tcp" (default) or "libp2p".
+	// Every node on a network must use the same one.
+	Transport string
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -68,6 +72,8 @@ func LoadConfig(path string) (*Config, error) {
 			config.Listen = value
 		case "db":
 			config.DB = value
+		case "transport":
+			config.Transport = value
 		case "http":
 			config.HTTP = value
 		case "http_exposed":
